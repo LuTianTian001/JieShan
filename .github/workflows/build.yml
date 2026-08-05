@@ -1,0 +1,176 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  validate:
+    name: Test and compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        shell: bash
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.15.1 --activate
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Check frontend
+        working-directory: web
+        env:
+          CI: "true"
+        run: |
+          pnpm run --if-present lint
+          pnpm run --if-present test
+          pnpm run build
+
+      - name: Check Go formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l cmd internal)"
+          test -z "$unformatted" || { printf 'Run gofmt on:\n%s\n' "$unformatted"; exit 1; }
+
+      - name: Test backend
+        run: go test ./...
+
+      - name: Vet backend
+        run: go vet ./...
+
+      - name: Compile backend
+        env:
+          CGO_ENABLED: "0"
+        run: go build -trimpath -o /tmp/jieshan ./cmd/jieshan
+
+  image:
+    name: Build and smoke-test container image
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Normalize image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build image for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: jieshan:smoke
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test final image
+        shell: bash
+        run: |
+          docker volume create jieshan-smoke-data
+          docker run --detach \
+            --name jieshan-smoke \
+            --read-only \
+            --tmpfs /tmp:rw,size=64m,mode=1777 \
+            --mount type=volume,source=jieshan-smoke-data,target=/data \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --env JIESHAN_ADMIN_PASSWORD=ci-smoke-test-password \
+            --env JIESHAN_SECRET_KEY=0000000000000000000000000000000000000000000000000000000000000000 \
+            --publish 127.0.0.1:4000:4000 \
+            jieshan:smoke
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:4000/healthz >/dev/null \
+              && curl --fail --silent http://127.0.0.1:4000/ | grep --quiet --ignore-case '<!doctype html'; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker logs jieshan-smoke
+          exit 1
+
+      - name: Clean up smoke test
+        if: always()
+        shell: bash
+        run: |
+          docker rm --force jieshan-smoke 2>/dev/null || true
+          docker volume rm jieshan-smoke-data 2>/dev/null || true
+
+      - name: Publish image
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+          cache-from: type=gha

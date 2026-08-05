@@ -1,0 +1,43 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+backups/
+
+# Go
+bin/
+coverage.out
+*.test
+/jieshan
+/jieshan.exe
+*.exe~
+
+# Frontend
+web/node_modules/
+web/dist/
+web/coverage/
+*.tsbuildinfo
+
+# Tooling and editors
+.idea/
+.vscode/
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+tmp/
+*.log

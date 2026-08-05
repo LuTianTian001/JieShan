@@ -1,0 +1,28 @@
+# Replace panel.example.com with your real domain. Caddy provisions and renews
+# HTTPS certificates automatically when DNS points to this server.
+panel.example.com {
+    encode zstd gzip
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+
+    reverse_proxy 127.0.0.1:4000 {
+        # Flush streaming model output immediately instead of buffering it.
+        flush_interval -1
+
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    log {
+        output file /var/log/caddy/jieshan-access.log {
+            roll_size 10MiB
+            roll_keep 3
+        }
+        format json
+    }
+}
