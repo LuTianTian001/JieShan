@@ -11,7 +11,7 @@ func TestBuiltinCatalogLoadsAndCoversProviders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuiltinCatalog() error = %v", err)
 	}
-	if catalog.Version != "2026-08-05.lkg.1" {
+	if catalog.Version != "2026-08-06.lkg.3" {
 		t.Fatalf("catalog version = %q", catalog.Version)
 	}
 	if len(catalog.DigestSHA256()) != 64 {
@@ -23,7 +23,7 @@ func TestBuiltinCatalogLoadsAndCoversProviders(t *testing.T) {
 		provider string
 		priced   bool
 	}{
-		{"gpt-5.6", "openai", true},
+		{"gpt-5.6-sol", "openai", true},
 		{"claude-sonnet-5-20260203", "anthropic", true},
 		{"gemini-2.5-pro", "google", true},
 		{"deepseek-chat", "deepseek", true},
@@ -49,7 +49,7 @@ func TestParseCatalogRejectsTrailingDataAndDuplicateAliases(t *testing.T) {
 		t.Fatalf("trailing JSON error = %v", err)
 	}
 
-	duplicate := strings.Replace(raw, `"aliases": ["gpt-5.6-mini"]`, `"aliases": ["gpt-5.6-mini", "gpt-5.6"]`, 1)
+	duplicate := strings.Replace(raw, `"aliases": ["gpt-5.6-sol"]`, `"aliases": ["gpt-5.6-sol", "gpt-5.6-terra"]`, 1)
 	if _, err := ParseCatalog([]byte(duplicate)); !errors.Is(err, ErrInvalidCatalog) {
 		t.Fatalf("duplicate alias error = %v", err)
 	}
@@ -59,5 +59,13 @@ func TestParseCatalogRejectsMissingFX(t *testing.T) {
 	raw := strings.Replace(string(BuiltinCatalogJSON()), `"CNY": {`, `"REMOVED": {`, 1)
 	if _, err := ParseCatalog([]byte(raw)); !errors.Is(err, ErrInvalidCatalog) {
 		t.Fatalf("missing FX error = %v", err)
+	}
+}
+
+func TestParseCatalogRejectsOverlappingPricePeriods(t *testing.T) {
+	raw := strings.Replace(string(BuiltinCatalogJSON()),
+		`"effective_from": "2026-09-01"`, `"effective_from": "2026-08-31"`, 1)
+	if _, err := ParseCatalog([]byte(raw)); !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("overlapping price period error = %v", err)
 	}
 }

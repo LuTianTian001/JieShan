@@ -13,12 +13,13 @@ import (
 var ErrDownstreamKeyHasReservations = errors.New("downstream key has active quota reservations")
 
 type DownstreamKeyWrite struct {
-	Name          string
-	Enabled       bool
-	QuotaMicroUSD *int64
-	RPMLimit      int
-	AllowedModels []string
-	ExpiresAt     *int64
+	Name             string
+	Enabled          bool
+	QuotaMicroUSD    *int64
+	RPMLimit         int
+	AllowedModels    []string
+	RoutingProfileID *int64
+	ExpiresAt        *int64
 }
 
 func APIKeyDigest(raw string) []byte {
@@ -30,10 +31,13 @@ func (s *Store) CreateDownstreamKey(ctx context.Context, input DownstreamKeyWrit
 	if input.QuotaMicroUSD != nil && *input.QuotaMicroUSD < 0 {
 		return 0, fmt.Errorf("quota cannot be negative")
 	}
+	if err := s.validateDownstreamRoutingProfile(ctx, input.RoutingProfileID); err != nil {
+		return 0, err
+	}
 	allowed, _ := json.Marshal(input.AllowedModels)
 	now := NowMS()
-	result, err := s.DB.ExecContext(ctx, `INSERT INTO downstream_keys(name,key_prefix,key_hash,enabled,quota_micro_usd,rpm_limit,allowed_models_json,expires_at,created_at,updated_at)
-VALUES (?,?,?,?,?,?,?,?,?,?)`, input.Name, prefix, APIKeyDigest(raw), boolInt(input.Enabled), input.QuotaMicroUSD, clamp(input.RPMLimit, 0, 100000), string(allowed), input.ExpiresAt, now, now)
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO downstream_keys(name,key_prefix,key_hash,enabled,quota_micro_usd,rpm_limit,allowed_models_json,routing_profile_id,expires_at,created_at,updated_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?)`, input.Name, prefix, APIKeyDigest(raw), boolInt(input.Enabled), input.QuotaMicroUSD, clamp(input.RPMLimit, 0, 100000), string(allowed), input.RoutingProfileID, input.ExpiresAt, now, now)
 	if err != nil {
 		return 0, err
 	}
@@ -41,7 +45,7 @@ VALUES (?,?,?,?,?,?,?,?,?,?)`, input.Name, prefix, APIKeyDigest(raw), boolInt(in
 }
 
 func (s *Store) ListDownstreamKeys(ctx context.Context) ([]DownstreamKey, error) {
-	rows, err := s.DB.QueryContext(ctx, keySelect+` ORDER BY created_at DESC,id DESC`)
+	rows, err := s.DB.QueryContext(ctx, keySelect+` ORDER BY k.created_at DESC,k.id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -58,17 +62,20 @@ func (s *Store) ListDownstreamKeys(ctx context.Context) ([]DownstreamKey, error)
 }
 
 func (s *Store) GetDownstreamKey(ctx context.Context, id int64) (DownstreamKey, error) {
-	return scanDownstreamKey(s.DB.QueryRowContext(ctx, keySelect+` WHERE id=?`, id))
+	return scanDownstreamKey(s.DB.QueryRowContext(ctx, keySelect+` WHERE k.id=?`, id))
 }
 
 func (s *Store) UpdateDownstreamKey(ctx context.Context, id int64, input DownstreamKeyWrite) error {
 	if input.QuotaMicroUSD != nil && *input.QuotaMicroUSD < 0 {
 		return fmt.Errorf("quota cannot be negative")
 	}
+	if err := s.validateDownstreamRoutingProfile(ctx, input.RoutingProfileID); err != nil {
+		return err
+	}
 	allowed, _ := json.Marshal(input.AllowedModels)
-	result, err := s.DB.ExecContext(ctx, `UPDATE downstream_keys SET name=?,enabled=?,quota_micro_usd=?,rpm_limit=?,allowed_models_json=?,expires_at=?,updated_at=?
+	result, err := s.DB.ExecContext(ctx, `UPDATE downstream_keys SET name=?,enabled=?,quota_micro_usd=?,rpm_limit=?,allowed_models_json=?,routing_profile_id=?,expires_at=?,updated_at=?
 WHERE id=? AND (? IS NULL OR (? >= used_micro_usd AND ?-used_micro_usd >= reserved_micro_usd))`,
-		input.Name, boolInt(input.Enabled), input.QuotaMicroUSD, clamp(input.RPMLimit, 0, 100000), string(allowed), input.ExpiresAt, NowMS(), id,
+		input.Name, boolInt(input.Enabled), input.QuotaMicroUSD, clamp(input.RPMLimit, 0, 100000), string(allowed), input.RoutingProfileID, input.ExpiresAt, NowMS(), id,
 		input.QuotaMicroUSD, input.QuotaMicroUSD, input.QuotaMicroUSD)
 	if err != nil {
 		return err
@@ -134,7 +141,7 @@ func (s *Store) ResetDownstreamKeyUsage(ctx context.Context, id int64) error {
 }
 
 func (s *Store) AuthenticateDownstreamKey(ctx context.Context, raw, model string) (DownstreamKey, error) {
-	item, err := scanDownstreamKey(s.DB.QueryRowContext(ctx, keySelect+` WHERE key_hash=?`, APIKeyDigest(raw)))
+	item, err := scanDownstreamKey(s.DB.QueryRowContext(ctx, keySelect+` WHERE k.key_hash=?`, APIKeyDigest(raw)))
 	if err != nil {
 		return DownstreamKey{}, err
 	}
@@ -168,16 +175,18 @@ func KeyAllowsModel(key DownstreamKey, model string) bool {
 	return len(key.AllowedModels) == 0 || contains(key.AllowedModels, model)
 }
 
-const keySelect = `SELECT id,name,key_prefix,enabled,quota_micro_usd,used_micro_usd,reserved_micro_usd,
-rpm_limit,allowed_models_json,expires_at,last_used_at,created_at,updated_at FROM downstream_keys`
+const keySelect = `SELECT k.id,k.name,k.key_prefix,k.enabled,k.quota_micro_usd,k.used_micro_usd,k.reserved_micro_usd,
+k.rpm_limit,k.allowed_models_json,k.routing_profile_id,COALESCE(p.name,'Default route'),k.expires_at,k.last_used_at,k.created_at,k.updated_at
+FROM downstream_keys k LEFT JOIN routing_profiles p ON p.id=k.routing_profile_id`
 
 func scanDownstreamKey(row scanner) (DownstreamKey, error) {
 	var item DownstreamKey
 	var enabled int
-	var quota, expires, lastUsed sql.NullInt64
+	var quota, routingProfileID, expires, lastUsed sql.NullInt64
 	var allowed []byte
 	err := row.Scan(&item.ID, &item.Name, &item.KeyPrefix, &enabled, &quota, &item.UsedMicroUSD,
-		&item.ReservedMicroUSD, &item.RPMLimit, &allowed, &expires, &lastUsed, &item.CreatedAt, &item.UpdatedAt)
+		&item.ReservedMicroUSD, &item.RPMLimit, &allowed, &routingProfileID, &item.RoutingProfileName,
+		&expires, &lastUsed, &item.CreatedAt, &item.UpdatedAt)
 	if err != nil {
 		return DownstreamKey{}, err
 	}
@@ -190,6 +199,10 @@ func scanDownstreamKey(row scanner) (DownstreamKey, error) {
 		value := quota.Int64
 		item.QuotaMicroUSD = &value
 	}
+	if routingProfileID.Valid {
+		value := routingProfileID.Int64
+		item.RoutingProfileID = &value
+	}
 	if expires.Valid {
 		value := expires.Int64
 		item.ExpiresAt = &value
@@ -199,6 +212,20 @@ func scanDownstreamKey(row scanner) (DownstreamKey, error) {
 		item.LastUsedAt = &value
 	}
 	return item, nil
+}
+
+func (s *Store) validateDownstreamRoutingProfile(ctx context.Context, profileID *int64) error {
+	if profileID == nil {
+		return nil
+	}
+	if *profileID <= 0 {
+		return errors.New("routing profile ID must be positive")
+	}
+	var exists int
+	if err := s.DB.QueryRowContext(ctx, `SELECT 1 FROM routing_profiles WHERE id=?`, *profileID).Scan(&exists); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) consumeRPM(ctx context.Context, keyID int64, limit int, nowMS int64) error {

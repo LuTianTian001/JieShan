@@ -31,7 +31,8 @@ func upstreamDTO(item store.Upstream, models []store.UpstreamModel) map[string]a
 	result := map[string]any{
 		"id": item.ID, "name": item.Name, "baseUrl": item.BaseURL, "protocol": item.Kind,
 		"enabled": item.Enabled, "state": state, "latencyMs": nil, "modelCount": item.ModelCount,
-		"credentialCount": 1, "lastSyncAt": isoOptional(lastSync),
+		"credentialCount": item.CredentialCount, "enabledCredentialCount": item.EnabledCredentialCount,
+		"unavailableCredentialCount": item.UnavailableCredentialCount, "lastSyncAt": isoOptional(lastSync),
 	}
 	if models != nil {
 		result["models"] = modelItems
@@ -88,18 +89,27 @@ func keyDTO(item store.DownstreamKey) map[string]any {
 		"id": item.ID, "name": item.Name, "prefix": item.KeyPrefix, "enabled": item.Enabled,
 		"quotaUsd": quota, "spentUsd": float64(item.UsedMicroUSD) / 1_000_000,
 		"allowedModels": item.AllowedModels, "rpmLimit": rpm, "expiresAt": isoOptional(item.ExpiresAt),
-		"lastUsedAt": isoOptional(item.LastUsedAt), "createdAt": iso(item.CreatedAt),
+		"routingProfileId": item.RoutingProfileID, "routingProfileName": item.RoutingProfileName,
+		"usesDefaultRouting": item.RoutingProfileID == nil,
+		"lastUsedAt":         isoOptional(item.LastUsedAt), "createdAt": iso(item.CreatedAt),
 	}
 }
 
 func logDTO(item store.RequestLog, attempts []store.RequestAttempt) map[string]any {
 	result := map[string]any{
 		"id": item.ID, "startedAt": iso(item.StartedAt), "keyName": item.KeyName,
+		"routingGeneration": item.RoutingGeneration, "surface": item.Surface,
+		"downstreamKeyId": item.DownstreamKeyID, "routeId": item.RouteID, "routeRevision": item.RouteRevision,
+		"publishedModelId": item.PublishedModelID, "publishedModelRevision": item.PublishedModelRevision,
+		"routingProfileId": item.RoutingProfileID, "routingProfileName": item.RoutingProfileName,
 		"requestedModel": item.RequestedModel, "actualModel": item.ActualModel, "status": item.Status,
-		"durationMs": int64Value(item.DurationMS), "ttftMs": item.FirstTokenMS,
-		"inputTokens": int64Value(item.InputTokens), "cacheTokens": int64Value(item.CacheReadTokens),
-		"outputTokens": int64Value(item.OutputTokens), "reasoningTokens": int64Value(item.ReasoningTokens),
+		"httpStatus": item.HTTPStatus, "stream": item.Stream, "finishedAt": isoOptional(item.FinishedAt),
+		"durationMs": item.DurationMS, "ttftMs": item.FirstTokenMS,
+		"inputTokens": item.InputTokens, "cacheTokens": item.CacheReadTokens,
+		"cacheWriteTokens": item.CacheWriteTokens, "cacheWrite1hTokens": item.CacheWrite1HTokens,
+		"outputTokens": item.OutputTokens, "reasoningTokens": item.ReasoningTokens,
 		"costUsd": float64(item.CostMicroUSD) / 1_000_000, "switchCount": item.SwitchCount,
+		"errorMessage": emptyNil(item.ErrorMessage), "priceSnapshot": emptyNil(item.PriceSnapshot),
 	}
 	if item.ReasoningEffort != "" {
 		result["reasoningEffort"] = item.ReasoningEffort
@@ -111,10 +121,17 @@ func logDTO(item store.RequestLog, attempts []store.RequestAttempt) map[string]a
 		attemptItems := make([]map[string]any, 0, len(attempts))
 		for _, attempt := range attempts {
 			attemptItems = append(attemptItems, map[string]any{
-				"id": attempt.ID, "sequence": attempt.AttemptIndex + 1, "upstreamName": attempt.UpstreamName,
-				"model": attempt.UpstreamModel, "state": attempt.Status, "startedAt": iso(attempt.CreatedAt),
-				"durationMs": int64Value(attempt.LatencyMS), "ttftMs": attempt.FirstTokenMS,
-				"statusCode": attempt.HTTPStatus, "switchReason": emptyNil(attempt.SwitchReason), "error": emptyNil(attempt.ErrorMessage),
+				"id": attempt.ID, "sequence": attempt.AttemptIndex + 1, "routingGeneration": attempt.RoutingGeneration,
+				"targetId": attempt.TargetID, "routeSiteTargetId": attempt.RouteSiteTargetID,
+				"upstreamId": attempt.UpstreamID, "upstreamName": attempt.UpstreamName,
+				"siteId": attempt.SiteID, "siteName": attempt.SiteName,
+				"endpointId": attempt.EndpointID, "endpointName": attempt.EndpointName,
+				"credentialId": attempt.InferenceCredentialID, "credentialName": attempt.CredentialName,
+				"siteModelId": attempt.SiteModelID,
+				"model":       attempt.UpstreamModel, "state": attempt.Status, "startedAt": iso(attempt.CreatedAt),
+				"durationMs": attempt.LatencyMS, "ttftMs": attempt.FirstTokenMS,
+				"statusCode": attempt.HTTPStatus, "switchReason": emptyNil(attempt.SwitchReason),
+				"errorClass": emptyNil(attempt.ErrorClass), "error": emptyNil(attempt.ErrorMessage),
 			})
 		}
 		result["attempts"] = attemptItems
@@ -135,7 +152,9 @@ func settingsDTO(item store.Settings) map[string]any {
 	}
 	return map[string]any{
 		"probeIntervalSeconds": item.ProbeIntervalSeconds, "failureThreshold": item.FailureThreshold,
-		"cooldownSeconds": item.DefaultCooldownSeconds, "requestTimeoutSeconds": item.RequestDeadlineSeconds,
+		"failureWindowSeconds": item.FailureWindowSeconds,
+		"cooldownSeconds":      item.DefaultCooldownSeconds, "requestTimeoutSeconds": item.RequestDeadlineSeconds,
+		"firstOutputTimeoutSeconds": item.FirstOutputTimeoutSeconds, "streamIdleTimeoutSeconds": item.StreamIdleTimeoutSeconds,
 		"maxAttempts": item.MaxAttempts, "logRetentionDays": item.LogRetentionDays,
 		"priceCatalogVersion": version, "priceCatalogUpdatedAt": updatedAt,
 		"priceCatalogSource": source, "lastBackupAt": nil,
@@ -154,10 +173,4 @@ func emptyNil(value string) any {
 		return nil
 	}
 	return value
-}
-func int64Value(value *int64) int64 {
-	if value == nil {
-		return 0
-	}
-	return *value
 }

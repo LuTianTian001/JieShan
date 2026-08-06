@@ -283,6 +283,7 @@ func newOneUsageItem(kind Kind, values map[string]any) *UsageItem {
 		CompletionTokens:    completion,
 		CacheReadTokens:     int64Value(lookup(other, "cache_tokens", "cache_read_tokens")),
 		CacheCreationTokens: int64Value(lookup(other, "cache_creation_tokens", "cache_write_tokens")),
+		ReasoningTokens:     int64Value(lookup(other, "reasoning_tokens")),
 		TotalTokens:         prompt + completion,
 		Quota:               quota,
 		ModelMultiplier:     amountValue(lookup(other, "model_ratio", "model_multiplier")),

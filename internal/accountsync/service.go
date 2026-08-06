@@ -131,21 +131,50 @@ type AccountView struct {
 }
 
 type UsageItemView struct {
-	ID           string        `json:"id"`
-	ExternalID   string        `json:"externalId,omitempty"`
-	OccurredAt   *string       `json:"occurredAt"`
-	Model        *string       `json:"model"`
-	Amount       *SourceAmount `json:"amount"`
-	InputTokens  *int64        `json:"inputTokens"`
-	OutputTokens *int64        `json:"outputTokens"`
-	Status       *string       `json:"status"`
-	SourceText   string        `json:"sourceText,omitempty"`
+	ID                  string        `json:"id"`
+	ExternalID          string        `json:"externalId,omitempty"`
+	RequestID           string        `json:"requestId,omitempty"`
+	UpstreamRequestID   string        `json:"upstreamRequestId,omitempty"`
+	OccurredAt          *string       `json:"occurredAt"`
+	SyncedAt            string        `json:"syncedAt"`
+	Model               *string       `json:"model"`
+	UpstreamModel       *string       `json:"upstreamModel"`
+	ReasoningEffort     *string       `json:"reasoningEffort"`
+	Amount              *SourceAmount `json:"amount"`
+	OriginalCost        *string       `json:"originalCost"`
+	ActualCost          *string       `json:"actualCost"`
+	Quota               *string       `json:"quota"`
+	InputTokens         *int64        `json:"inputTokens"`
+	CacheReadTokens     *int64        `json:"cacheReadTokens"`
+	CacheCreationTokens *int64        `json:"cacheCreationTokens"`
+	OutputTokens        *int64        `json:"outputTokens"`
+	ReasoningTokens     *int64        `json:"reasoningTokens"`
+	TotalTokens         *int64        `json:"totalTokens"`
+	HTTPStatus          *int          `json:"httpStatus"`
+	Status              *string       `json:"status"`
+	DurationMS          *int64        `json:"durationMs"`
+	FirstTokenMS        *int64        `json:"firstTokenMs"`
+	Stream              *bool         `json:"stream"`
+	RateMultiplier      *string       `json:"rateMultiplier"`
+	ModelMultiplier     *string       `json:"modelMultiplier"`
+	GroupMultiplier     *string       `json:"groupMultiplier"`
+	APIKeyID            string        `json:"apiKeyId,omitempty"`
+	APIKeyName          string        `json:"apiKeyName,omitempty"`
+	GroupID             string        `json:"groupId,omitempty"`
+	GroupName           string        `json:"groupName,omitempty"`
+	Endpoint            string        `json:"endpoint,omitempty"`
+	RequestType         string        `json:"requestType,omitempty"`
+	BillingType         string        `json:"billingType,omitempty"`
+	BillingMode         string        `json:"billingMode,omitempty"`
+	SourceText          string        `json:"sourceText,omitempty"`
 }
 
 type UsagePageView struct {
 	Items        []UsageItemView `json:"items"`
 	Range        string          `json:"range"`
 	LastSyncedAt *string         `json:"lastSyncedAt"`
+	NextBeforeID *string         `json:"nextBeforeId"`
+	HasMore      bool            `json:"hasMore"`
 }
 
 type SyncError struct {
@@ -440,7 +469,7 @@ func (s *Service) refreshLocked(ctx context.Context, upstreamID int64) (AccountV
 	return s.Get(ctx, upstreamID)
 }
 
-func (s *Service) Usage(ctx context.Context, upstreamID int64, rangeName string, limit int) (UsagePageView, error) {
+func (s *Service) Usage(ctx context.Context, upstreamID int64, rangeName string, limit int, beforeIDs ...int64) (UsagePageView, error) {
 	account, err := s.store.GetUpstreamAccount(ctx, upstreamID)
 	if err != nil {
 		return UsagePageView{}, err
@@ -449,15 +478,287 @@ func (s *Service) Usage(ctx context.Context, upstreamID int64, rangeName string,
 	if !ok {
 		return UsagePageView{}, fmt.Errorf("unsupported usage range %q", rangeName)
 	}
+	var beforeID int64
+	if len(beforeIDs) > 0 {
+		beforeID = beforeIDs[0]
+	}
 	items, err := s.store.ListUsage(ctx, upstreamID, store.UpstreamAccountUsageQuery{
-		SinceAt: time.Now().Add(-duration).UnixMilli(), Limit: limit,
+		SinceAt: time.Now().Add(-duration).UnixMilli(), BeforeID: beforeID, Limit: limit + 1,
 	})
 	if err != nil {
 		return UsagePageView{}, err
 	}
-	result := UsagePageView{Items: make([]UsageItemView, 0, len(items)), Range: rangeName, LastSyncedAt: isoPointer(account.LastSuccessAt)}
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	result := UsagePageView{
+		Items: make([]UsageItemView, 0, len(items)), Range: rangeName,
+		LastSyncedAt: isoPointer(account.LastSuccessAt), HasMore: hasMore,
+	}
 	for _, item := range items {
 		result.Items = append(result.Items, usageItemView(item))
+	}
+	if hasMore && len(items) > 0 {
+		cursor := strconv.FormatInt(items[len(items)-1].ID, 10)
+		result.NextBeforeID = &cursor
+	}
+	return result, nil
+}
+
+func (s *Service) ConfigureSite(ctx context.Context, siteID int64, input ConfigureInput) (AccountView, error) {
+	mutex := s.siteMutex(siteID)
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	if _, err := s.store.GetSite(ctx, siteID); err != nil {
+		return AccountView{}, err
+	}
+	descriptor, ok := descriptorFor(input.AdapterKey)
+	if !ok {
+		return AccountView{}, ErrUnsupportedAdapter
+	}
+	origin, err := normalizeOrigin(input.DashboardURL)
+	if err != nil {
+		return AccountView{}, err
+	}
+
+	existing, existingErr := s.store.GetSiteAccountSecret(ctx, siteID)
+	var envelope authEnvelope
+	if existingErr == nil {
+		envelope, err = s.decryptEnvelope(existing.AuthCipher)
+		if err != nil {
+			return AccountView{}, err
+		}
+	} else if !errors.Is(existingErr, sql.ErrNoRows) {
+		return AccountView{}, existingErr
+	}
+
+	nextEnvelope, err := mergeAuth(envelope, descriptor, input.Auth, existingErr == nil && existing.AdapterKind == descriptor.Key)
+	if err != nil {
+		return AccountView{}, err
+	}
+	authCipher, err := s.encryptEnvelope(nextEnvelope)
+	if err != nil {
+		return AccountView{}, err
+	}
+	capabilities, err := json.Marshal(descriptor.Capabilities)
+	if err != nil {
+		return AccountView{}, err
+	}
+
+	if errors.Is(existingErr, sql.ErrNoRows) {
+		_, err = s.store.CreateSiteAccount(ctx, store.SiteAccountWrite{
+			SiteID: siteID, AdapterKind: descriptor.Key, APIOrigin: origin,
+			AuthCipher: authCipher, Enabled: input.Enabled, Capabilities: capabilities,
+		})
+	} else {
+		err = s.store.UpdateSiteAccount(ctx, siteID, store.SiteAccountUpdate{
+			AdapterKind: descriptor.Key, APIOrigin: origin, AuthCipher: authCipher,
+			ReplaceAuth: true, Enabled: input.Enabled, Capabilities: capabilities,
+		})
+	}
+	if err != nil {
+		return AccountView{}, err
+	}
+	if input.RefreshNow && input.Enabled {
+		_, _ = s.refreshSiteLocked(ctx, siteID)
+	}
+	return s.GetSite(ctx, siteID)
+}
+
+func (s *Service) DeleteSite(ctx context.Context, siteID int64) error {
+	mutex := s.siteMutex(siteID)
+	mutex.Lock()
+	defer mutex.Unlock()
+	return s.store.DeleteSiteAccount(ctx, siteID)
+}
+
+func (s *Service) GetSite(ctx context.Context, siteID int64) (AccountView, error) {
+	site, err := s.store.GetSite(ctx, siteID)
+	if err != nil {
+		return AccountView{}, err
+	}
+	account, err := s.store.GetSiteAccountSecret(ctx, siteID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AccountView{
+			Configured: false, DashboardURL: s.defaultSiteOrigin(ctx, site),
+			Capabilities: Capabilities{}, Sync: SyncView{State: "unconfigured"},
+		}, nil
+	}
+	if err != nil {
+		return AccountView{}, err
+	}
+	descriptor, ok := descriptorFor(account.AdapterKind)
+	if !ok {
+		return AccountView{}, ErrUnsupportedAdapter
+	}
+	envelope, err := s.decryptEnvelope(account.AuthCipher)
+	if err != nil {
+		return AccountView{}, err
+	}
+	view := AccountView{
+		Configured: true, Enabled: account.Enabled, DashboardURL: account.APIOrigin,
+		Adapter: &AdapterSummary{Key: descriptor.Key, Label: descriptor.Label},
+		Auth:    authSummary(envelope), Capabilities: capabilitiesFrom(account.Capabilities, descriptor.Capabilities),
+		Sync: s.siteSyncView(account.SiteAccount),
+	}
+	snapshot, err := s.store.GetLatestSiteAccountSnapshot(ctx, siteID)
+	if err == nil {
+		view.Snapshot, err = snapshotViewDocument(snapshot.Snapshot, snapshot.CapturedAt, descriptor.Key)
+		if err != nil {
+			return AccountView{}, err
+		}
+		if view.Sync.Error == nil {
+			var document snapshotDocument
+			if json.Unmarshal(snapshot.Snapshot, &document) == nil && len(document.Warnings) > 0 {
+				view.Sync.Error = &SyncErrorView{Code: "partial_sync", Message: warningMessage(document.Warnings)}
+			}
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return AccountView{}, err
+	}
+	return view, nil
+}
+
+func (s *Service) RefreshSite(ctx context.Context, siteID int64) (AccountView, error) {
+	mutex := s.siteMutex(siteID)
+	if !mutex.TryLock() {
+		return AccountView{}, ErrSyncInProgress
+	}
+	defer mutex.Unlock()
+	return s.refreshSiteLocked(ctx, siteID)
+}
+
+func (s *Service) refreshSiteLocked(ctx context.Context, siteID int64) (AccountView, error) {
+	key := siteSyncKey(siteID)
+	s.syncing.Store(key, struct{}{})
+	defer s.syncing.Delete(key)
+
+	account, err := s.store.GetSiteAccountSecret(ctx, siteID)
+	if err != nil {
+		return AccountView{}, err
+	}
+	if !account.Enabled {
+		return AccountView{}, ErrAccountDisabled
+	}
+	descriptor, ok := descriptorFor(account.AdapterKind)
+	if !ok {
+		return AccountView{}, ErrUnsupportedAdapter
+	}
+	envelope, err := s.decryptEnvelope(account.AuthCipher)
+	if err != nil {
+		return AccountView{}, err
+	}
+	adapter, err := accountadapter.New(accountadapter.Kind(descriptor.Key), s.doer)
+	if err != nil {
+		return AccountView{}, err
+	}
+
+	attemptedAt := store.NowMS()
+	connection := accountadapter.Connection{Origin: account.APIOrigin, Credentials: envelope.Credentials}
+	snapshot, rotated, err := adapter.Snapshot(ctx, connection)
+	applyRotation(&connection, rotated)
+	if err != nil {
+		return AccountView{}, s.recordSiteFailureWithCredentials(ctx, siteID, attemptedAt, descriptor.Capabilities, envelope, connection.Credentials, err)
+	}
+
+	capabilities := descriptor.Capabilities
+	warnings := make([]syncWarning, 0, 2)
+	var subscriptions []accountadapter.Subscription
+	if capabilities.Subscription {
+		subscriptions, rotated, err = adapter.Subscriptions(ctx, connection)
+		applyRotation(&connection, rotated)
+		if err != nil {
+			if errors.Is(err, accountadapter.ErrUnsupported) {
+				capabilities.Subscription = false
+			} else {
+				warnings = append(warnings, warningFor(err))
+			}
+		}
+	}
+
+	usage := make([]store.UpstreamAccountUsageWrite, 0)
+	if capabilities.Usage {
+		usageStart := time.Now().Add(-usageInitialRange)
+		if account.LastSuccessAt != nil {
+			incrementalStart := time.UnixMilli(*account.LastSuccessAt).Add(-usageSyncOverlap)
+			if incrementalStart.After(usageStart) {
+				usageStart = incrementalStart
+			}
+		}
+		usage, rotated, err = s.fetchUsage(ctx, adapter, connection, descriptor.Key, attemptedAt, usageStart)
+		applyRotation(&connection, rotated)
+		if err != nil {
+			if errors.Is(err, accountadapter.ErrUnsupported) {
+				capabilities.Usage = false
+			} else {
+				warnings = append(warnings, warningFor(err))
+			}
+			usage = nil
+		}
+	}
+
+	document, err := json.Marshal(snapshotDocument{
+		Version: 1, Account: snapshot, Subscriptions: subscriptions, Warnings: warnings,
+	})
+	if err != nil {
+		return AccountView{}, s.recordSiteFailureWithCredentials(ctx, siteID, attemptedAt, capabilities, envelope, connection.Credentials, err)
+	}
+	capabilityJSON, err := json.Marshal(capabilities)
+	if err != nil {
+		return AccountView{}, s.recordSiteFailureWithCredentials(ctx, siteID, attemptedAt, capabilities, envelope, connection.Credentials, err)
+	}
+	rotatedCipher, err := s.rotatedAuthCipher(envelope, connection.Credentials)
+	if err != nil {
+		return AccountView{}, s.recordSiteFailure(ctx, siteID, attemptedAt, capabilities, err, nil)
+	}
+	succeededAt := store.NowMS()
+	if err := s.store.UpdateSiteAccountSyncSuccess(ctx, siteID, store.SiteAccountSyncSuccess{
+		AttemptedAt: attemptedAt, SucceededAt: succeededAt, SnapshotAt: succeededAt,
+		Capabilities: capabilityJSON, Snapshot: document, Usage: usage, RotatedAuthCipher: rotatedCipher,
+	}); err != nil {
+		return AccountView{}, s.recordSiteFailure(ctx, siteID, attemptedAt, capabilities, err, rotatedCipher)
+	}
+	return s.GetSite(ctx, siteID)
+}
+
+func (s *Service) SiteUsage(ctx context.Context, siteID int64, rangeName string, limit int, beforeIDs ...int64) (UsagePageView, error) {
+	account, err := s.store.GetSiteAccount(ctx, siteID)
+	if err != nil {
+		return UsagePageView{}, err
+	}
+	duration, ok := usageRange(rangeName)
+	if !ok {
+		return UsagePageView{}, fmt.Errorf("unsupported usage range %q", rangeName)
+	}
+	var beforeID int64
+	if len(beforeIDs) > 0 {
+		beforeID = beforeIDs[0]
+	}
+	items, err := s.store.ListSiteAccountUsage(ctx, siteID, store.UpstreamAccountUsageQuery{
+		SinceAt: time.Now().Add(-duration).UnixMilli(), BeforeID: beforeID, Limit: limit + 1,
+	})
+	if err != nil {
+		return UsagePageView{}, err
+	}
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	result := UsagePageView{
+		Items: make([]UsageItemView, 0, len(items)), Range: rangeName,
+		LastSyncedAt: isoPointer(account.LastSuccessAt), HasMore: hasMore,
+	}
+	for _, item := range items {
+		result.Items = append(result.Items, usageItemView(store.UpstreamAccountUsageRecord{
+			ID: item.ID, DedupeKey: item.DedupeKey, ExternalID: item.ExternalID, ModelName: item.ModelName,
+			Amount: item.Amount, Unit: item.Unit, Raw: item.Raw, OccurredAt: item.OccurredAt, SyncedAt: item.SyncedAt,
+		}))
+	}
+	if hasMore && len(items) > 0 {
+		cursor := strconv.FormatInt(items[len(items)-1].ID, 10)
+		result.NextBeforeID = &cursor
 	}
 	return result, nil
 }
@@ -502,10 +803,27 @@ func (s *Service) syncDue(ctx context.Context) {
 			return
 		}
 	}
+	siteAccounts, err := s.store.ListSiteAccounts(ctx)
+	if err != nil {
+		s.logger.Warn("list site accounts for synchronization", "error", redact.String(err.Error()))
+		return
+	}
+	for _, account := range siteAccounts {
+		if !account.Enabled || (account.LastAttemptAt != nil && *account.LastAttemptAt > cutoff) {
+			continue
+		}
+		if _, err := s.RefreshSite(ctx, account.SiteID); err != nil &&
+			!errors.Is(err, context.Canceled) && !errors.Is(err, ErrSyncInProgress) {
+			s.logger.Warn("synchronize site account", "site_id", account.SiteID, "error", redact.String(err.Error()))
+		}
+		if ctx.Err() != nil {
+			return
+		}
+	}
 }
 
 func (s *Service) fetchUsage(ctx context.Context, adapter accountadapter.Adapter, connection accountadapter.Connection, adapterKey string, syncedAt int64, start time.Time) ([]store.UpstreamAccountUsageWrite, *accountadapter.Credentials, error) {
-	items := make([]store.UpstreamAccountUsageWrite, 0, usageSyncLimit)
+	items := make([]store.UpstreamAccountUsageWrite, 0, usageSyncLimit*usageSyncPages)
 	current := connection
 	var latestRotation *accountadapter.Credentials
 	now := time.Now()
@@ -524,11 +842,8 @@ func (s *Service) fetchUsage(ctx context.Context, adapter accountadapter.Adapter
 		}
 		for _, item := range result.Items {
 			items = append(items, usageWrite(adapterKey, item, syncedAt))
-			if len(items) == usageSyncLimit {
-				break
-			}
 		}
-		if len(items) == usageSyncLimit || !result.HasMore || len(result.Items) == 0 {
+		if !result.HasMore || len(result.Items) == 0 {
 			break
 		}
 	}
@@ -566,6 +881,27 @@ func (s *Service) recordFailure(ctx context.Context, upstreamID, attemptedAt int
 	return classified
 }
 
+func (s *Service) recordSiteFailureWithCredentials(ctx context.Context, siteID, attemptedAt int64, capabilities Capabilities, envelope authEnvelope, credentials accountadapter.Credentials, cause error) error {
+	rotatedCipher, err := s.rotatedAuthCipher(envelope, credentials)
+	if err != nil {
+		s.logger.Error("encrypt rotated site account credentials", "site_id", siteID, "error", redact.String(err.Error()))
+		rotatedCipher = nil
+	}
+	return s.recordSiteFailure(ctx, siteID, attemptedAt, capabilities, cause, rotatedCipher)
+}
+
+func (s *Service) recordSiteFailure(ctx context.Context, siteID, attemptedAt int64, capabilities Capabilities, cause error, rotatedCipher []byte) error {
+	classified := classify(cause)
+	capabilityJSON, _ := json.Marshal(capabilities)
+	if err := s.store.UpdateSiteAccountSyncFailure(ctx, siteID, store.SiteAccountSyncFailure{
+		AttemptedAt: attemptedAt, State: "error", ErrorCode: classified.Code,
+		ErrorMessage: classified.Error(), Capabilities: capabilityJSON, RotatedAuthCipher: rotatedCipher,
+	}); err != nil {
+		s.logger.Error("record site account synchronization failure", "site_id", siteID, "error", redact.String(err.Error()))
+	}
+	return classified
+}
+
 func (s *Service) syncView(account store.UpstreamAccount) SyncView {
 	result := SyncView{
 		State: "stale", LastAttemptAt: isoPointer(account.LastAttemptAt), LastSuccessAt: isoPointer(account.LastSuccessAt),
@@ -597,9 +933,49 @@ func (s *Service) syncView(account store.UpstreamAccount) SyncView {
 	return result
 }
 
+func (s *Service) siteSyncView(account store.SiteAccount) SyncView {
+	result := SyncView{
+		State: "stale", LastAttemptAt: isoPointer(account.LastAttemptAt), LastSuccessAt: isoPointer(account.LastSuccessAt),
+	}
+	if account.Enabled {
+		next := time.Now()
+		if account.LastAttemptAt != nil {
+			next = time.UnixMilli(*account.LastAttemptAt).Add(s.interval)
+		}
+		nextText := next.UTC().Format(time.RFC3339)
+		result.NextAt = &nextText
+	}
+	if _, ok := s.syncing.Load(siteSyncKey(account.SiteID)); ok {
+		result.State = "syncing"
+	} else if account.SyncState == "healthy" && account.LastSuccessAt != nil {
+		result.State = "ready"
+	} else if account.SyncState == "error" {
+		result.State = "error"
+	}
+	if account.LastSuccessAt == nil || time.Since(time.UnixMilli(*account.LastSuccessAt)) > time.Duration(staleFactor)*s.interval {
+		result.Stale = true
+		if result.State == "ready" {
+			result.State = "stale"
+		}
+	}
+	if account.LastErrorCode != "" || account.LastErrorMessage != "" {
+		result.Error = &SyncErrorView{Code: account.LastErrorCode, Message: account.LastErrorMessage}
+	}
+	return result
+}
+
 func (s *Service) upstreamMutex(upstreamID int64) *sync.Mutex {
 	value, _ := s.locks.LoadOrStore(upstreamID, &sync.Mutex{})
 	return value.(*sync.Mutex)
+}
+
+func (s *Service) siteMutex(siteID int64) *sync.Mutex {
+	value, _ := s.locks.LoadOrStore(siteSyncKey(siteID), &sync.Mutex{})
+	return value.(*sync.Mutex)
+}
+
+func siteSyncKey(siteID int64) string {
+	return "site:" + strconv.FormatInt(siteID, 10)
 }
 
 func (s *Service) rotatedAuthCipher(envelope authEnvelope, credentials accountadapter.Credentials) ([]byte, error) {
@@ -725,6 +1101,36 @@ func defaultOrigin(item store.Upstream) string {
 	return strings.TrimRight(parsed.String(), "/")
 }
 
+func (s *Service) defaultSiteOrigin(ctx context.Context, item store.Site) string {
+	if item.DashboardURL != "" {
+		return strings.TrimRight(item.DashboardURL, "/")
+	}
+	endpoints, err := s.store.ListInferenceEndpoints(ctx, item.ID)
+	if err != nil || len(endpoints) == 0 {
+		return ""
+	}
+	return originFromBaseURL(endpoints[0].BaseURL)
+}
+
+func originFromBaseURL(value string) string {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return ""
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	for _, suffix := range []string{"/api/v1", "/v1", "/api"} {
+		if strings.HasSuffix(strings.ToLower(path), suffix) {
+			path = path[:len(path)-len(suffix)]
+			break
+		}
+	}
+	parsed.Path = path
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/")
+}
+
 func capabilitiesFrom(raw json.RawMessage, fallback Capabilities) Capabilities {
 	var result Capabilities
 	if len(raw) == 0 || json.Unmarshal(raw, &result) != nil {
@@ -734,11 +1140,15 @@ func capabilitiesFrom(raw json.RawMessage, fallback Capabilities) Capabilities {
 }
 
 func snapshotView(snapshot store.UpstreamAccountSnapshot, adapterKey string) (*SnapshotView, error) {
+	return snapshotViewDocument(snapshot.Snapshot, snapshot.CapturedAt, adapterKey)
+}
+
+func snapshotViewDocument(raw json.RawMessage, capturedAt int64, adapterKey string) (*SnapshotView, error) {
 	var document snapshotDocument
-	if err := json.Unmarshal(snapshot.Snapshot, &document); err != nil {
+	if err := json.Unmarshal(raw, &document); err != nil {
 		return nil, errors.New("cannot decode upstream account snapshot")
 	}
-	result := &SnapshotView{CapturedAt: time.UnixMilli(snapshot.CapturedAt).UTC().Format(time.RFC3339)}
+	result := &SnapshotView{CapturedAt: time.UnixMilli(capturedAt).UTC().Format(time.RFC3339)}
 	if document.Account.Balance != "" {
 		currency := firstNonEmpty(document.Account.Currency, "raw")
 		sourceLabel := "站点原始余额"
@@ -814,7 +1224,10 @@ func usageDedupe(item accountadapter.UsageItem) string {
 }
 
 func usageItemView(record store.UpstreamAccountUsageRecord) UsageItemView {
-	result := UsageItemView{ID: strconv.FormatInt(record.ID, 10), ExternalID: record.ExternalID}
+	result := UsageItemView{
+		ID: strconv.FormatInt(record.ID, 10), ExternalID: record.ExternalID,
+		SyncedAt: time.UnixMilli(record.SyncedAt).UTC().Format(time.RFC3339),
+	}
 	if record.OccurredAt != nil {
 		text := time.UnixMilli(*record.OccurredAt).UTC().Format(time.RFC3339)
 		result.OccurredAt = &text
@@ -828,10 +1241,34 @@ func usageItemView(record store.UpstreamAccountUsageRecord) UsageItemView {
 	}
 	var item accountadapter.UsageItem
 	if json.Unmarshal(record.Raw, &item) == nil {
-		input, output := item.PromptTokens, item.CompletionTokens
-		result.InputTokens, result.OutputTokens = &input, &output
+		var fields map[string]json.RawMessage
+		_ = json.Unmarshal(record.Raw, &fields)
+		result.RequestID = item.RequestID
+		result.UpstreamRequestID = item.UpstreamRequestID
+		result.UpstreamModel = nonEmptyStringPointer(item.UpstreamModel)
+		result.ReasoningEffort = nonEmptyStringPointer(item.ReasoningEffort)
+		result.OriginalCost = nonEmptyStringPointer(item.TotalCost)
+		result.ActualCost = nonEmptyStringPointer(item.ActualCost)
+		result.Quota = nonEmptyStringPointer(item.Quota)
+		result.InputTokens = presentInt64(fields, "prompt_tokens", item.PromptTokens)
+		result.CacheReadTokens = presentInt64(fields, "cache_read_tokens", item.CacheReadTokens)
+		result.CacheCreationTokens = presentInt64(fields, "cache_creation_tokens", item.CacheCreationTokens)
+		result.OutputTokens = presentInt64(fields, "completion_tokens", item.CompletionTokens)
+		result.ReasoningTokens = presentInt64(fields, "reasoning_tokens", item.ReasoningTokens)
+		result.TotalTokens = presentInt64(fields, "total_tokens", item.TotalTokens)
+		result.DurationMS = presentInt64(fields, "duration_ms", item.DurationMS)
+		result.FirstTokenMS = presentInt64(fields, "first_token_ms", item.FirstTokenMS)
+		result.Stream = presentBool(fields, "stream", item.Stream)
+		result.RateMultiplier = nonEmptyStringPointer(item.RateMultiplier)
+		result.ModelMultiplier = nonEmptyStringPointer(item.ModelMultiplier)
+		result.GroupMultiplier = nonEmptyStringPointer(item.GroupMultiplier)
+		result.APIKeyID, result.APIKeyName = item.APIKeyID, item.APIKeyName
+		result.GroupID, result.GroupName = item.GroupID, item.GroupName
+		result.Endpoint = item.Endpoint
+		result.RequestType, result.BillingType, result.BillingMode = item.Type, item.BillingType, item.BillingMode
 		result.SourceText = firstNonEmpty(item.Content, item.RequestID, item.UpstreamRequestID)
-		if item.StatusCode != 0 {
+		if statusCode := presentInt(fields, "status_code", item.StatusCode); statusCode != nil {
+			result.HTTPStatus = statusCode
 			status := fmt.Sprintf("HTTP %d", item.StatusCode)
 			if item.StatusCode >= 200 && item.StatusCode < 300 {
 				status = "success"
@@ -840,6 +1277,38 @@ func usageItemView(record store.UpstreamAccountUsageRecord) UsageItemView {
 		}
 	}
 	return result
+}
+
+func nonEmptyStringPointer(value string) *string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func presentInt64(fields map[string]json.RawMessage, key string, value int64) *int64 {
+	if _, ok := fields[key]; !ok {
+		return nil
+	}
+	copy := value
+	return &copy
+}
+
+func presentInt(fields map[string]json.RawMessage, key string, value int) *int {
+	if _, ok := fields[key]; !ok {
+		return nil
+	}
+	copy := value
+	return &copy
+}
+
+func presentBool(fields map[string]json.RawMessage, key string, value bool) *bool {
+	if _, ok := fields[key]; !ok {
+		return nil
+	}
+	copy := value
+	return &copy
 }
 
 func warningFor(err error) syncWarning {

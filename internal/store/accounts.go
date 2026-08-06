@@ -297,9 +297,17 @@ VALUES (?,?,?)`, accountID, snapshot, snapshotAt); err != nil {
 		if syncedAt == 0 {
 			syncedAt = succeededAt
 		}
+		// Existing upstream records can be finalized after their first appearance.
+		// Preserve the local row id while refreshing every source-owned field.
 		if _, err := tx.ExecContext(ctx, `INSERT INTO upstream_account_usage_records(
 upstream_account_id,dedupe_key,external_id,model_name,amount_text,unit,raw_json,occurred_at,synced_at)
-VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(upstream_account_id,dedupe_key) DO NOTHING`,
+VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(upstream_account_id,dedupe_key) DO UPDATE SET
+external_id=COALESCE(excluded.external_id,upstream_account_usage_records.external_id),
+model_name=COALESCE(excluded.model_name,upstream_account_usage_records.model_name),
+amount_text=COALESCE(excluded.amount_text,upstream_account_usage_records.amount_text),
+unit=COALESCE(excluded.unit,upstream_account_usage_records.unit),raw_json=excluded.raw_json,
+occurred_at=COALESCE(excluded.occurred_at,upstream_account_usage_records.occurred_at),
+synced_at=MAX(excluded.synced_at,upstream_account_usage_records.synced_at)`,
 			accountID, item.DedupeKey, nullableString(strings.TrimSpace(item.ExternalID)), nullableString(strings.TrimSpace(item.ModelName)),
 			nullableString(strings.TrimSpace(item.Amount)), nullableString(strings.TrimSpace(item.Unit)), item.raw, accountNullableInt64(item.OccurredAt), syncedAt); err != nil {
 			return err
@@ -425,6 +433,20 @@ WHERE expired.captured_at<?
   AND EXISTS (
     SELECT 1 FROM upstream_account_snapshots AS newer
     WHERE newer.upstream_account_id=expired.upstream_account_id
+      AND (newer.captured_at>expired.captured_at
+        OR (newer.captured_at=expired.captured_at AND newer.id>expired.id))
+  )`, cutoffMS); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM site_account_usage_records
+WHERE COALESCE(occurred_at,synced_at)<?`, cutoffMS); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM site_account_snapshots AS expired
+WHERE expired.captured_at<?
+  AND EXISTS (
+    SELECT 1 FROM site_account_snapshots AS newer
+    WHERE newer.site_account_id=expired.site_account_id
       AND (newer.captured_at>expired.captured_at
         OR (newer.captured_at=expired.captured_at AND newer.id>expired.id))
   )`, cutoffMS); err != nil {

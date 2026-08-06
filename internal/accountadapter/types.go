@@ -119,6 +119,7 @@ type UsageItem struct {
 	CompletionTokens    int64  `json:"completion_tokens,omitempty"`
 	CacheReadTokens     int64  `json:"cache_read_tokens,omitempty"`
 	CacheCreationTokens int64  `json:"cache_creation_tokens,omitempty"`
+	ReasoningTokens     int64  `json:"reasoning_tokens,omitempty"`
 	TotalTokens         int64  `json:"total_tokens,omitempty"`
 	Quota               string `json:"quota,omitempty"`
 	TotalCost           string `json:"total_cost,omitempty"`

@@ -16,14 +16,15 @@ import { useState } from 'react';
 import { Badge, Button, Dialog, EmptyState, ErrorState, LoadingState } from '../../components/ui';
 import { useToast } from '../../components/Toast';
 import { api } from '../../lib/api';
-import { formatDateTime, formatRelativeTime, formatTokens } from '../../lib/format';
+import { formatDateTime, formatLatency, formatTokens } from '../../lib/format';
 import { useAsyncData } from '../../lib/hooks';
 import type {
   AccountSyncState,
+  AccountTarget,
   AccountUsageRange,
   SourceAmount,
-  Upstream,
   UpstreamAccount,
+  UpstreamUsagePage,
   UpstreamUsageItem,
 } from '../../lib/types';
 import { AccountConfigDialog } from './AccountConfigDialog';
@@ -54,9 +55,9 @@ function amountText(amount: SourceAmount | null | undefined): string {
 
 function credentialSummary(account: UpstreamAccount): string {
   if (!account.auth) return '-';
-  if (account.auth.kind === 'api_token') return account.auth.hasApiToken ? 'API Token 已保存' : 'API Token 缺失';
+  if (account.auth.kind === 'api_token') return account.auth.hasApiToken ? '管理 Token 已保存' : '管理 Token 缺失';
   const saved = [account.auth.hasAccessToken && 'Access', account.auth.hasRefreshToken && 'Refresh'].filter(Boolean);
-  return saved.length === 2 ? 'Access + Refresh 已保存' : `${saved.join(' + ') || 'Token'} 不完整`;
+  return saved.length === 2 ? '管理 Access + Refresh 已保存' : `${saved.join(' + ') || '管理 Token'} 不完整`;
 }
 
 function usageStatusTone(status: string | null): 'neutral' | 'success' | 'warning' | 'danger' {
@@ -71,24 +72,36 @@ function UsageRow({ item }: { item: UpstreamUsageItem }) {
   const tokenSummary = item.inputTokens == null && item.outputTokens == null
     ? '-'
     : `${item.inputTokens == null ? '-' : formatTokens(item.inputTokens)} / ${item.outputTokens == null ? '-' : formatTokens(item.outputTokens)}`;
+  const cacheSummary = item.cacheReadTokens == null && item.cacheCreationTokens == null
+    ? '-'
+    : `${item.cacheReadTokens == null ? '-' : formatTokens(item.cacheReadTokens)} / ${item.cacheCreationTokens == null ? '-' : formatTokens(item.cacheCreationTokens)}`;
+  const reasoningSummary = [item.reasoningEffort, item.reasoningTokens == null ? null : formatTokens(item.reasoningTokens)].filter(Boolean).join(' · ') || '-';
+  const timingSummary = item.firstTokenMs == null && item.durationMs == null
+    ? '-'
+    : `${formatLatency(item.firstTokenMs ?? null)} / ${formatLatency(item.durationMs ?? null)}`;
+  const requestLabel = item.requestId || item.upstreamRequestId || item.externalId || '无请求 ID';
+  const statusLabel = item.status || (item.httpStatus ? `HTTP ${item.httpStatus}` : '站点未提供');
 
   return (
     <div className="account-usage-row">
       <div className="account-usage-primary">
-        <code>{item.model || '未知模型'}</code>
-        <span>{item.sourceText || item.externalId || '站点原始记录'}</span>
+        <strong>{formatDateTime(item.occurredAt)}</strong>
+        <code>{item.model || item.upstreamModel || '站点未提供模型'}</code>
+        <span title={requestLabel}>{requestLabel}</span>
       </div>
       <div className="account-usage-metric"><span>输入 / 输出</span><strong>{tokenSummary}</strong></div>
+      <div className="account-usage-metric"><span>缓存读 / 写</span><strong>{cacheSummary}</strong><small>{reasoningSummary === '-' ? '无思考数据' : `思考 ${reasoningSummary}`}</small></div>
+      <div className="account-usage-metric"><span>TTFT / 总耗时</span><strong>{timingSummary}</strong></div>
       <div className="account-usage-metric"><span>站点扣费</span><strong>{amountText(item.amount)}</strong></div>
       <div className="account-usage-meta">
-        <Badge tone={usageStatusTone(item.status)}>{item.status || '未知'}</Badge>
-        <span title={formatDateTime(item.occurredAt)}>{formatRelativeTime(item.occurredAt)}</span>
+        <Badge tone={usageStatusTone(item.status)}>{statusLabel}</Badge>
+        <span>{item.apiKeyName || item.groupName || '站点未提供 Key'}</span>
       </div>
     </div>
   );
 }
 
-export function AccountTab({ upstream }: { upstream: Upstream }) {
+export function AccountTab({ target, onChanged }: { target: AccountTarget; onChanged?: () => void }) {
   const toast = useToast();
   const [configOpen, setConfigOpen] = useState(false);
   const [removeOpen, setRemoveOpen] = useState(false);
@@ -96,32 +109,66 @@ export function AccountTab({ upstream }: { upstream: Upstream }) {
   const [usageVersion, setUsageVersion] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   const [removing, setRemoving] = useState(false);
+  const [olderItems, setOlderItems] = useState<UpstreamUsageItem[]>([]);
+  const [nextBeforeId, setNextBeforeId] = useState<string | null>(null);
+  const [hasMoreOverride, setHasMoreOverride] = useState<boolean | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
 
   const bundle = useAsyncData<AccountBundle>(async () => {
     const [adapters, account] = await Promise.all([
       api.accountAdapters(),
-      api.upstreamAccount(upstream.id),
+      readAccount(target),
     ]);
     return { adapters, account };
-  }, [upstream.id]);
+  }, [target.kind, target.id]);
 
   const account = bundle.data?.account ?? null;
   const usageEnabled = Boolean(account?.configured && account.enabled && account.capabilities.usage);
   const usage = useAsyncData(async () => {
     if (!usageEnabled) return { items: [], range, lastSyncedAt: null };
-    return api.upstreamAccountUsage(upstream.id, range, 50);
-  }, [upstream.id, range, usageEnabled, usageVersion]);
+    return readAccountUsage(target, range, 50);
+  }, [target.kind, target.id, range, usageEnabled, usageVersion]);
 
   const updateAccount = (updated: UpstreamAccount) => {
     bundle.setData((current) => current ? { ...current, account: updated } : current);
+    setOlderItems([]);
+    setNextBeforeId(null);
+    setHasMoreOverride(null);
     setUsageVersion((value) => value + 1);
+    onChanged?.();
+  };
+
+  const changeRange = (next: AccountUsageRange) => {
+    setRange(next);
+    setOlderItems([]);
+    setNextBeforeId(null);
+    setHasMoreOverride(null);
+  };
+
+  const loadMore = async () => {
+    const cursor = nextBeforeId ?? usage.data?.nextBeforeId ?? null;
+    if (!cursor || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const page = await readAccountUsage(target, range, 50, cursor);
+      setOlderItems((current) => {
+        const seen = new Set(current.map((item) => item.id));
+        return [...current, ...page.items.filter((item) => !seen.has(item.id))];
+      });
+      setNextBeforeId(page.nextBeforeId ?? null);
+      setHasMoreOverride(Boolean(page.hasMore));
+    } catch (reason) {
+      toast.show(reason instanceof Error ? reason.message : '加载更多记录失败', 'error');
+    } finally {
+      setLoadingMore(false);
+    }
   };
 
   const refreshAccount = async () => {
     if (!account?.configured || !account.enabled) return;
     setRefreshing(true);
     try {
-      updateAccount(await api.refreshUpstreamAccount(upstream.id));
+      updateAccount(await refreshAccountTarget(target));
       toast.show('账户数据已刷新', 'success');
     } catch (reason) {
       toast.show(reason instanceof Error ? reason.message : '账户刷新失败', 'error');
@@ -134,11 +181,11 @@ export function AccountTab({ upstream }: { upstream: Upstream }) {
   const removeAccount = async () => {
     setRemoving(true);
     try {
-      await api.deleteUpstreamAccount(upstream.id);
-      const updated = await api.upstreamAccount(upstream.id);
+      await deleteAccountTarget(target);
+      const updated = await readAccount(target);
       updateAccount(updated);
       setRemoveOpen(false);
-      toast.show('账户连接已移除，上游 API Key 未受影响', 'success');
+      toast.show('账户连接已移除，推理 API Key 未受影响', 'success');
     } catch (reason) {
       toast.show(reason instanceof Error ? reason.message : '移除账户连接失败', 'error');
     } finally {
@@ -164,7 +211,7 @@ export function AccountTab({ upstream }: { upstream: Upstream }) {
       {!account.configured ? (
         <div className="account-unconfigured">
           <ServerCog size={28} aria-hidden="true" />
-          <div><strong>尚未连接站点账户</strong><p>选择站点适配器并提供账户 Token 后，面板才能定时读取余额、套餐和原始使用记录。</p></div>
+          <div><strong>尚未连接站点账户</strong><p>选择站点适配器并提供管理 Token 后，面板才能定时读取余额、套餐和原始使用记录；这里不使用推理 API Key。</p></div>
           <Button variant="primary" icon={KeyRound} disabled={bundle.data.adapters.length === 0} onClick={() => setConfigOpen(true)}>配置账户</Button>
           {bundle.data.adapters.length === 0 && <span className="muted-copy">服务端没有返回可用的账户适配器。</span>}
         </div>
@@ -218,7 +265,7 @@ export function AccountTab({ upstream }: { upstream: Upstream }) {
             <div className="account-panel-heading">
               <div><Activity size={16} aria-hidden="true" /><strong>站点使用记录</strong></div>
               {account.capabilities.usage && <div className="usage-range-switch" role="group" aria-label="使用记录时间范围">
-                {rangeLabels.map((item) => <button type="button" className={range === item.value ? 'is-active' : ''} key={item.value} onClick={() => setRange(item.value)}>{item.label}</button>)}
+                {rangeLabels.map((item) => <button type="button" className={range === item.value ? 'is-active' : ''} key={item.value} onClick={() => changeRange(item.value)}>{item.label}</button>)}
               </div>}
             </div>
             {!account.capabilities.usage ? (
@@ -227,12 +274,12 @@ export function AccountTab({ upstream }: { upstream: Upstream }) {
               <div className="account-section-loading"><RefreshCw className="spin" size={16} />正在读取原始记录</div>
             ) : usage.error ? (
               <div className="account-inline-error"><span>{usage.error}</span><Button size="sm" onClick={() => void usage.refresh()}>重试</Button></div>
-            ) : usage.data?.items.length ? (
-              <div className="account-usage-list">{usage.data.items.map((item) => <UsageRow item={item} key={item.id} />)}</div>
+            ) : usage.data?.items.length || olderItems.length ? (
+              <div className="account-usage-list">{[...(usage.data?.items ?? []), ...olderItems].map((item) => <UsageRow item={item} key={item.id} />)}</div>
             ) : (
               <EmptyState title="当前范围没有记录" description="站点没有返回可展示的原始使用记录。" />
             )}
-            {account.capabilities.usage && usage.data && <div className="account-usage-footnote"><span>最多显示最近 50 条</span><span>最近同步 {formatDateTime(usage.data.lastSyncedAt)}</span></div>}
+            {account.capabilities.usage && usage.data && <div className="account-usage-footnote"><span>{(hasMoreOverride ?? usage.data.hasMore) && (nextBeforeId ?? usage.data.nextBeforeId) ? <Button size="sm" busy={loadingMore} onClick={() => void loadMore()}>加载更多</Button> : '已显示当前范围内全部记录'}</span><span>最近同步 {formatDateTime(usage.data.lastSyncedAt)}</span></div>}
           </section>
 
           <section className="account-connection-section">
@@ -242,7 +289,7 @@ export function AccountTab({ upstream }: { upstream: Upstream }) {
             </div>
             <dl className="compact-definition account-connection-definition">
               <div><dt>适配器</dt><dd>{account.adapter?.label || '-'}</dd></div>
-              <div><dt>账户凭据</dt><dd>{credentialSummary(account)}</dd></div>
+              <div><dt>管理凭据</dt><dd>{credentialSummary(account)}</dd></div>
               {account.auth?.kind === 'access_refresh' && <div><dt>Access 到期</dt><dd>{formatDateTime(account.auth.accessTokenExpiresAt)}</dd></div>}
               <div><dt>站点面板</dt><dd>{account.dashboardUrl ? <a href={account.dashboardUrl} target="_blank" rel="noreferrer">打开站点<ExternalLink size={12} aria-hidden="true" /></a> : '-'}</dd></div>
             </dl>
@@ -252,7 +299,7 @@ export function AccountTab({ upstream }: { upstream: Upstream }) {
 
       <AccountConfigDialog
         open={configOpen}
-        upstream={upstream}
+        target={target}
         adapters={bundle.data.adapters}
         account={account}
         onClose={() => setConfigOpen(false)}
@@ -262,13 +309,31 @@ export function AccountTab({ upstream }: { upstream: Upstream }) {
       <Dialog
         open={removeOpen}
         title="移除账户连接"
-        description="只会删除余额、套餐和使用记录的连接配置，不会删除上游或代理 API Key。"
+        description="只会删除余额、套餐和使用记录的连接配置，不会删除站点、接入地址或推理 API Key。"
         onClose={() => setRemoveOpen(false)}
         width="sm"
         footer={<><Button onClick={() => setRemoveOpen(false)}>取消</Button><Button variant="danger" icon={Trash2} busy={removing} onClick={() => void removeAccount()}>确认移除</Button></>}
       >
-        <div className="account-remove-summary"><strong>{upstream.name}</strong><span>{account.adapter?.label || '账户适配器'}</span><code>{account.dashboardUrl}</code></div>
+        <div className="account-remove-summary"><strong>{target.name}</strong><span>{account.adapter?.label || '账户适配器'}</span><code>{account.dashboardUrl}</code></div>
       </Dialog>
     </div>
   );
+}
+
+function readAccount(target: AccountTarget): Promise<UpstreamAccount> {
+  return target.kind === 'site' ? api.siteAccount(target.id) : api.upstreamAccount(target.id);
+}
+
+function readAccountUsage(target: AccountTarget, range: AccountUsageRange, limit: number, beforeId?: string): Promise<UpstreamUsagePage> {
+  return target.kind === 'site'
+    ? api.siteAccountUsage(target.id, range, limit, beforeId)
+    : api.upstreamAccountUsage(target.id, range, limit, beforeId);
+}
+
+function refreshAccountTarget(target: AccountTarget): Promise<UpstreamAccount> {
+  return target.kind === 'site' ? api.refreshSiteAccount(target.id) : api.refreshUpstreamAccount(target.id);
+}
+
+function deleteAccountTarget(target: AccountTarget): Promise<void> {
+  return target.kind === 'site' ? api.deleteSiteAccount(target.id) : api.deleteUpstreamAccount(target.id);
 }

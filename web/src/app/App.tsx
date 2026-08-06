@@ -12,6 +12,7 @@ import { MonitorPage } from '../pages/MonitorPage';
 import { RoutesPage } from '../pages/RoutesPage';
 import { SettingsPage } from '../pages/SettingsPage';
 import { UpstreamsPage } from '../pages/UpstreamsPage';
+import { UpstreamDetailPage } from '../pages/upstreams/UpstreamDetailPage';
 
 export function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -41,7 +42,7 @@ export function App() {
     }
   };
 
-  if (checking) return <div className="boot-screen"><div className="brand-mark">J</div><LoadingState label="正在连接 JieShan" /></div>;
+  if (checking) return <div className="boot-screen"><div className="brand-mark"><img src="/jieshan-brand.jpg" alt="" /></div><LoadingState label="正在连接 JieShan" /></div>;
 
   if (!user) return <LoginPage onLogin={login} onDemo={async () => setUser(await api.me())} />;
 
@@ -52,6 +53,7 @@ export function App() {
           <Route element={<AppShell user={user} onLogout={logout} />}>
             <Route index element={<MonitorPage />} />
             <Route path="upstreams" element={<UpstreamsPage />} />
+            <Route path="upstreams/:upstreamId" element={<UpstreamDetailPage />} />
             <Route path="routes" element={<RoutesPage />} />
             <Route path="keys" element={<KeysPage />} />
             <Route path="logs" element={<LogsPage />} />

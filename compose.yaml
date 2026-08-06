@@ -1,5 +1,3 @@
-name: jieshan
-
 services:
   jieshan:
     image: ${JIESHAN_IMAGE:-ghcr.io/lutiantian001/jieshan:latest}

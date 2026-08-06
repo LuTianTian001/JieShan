@@ -32,24 +32,35 @@ type FXSnapshot struct {
 }
 
 type RateBand struct {
-	MaxInputTokens      *int64 `json:"max_input_tokens,omitempty"`
-	InputPerMillion     string `json:"input_per_million,omitempty"`
-	CachePerMillion     string `json:"cache_per_million,omitempty"`
-	OutputPerMillion    string `json:"output_per_million,omitempty"`
-	ReasoningPerMillion string `json:"reasoning_per_million,omitempty"`
+	MaxInputTokens         *int64 `json:"max_input_tokens,omitempty"`
+	InputPerMillion        string `json:"input_per_million,omitempty"`
+	CachePerMillion        string `json:"cache_per_million,omitempty"`
+	CacheWritePerMillion   string `json:"cache_write_per_million,omitempty"`
+	CacheWrite1HPerMillion string `json:"cache_write_1h_per_million,omitempty"`
+	OutputPerMillion       string `json:"output_per_million,omitempty"`
+	ReasoningPerMillion    string `json:"reasoning_per_million,omitempty"`
+}
+
+// PricePeriod is active from EffectiveFrom 00:00 UTC until EffectiveUntil
+// 00:00 UTC. An empty EffectiveUntil leaves the period open-ended.
+type PricePeriod struct {
+	EffectiveFrom  string     `json:"effective_from"`
+	EffectiveUntil string     `json:"effective_until,omitempty"`
+	Bands          []RateBand `json:"bands"`
 }
 
 type ModelPrice struct {
-	Provider        string     `json:"provider"`
-	Name            string     `json:"name"`
-	Aliases         []string   `json:"aliases,omitempty"`
-	Currency        string     `json:"currency"`
-	Priced          bool       `json:"priced"`
-	UnpricedReason  string     `json:"unpriced_reason,omitempty"`
-	Bands           []RateBand `json:"bands,omitempty"`
-	SourceURL       string     `json:"source_url"`
-	SourceCheckedAt string     `json:"source_checked_at"`
-	Notes           string     `json:"notes,omitempty"`
+	Provider        string        `json:"provider"`
+	Name            string        `json:"name"`
+	Aliases         []string      `json:"aliases,omitempty"`
+	Currency        string        `json:"currency"`
+	Priced          bool          `json:"priced"`
+	UnpricedReason  string        `json:"unpriced_reason,omitempty"`
+	Bands           []RateBand    `json:"bands,omitempty"`
+	PricePeriods    []PricePeriod `json:"price_periods,omitempty"`
+	SourceURL       string        `json:"source_url"`
+	SourceCheckedAt string        `json:"source_checked_at"`
+	Notes           string        `json:"notes,omitempty"`
 }
 
 type Catalog struct {
@@ -208,18 +219,66 @@ func validateModel(model *ModelPrice) error {
 		if strings.TrimSpace(model.UnpricedReason) == "" {
 			return fmt.Errorf("unpriced_reason is required for unpriced models")
 		}
-		if len(model.Bands) != 0 {
-			return fmt.Errorf("unpriced models cannot contain rate bands")
+		if len(model.Bands) != 0 || len(model.PricePeriods) != 0 {
+			return fmt.Errorf("unpriced models cannot contain rate bands or price periods")
 		}
 		return nil
 	}
-	if len(model.Bands) == 0 {
-		return fmt.Errorf("priced model has no rate bands")
+	if len(model.Bands) == 0 && len(model.PricePeriods) == 0 {
+		return fmt.Errorf("priced model has no rate bands or price periods")
+	}
+	if len(model.Bands) != 0 && len(model.PricePeriods) != 0 {
+		return fmt.Errorf("priced model cannot mix legacy bands and price periods")
+	}
+	if len(model.Bands) != 0 {
+		return validateRateBands(model.Bands)
+	}
+	var previousFrom, previousUntil time.Time
+	previousOpenEnded := false
+	for i := range model.PricePeriods {
+		period := &model.PricePeriods[i]
+		from, err := parseDate("price period effective_from", period.EffectiveFrom)
+		if err != nil {
+			return fmt.Errorf("price period %d: %w", i, err)
+		}
+		var until time.Time
+		if period.EffectiveUntil != "" {
+			until, err = parseDate("price period effective_until", period.EffectiveUntil)
+			if err != nil {
+				return fmt.Errorf("price period %d: %w", i, err)
+			}
+			if !from.Before(until) {
+				return fmt.Errorf("price period %d effective_until must be after effective_from", i)
+			}
+		}
+		if i > 0 {
+			if previousOpenEnded {
+				return fmt.Errorf("only the final price period may be open-ended")
+			}
+			if !from.After(previousFrom) {
+				return fmt.Errorf("price periods must be ordered by effective_from")
+			}
+			if from.Before(previousUntil) {
+				return fmt.Errorf("price periods cannot overlap")
+			}
+		}
+		if err := validateRateBands(period.Bands); err != nil {
+			return fmt.Errorf("price period %d: %w", i, err)
+		}
+		previousFrom, previousUntil = from, until
+		previousOpenEnded = period.EffectiveUntil == ""
+	}
+	return nil
+}
+
+func validateRateBands(bands []RateBand) error {
+	if len(bands) == 0 {
+		return fmt.Errorf("rate bands are required")
 	}
 	var previous int64
-	for i := range model.Bands {
-		band := &model.Bands[i]
-		if i < len(model.Bands)-1 && band.MaxInputTokens == nil {
+	for i := range bands {
+		band := &bands[i]
+		if i < len(bands)-1 && band.MaxInputTokens == nil {
 			return fmt.Errorf("only the final rate band may omit max_input_tokens")
 		}
 		if band.MaxInputTokens != nil {
@@ -233,6 +292,7 @@ func validateModel(model *ModelPrice) error {
 		}
 		for name, value := range map[string]string{
 			"input": band.InputPerMillion, "cache": band.CachePerMillion,
+			"cache_write": band.CacheWritePerMillion, "cache_write_1h": band.CacheWrite1HPerMillion,
 			"output": band.OutputPerMillion, "reasoning": band.ReasoningPerMillion,
 		} {
 			if value == "" {
@@ -247,10 +307,16 @@ func validateModel(model *ModelPrice) error {
 }
 
 func validateDate(field, value string) error {
-	if _, err := time.Parse("2006-01-02", value); err != nil {
-		return invalidCatalog("%s must be YYYY-MM-DD", field)
+	_, err := parseDate(field, value)
+	return err
+}
+
+func parseDate(field, value string) (time.Time, error) {
+	parsed, err := time.Parse("2006-01-02", value)
+	if err != nil {
+		return time.Time{}, invalidCatalog("%s must be YYYY-MM-DD", field)
 	}
-	return nil
+	return parsed, nil
 }
 
 func validateHTTPS(raw string) error {

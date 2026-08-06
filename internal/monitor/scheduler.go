@@ -35,9 +35,23 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 func (s *Scheduler) runDue(ctx context.Context) {
+	var group sync.WaitGroup
+	group.Add(2)
+	go func() {
+		defer group.Done()
+		s.runV3Due(ctx)
+	}()
+	go func() {
+		defer group.Done()
+		s.runLegacyDue(ctx)
+	}()
+	group.Wait()
+}
+
+func (s *Scheduler) runLegacyDue(ctx context.Context) {
 	routes, err := s.store.ListRoutes(ctx)
 	if err != nil {
-		s.logger.Warn("monitor scheduler could not load routes", "error", err)
+		s.logger.Warn("monitor scheduler could not load legacy routes", "error", err)
 		return
 	}
 	jobs := dueProbeJobs(routes, time.Now())
@@ -67,6 +81,57 @@ func (s *Scheduler) runDue(ctx context.Context) {
 	for _, job := range jobs {
 		select {
 		case queue <- job:
+		case <-ctx.Done():
+			close(queue)
+			group.Wait()
+			return
+		}
+	}
+	close(queue)
+	group.Wait()
+}
+
+func (s *Scheduler) runV3Due(ctx context.Context) {
+	nowMS := time.Now().UnixMilli()
+	if _, err := s.store.ExpireStaleProbeRuns(ctx, nowMS); err != nil {
+		s.logger.Warn("monitor scheduler could not expire stale V3 probes", "error", err)
+		return
+	}
+	models, err := s.store.ListDuePublishedModels(ctx, nowMS, 50)
+	if err != nil {
+		s.logger.Warn("monitor scheduler could not load V3 models", "error", err)
+		return
+	}
+	if len(models) == 0 {
+		return
+	}
+	workers := 2
+	if len(models) < workers {
+		workers = len(models)
+	}
+	queue := make(chan store.PublishedModel)
+	var group sync.WaitGroup
+	for range workers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for model := range queue {
+				deadline := time.Duration(model.RequestDeadlineSeconds) * time.Second
+				if deadline < 20*time.Second {
+					deadline = 20 * time.Second
+				}
+				probeCtx, cancel := context.WithTimeout(ctx, deadline)
+				_, err := s.gateway.ProbePublishedModel(probeCtx, model.ID, nil, "scheduled")
+				cancel()
+				if err != nil {
+					s.logger.Warn("V3 model probe failed", "published_model_id", model.ID, "model", model.PublicName, "error", err)
+				}
+			}
+		}()
+	}
+	for _, model := range models {
+		select {
+		case queue <- model:
 		case <-ctx.Done():
 			close(queue)
 			group.Wait()

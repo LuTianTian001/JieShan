@@ -1,30 +1,41 @@
 # Deployment
 
-This guide targets one administrator running JieShan, Caddy, and a light
-sing-box or Xray node on a two-core, one-gigabyte Debian server. That host size
-is suitable for low concurrency. Use two gigabytes when the proxy node serves
-other people or carries sustained traffic.
+This guide targets one administrator running JieShan behind Caddy on a
+two-core, one-gigabyte Linux server. That size is suitable for light personal
+traffic when the server pulls a prebuilt image. If the same server also runs a
+VPN or proxy for other people, two gigabytes is the safer baseline.
 
-## Host layout
+## Capacity plan
 
-The default Compose limits reserve room for the operating system and the proxy
-node:
+The supplied Compose limits leave part of a one-gigabyte host available to the
+kernel, Caddy, and a light personal proxy:
 
 | Component | Suggested limit or working range |
 | --- | --- |
-| JieShan | 640 MiB memory, 768 MiB memory-plus-swap, 480 MiB Go limit |
-| Caddy | Usually tens of MiB under light traffic |
-| sing-box or Xray | Configuration-dependent; keep its cache and logs bounded |
-| Swap | 1 GiB, used for brief peaks rather than normal operation |
+| JieShan container | 640 MiB memory, 768 MiB memory plus swap |
+| Go heap | 480 MiB through `GOMEMLIMIT` |
+| Caddy | Usually tens of MiB at light traffic |
+| sing-box or Xray | Configuration-dependent; bound caches and logs |
+| Swap | 1 GiB for short peaks, not sustained normal use |
 
-Do not install PostgreSQL, Redis, a desktop environment, or a large server
-panel on this host. Build images in GitHub Actions or another machine; the
-server should normally pull and run the image.
+Two cores and one gigabyte are enough when:
 
-## Prepare the server
+- there is one administrator;
+- request concurrency is low;
+- only routed models are monitored;
+- images are built elsewhere;
+- request, container, and proxy logs are bounded;
+- the co-located proxy is primarily personal use.
+
+Use two gigabytes or a separate proxy server for sustained concurrency, many
+monitored model-site pairs, large log retention, or a VPN shared with multiple
+people. Do not add PostgreSQL, Redis, a desktop environment, or a large server
+panel to the one-gigabyte layout.
+
+## Prepare the host
 
 Install Docker Engine, the Docker Compose plugin, and Caddy from their official
-repositories. Enable a one-gigabyte swap file if the server has none:
+repositories. If the server has no swap, create one gigabyte:
 
 ```bash
 sudo fallocate -l 1G /swapfile
@@ -34,7 +45,7 @@ sudo swapon /swapfile
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 ```
 
-Verify available capacity before deployment:
+Confirm available resources before deployment:
 
 ```bash
 nproc
@@ -46,8 +57,8 @@ docker compose version
 
 ## Configure JieShan
 
-Create a deployment directory containing `compose.yaml` and `.env.example`, then
-create the private environment file:
+Create a deployment directory containing `compose.yaml` and `.env.example`,
+then create a private environment file:
 
 ```bash
 umask 077
@@ -56,99 +67,92 @@ chmod 600 .env
 openssl rand -hex 32
 ```
 
-Edit `.env` and set at least:
+Set at least:
 
 ```dotenv
 JIESHAN_ADMIN_PASSWORD=a-long-unique-password
 JIESHAN_SECRET_KEY=the-64-character-value-generated-above
 ```
 
-Keep the default `JIESHAN_BIND_IP=127.0.0.1` when Caddy is installed on the
-host. Do not expose port 4000 to the public Internet over plain HTTP. Before
-DNS and TLS are ready, administer the panel through an SSH tunnel from the
-local computer:
+The secret key must remain stable across restarts and restores. Replacing it
+makes stored upstream credentials unreadable.
 
-```bash
-ssh -L 4000:127.0.0.1:4000 user@your-server
-```
+Keep `JIESHAN_BIND_IP=127.0.0.1` when Caddy runs on the same host. Keep
+`JIESHAN_TRUST_PROXY=true` only for the documented trusted reverse proxy path.
+Set it to `false` when requests reach JieShan directly.
 
-Keep `JIESHAN_TRUST_PROXY=true` for the documented loopback Caddy setup. Set it
-to `false` if requests reach JieShan without a trusted reverse proxy.
-
-Public upstreams require no extra network setting. If an upstream intentionally
-runs on your own LAN or Docker host, set
-`JIESHAN_ALLOW_PRIVATE_UPSTREAMS=true`. Leave it disabled otherwise; metadata,
-link-local, and multicast addresses remain blocked in either mode.
+Public relay sites require no private-network access. Set
+`JIESHAN_ALLOW_PRIVATE_UPSTREAMS=true` only when an intended upstream runs on a
+private address you control. Leave it disabled otherwise.
 
 ## Start and verify
 
-The production Compose file only pulls and runs the image published by GitHub
-Actions. Do not compile the frontend or Go binary on a one-gigabyte server:
+The production host should pull an image built by CI rather than compile Go or
+install frontend dependencies:
 
 ```bash
 docker compose pull
 docker compose up -d --no-build
+docker compose ps
 ```
 
-If the GitHub Container Registry package is private, authenticate Docker with a
-read-only package token before pulling it. Never place that token in
-`compose.yaml` or `.env`.
-
-Verify health and bounded resource use:
+Verify the process, health endpoint, logs, and resource use:
 
 ```bash
-docker compose ps
 curl --fail http://127.0.0.1:4000/healthz
-docker stats --no-stream jieshan
 docker compose logs --tail=100 jieshan
+docker stats --no-stream jieshan
 ```
+
+Then sign in and verify the product path, not just the process:
+
+1. Add one Site, one Endpoint, and one API Key.
+2. Run model discovery and publish one model.
+3. Enable monitoring for that model and run its all-sites manual probe.
+4. Create a downstream key and make one small API call.
+5. Confirm the request log shows its Site, Endpoint, API Key, token usage, and
+   attempt timeline.
 
 ## HTTPS with Caddy
 
 Copy `deploy/caddy/Caddyfile.example` to the host Caddy configuration, replace
-`panel.example.com`, point the domain's DNS records to the server, and reload
-Caddy:
+the example domain, point DNS to the server, validate, and reload:
 
 ```bash
 sudo caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 
-Only ports 22, 80, and 443 need to be publicly reachable for the panel. Keep
-port 4000 bound to loopback. The example disables response buffering so model
-streaming reaches clients immediately.
+Only ports 22, 80, and 443 need to be public for the panel. Port 4000 remains on
+loopback. The example disables response buffering so streaming output reaches
+clients without being held by the reverse proxy.
 
-Caddy owns TCP ports 80 and 443 in this layout. Give sing-box or Xray a
-different explicit TCP or UDP port and open only that port in the firewall. If
-the proxy protocol must own port 443, use another public IP or design an
-explicit protocol multiplexer; the provided Caddy example does not share one
-IP-and-port pair with the proxy node.
-
-## Upgrade
-
-The workflow publishes `latest`, branch, semantic-version, and commit-SHA image
-tags. Pin a semantic version or SHA for a controlled production rollout.
+Before DNS and TLS are ready, keep the service private and use an SSH tunnel:
 
 ```bash
-docker compose pull
-docker compose up -d --no-build --remove-orphans
-docker compose ps
-curl --fail http://127.0.0.1:4000/healthz
-docker compose logs --tail=100 jieshan
+ssh -L 4000:127.0.0.1:4000 user@your-server
 ```
 
-Check `/healthz`, sign in, and make one small API request after each upgrade.
-Keep the previous image tag available until that verification passes. Only
-after verification should unused images be removed:
+## Co-locating a VPN or proxy
 
-```bash
-docker image prune -f
-```
+Run sing-box, Xray, or another proxy as a separate service with its own restart
+policy, memory limit, ports, logs, and data directory. Do not put it inside the
+JieShan container or mount the JieShan data volume into it.
+
+Caddy normally owns TCP ports 80 and 443. Give the proxy an explicit different
+TCP or UDP port and open only the required firewall rules. If the proxy must
+own port 443, use another public IP or an intentionally designed protocol
+multiplexer; the example Caddy layout cannot share one IP-and-port pair.
+
+On a one-gigabyte host, watch both RSS and swap after real traffic begins. A
+small personal proxy can fit beside JieShan, but a shared VPN can create memory,
+file-descriptor, bandwidth, and connection-tracking pressure unrelated to the
+number of JieShan administrators.
 
 ## Back up SQLite
 
-For the first release, use a short maintenance window to produce a consistent
-volume backup:
+Back up before every upgrade and before applying a legacy-data migration. A
+short maintenance window is the simplest consistent volume backup:
 
 ```bash
 mkdir -p backups
@@ -161,25 +165,45 @@ docker run --rm \
 docker compose start jieshan
 ```
 
-Store backups somewhere other than this server. The deployment secret is needed
-to decrypt upstream credentials, so back up `.env` separately in an encrypted
-password manager. Do not put it inside the database archive.
+Copy the archive off the server and verify that it contains `jieshan.db` plus
+any `-wal` or `-shm` files present in the stopped volume. Store `.env`
+separately in an encrypted password manager. The database backup alone is not
+enough because the deployment secret is required to decrypt upstream
+credentials.
 
-To restore, stop JieShan, preserve the current volume, extract the selected
-archive into a new empty volume, and start the pinned application version. Test
-the procedure before relying on it.
+For a non-container installation, stop the process and copy the database and
+its adjacent WAL files together, or use SQLite's online backup command. Never
+copy only the main database file while the application is actively writing.
 
-## Operations on a one-gigabyte host
+## Upgrade and rollback
 
-- Keep probe concurrency low and monitor only models that are actually routed.
-- Retain a bounded number of request and attempt logs.
-- Leave Docker's log rotation enabled as provided by `compose.yaml`.
-- Avoid building on the server; `pnpm install` and Go compilation can cause avoidable
-  memory peaks.
-- Watch swap activity. Sustained swap usage means traffic or retention settings
-  exceed the host's practical capacity.
-- Run the personal proxy node as a separate service with its own restart policy,
-  limits, and logs. It should not share JieShan's container or data volume.
+Pin a semantic version or commit-SHA image for a controlled rollout. Back up,
+then upgrade:
 
-If the container is killed for memory repeatedly, first lower probe concurrency
-and log retention. Upgrade to two gigabytes before removing the memory limit.
+```bash
+docker compose pull
+docker compose up -d --no-build --remove-orphans
+docker compose ps
+curl --fail http://127.0.0.1:4000/healthz
+docker compose logs --tail=100 jieshan
+```
+
+After startup, sign in, inspect the monitor matrix, and make one small API call.
+Keep the previous image tag and database backup until this verification passes.
+
+To roll back after a schema migration, stop JieShan, point Compose at the
+previous image, restore the matching pre-upgrade data volume, restore the same
+deployment secret, and start the service. Do not run an older binary against a
+database already migrated by a newer release unless that release explicitly
+documents backward compatibility.
+
+## One-gigabyte operations
+
+- Monitor only models that can receive traffic.
+- Keep discovery and probe concurrency at conservative defaults.
+- Keep Docker log rotation enabled as supplied by `compose.yaml`.
+- Apply a bounded request-log retention policy and review database growth.
+- Build in GitHub Actions or another machine; do not run `pnpm install` or a
+  production Go build on the one-gigabyte server.
+- Treat sustained swap use, repeated OOM kills, or rising request queue time as
+  a capacity problem. Upgrade memory before removing the container limit.

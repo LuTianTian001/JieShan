@@ -87,7 +87,7 @@ func ClassifyInvalidSuccess(body []byte) Decision {
 
 func isModelUnsupportedMessage(text string) bool {
 	phrases := []string{
-		"model not found", "model does not exist", "no such model", "unsupported model", "unknown model",
+		"model not found", "model does not exist", "no such model", "unsupported model", "unknown model", "model is not available",
 		"模型不存在", "模型未找到", "不支持的模型", "不支持此模型", "无此模型", "没有该模型",
 	}
 	for _, phrase := range phrases {

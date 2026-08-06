@@ -174,6 +174,9 @@ func TestUpdateSyncSuccessStoresSnapshotUsageAndRotatedAuthAtomically(t *testing
 	if err != nil || len(usage) != 2 {
 		t.Fatalf("deduplicated usage = %+v, %v", usage, err)
 	}
+	if usage[1].Amount != "changed" || usage[1].ModelName != "gpt-test" || usage[1].OccurredAt == nil || *usage[1].OccurredAt != occurredFirst || string(usage[1].Raw) != `{"duplicate":true}` {
+		t.Fatalf("updated usage record = %+v", usage[1])
+	}
 	var snapshots int
 	if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM upstream_account_snapshots").Scan(&snapshots); err != nil {
 		t.Fatal(err)

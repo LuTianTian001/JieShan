@@ -557,6 +557,39 @@ func TestParseUsageRemovesCachedAndReasoningSubsets(t *testing.T) {
 	}
 }
 
+func TestParseUsageSeparatesOpenAICacheWrites(t *testing.T) {
+	_, parsed := parseUsage([]byte(`{
+  "model":"gpt-5.6-luna",
+  "usage":{
+    "input_tokens":100,
+    "output_tokens":20,
+    "input_tokens_details":{"cached_tokens":30,"cache_write_tokens":10},
+    "output_tokens_details":{"reasoning_tokens":5}
+  }
+}`), "fallback")
+	if !parsed.complete() || *parsed.Input != 60 || *parsed.CacheRead != 30 || *parsed.CacheWrite != 10 ||
+		*parsed.CacheWrite1H != 0 || *parsed.Output != 15 || *parsed.Reasoning != 5 {
+		t.Fatalf("cache-write usage was not canonicalized: %+v", parsed)
+	}
+}
+
+func TestParseUsageSeparatesAnthropicCacheWriteTTLs(t *testing.T) {
+	_, parsed := parseUsage([]byte(`{
+  "model":"claude-sonnet-5",
+  "usage":{
+    "input_tokens":60,
+    "cache_read_input_tokens":30,
+    "cache_creation_input_tokens":10,
+    "cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":6},
+    "output_tokens":20
+  }
+}`), "fallback")
+	if !parsed.complete() || *parsed.Input != 60 || *parsed.CacheRead != 30 || *parsed.CacheWrite != 4 ||
+		*parsed.CacheWrite1H != 6 || *parsed.Output != 20 || *parsed.Reasoning != 0 {
+		t.Fatalf("Anthropic cache usage was not canonicalized: %+v", parsed)
+	}
+}
+
 func TestMeteredFailureReleasesReservation(t *testing.T) {
 	failed := &upstreamRecorder{serve: func(w http.ResponseWriter, _ *http.Request, _ int) {
 		http.Error(w, `{"error":{"message":"unavailable"}}`, http.StatusServiceUnavailable)
@@ -565,7 +598,7 @@ func TestMeteredFailureReleasesReservation(t *testing.T) {
 	defer server.Close()
 
 	fixture := newGatewayFixture(t, server.URL)
-	fixture.makeMetered(t, "gpt-5.6-nano", 10_000)
+	fixture.makeMetered(t, "gpt-5.4-nano", 10_000)
 	response := fixture.chat(t, false)
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
@@ -598,7 +631,7 @@ func TestMeteredStreamWithoutUsageUsesConservativeSettlement(t *testing.T) {
 	defer server.Close()
 
 	fixture := newGatewayFixture(t, server.URL)
-	fixture.makeMetered(t, "gpt-5.6-nano", 10_000)
+	fixture.makeMetered(t, "gpt-5.4-nano", 10_000)
 	response := fixture.chat(t, true)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())

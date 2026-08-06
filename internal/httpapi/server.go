@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -88,6 +89,12 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/dashboard", s.admin(http.HandlerFunc(s.dashboard)))
 	s.mux.Handle("GET /api/v1/monitor/matrix", s.admin(http.HandlerFunc(s.monitorMatrix)))
 	s.mux.Handle("GET /api/v1/account-adapters", s.admin(http.HandlerFunc(s.listAccountAdapters)))
+	s.registerV2SiteRoutes()
+	s.registerV2ModelRoutes()
+	s.registerV2ProbeRoutes()
+	s.registerV2RequestLogRoutes()
+	s.registerV2LegacyMigrationRoutes()
+	s.registerV2RoutingProfileRoutes()
 
 	s.mux.Handle("GET /api/v1/upstreams", s.admin(http.HandlerFunc(s.listUpstreams)))
 	s.mux.Handle("POST /api/v1/upstreams", s.admin(http.HandlerFunc(s.createUpstream)))
@@ -127,6 +134,7 @@ func (s *Server) routes() {
 
 	s.mux.HandleFunc("GET /v1/models", s.gateway.Models)
 	s.mux.HandleFunc("POST /v1/chat/completions", s.gateway.ChatCompletions)
+	s.mux.HandleFunc("POST /v1/responses", s.gateway.Responses)
 	s.mux.HandleFunc("POST /chat/completions", s.gateway.ChatCompletions)
 	s.mux.Handle("/", spaHandler(s.cfg.WebDir))
 }
@@ -586,7 +594,16 @@ func (s *Server) listUpstreamAccountUsage(w http.ResponseWriter, r *http.Request
 		}
 		limit = parsed
 	}
-	result, err := s.accounts.Usage(r.Context(), id, rangeName, limit)
+	var beforeID int64
+	if raw := strings.TrimSpace(r.URL.Query().Get("beforeId")); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 1 {
+			writeError(w, http.StatusBadRequest, "beforeId must be a positive integer", "invalid_request")
+			return
+		}
+		beforeID = parsed
+	}
+	result, err := s.accounts.Usage(r.Context(), id, rangeName, limit, beforeID)
 	if err != nil {
 		writeAccountError(w, err)
 		return
@@ -777,14 +794,16 @@ func (s *Server) probeRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 type keyPayload struct {
-	Name          string    `json:"name"`
-	Enabled       *bool     `json:"enabled"`
-	QuotaMicroUSD *int64    `json:"quotaMicroUsd"`
-	QuotaUSD      *float64  `json:"quotaUsd"`
-	ClearQuota    bool      `json:"clearQuota"`
-	RPMLimit      *int      `json:"rpmLimit"`
-	AllowedModels *[]string `json:"allowedModels"`
-	ExpiresAt     *string   `json:"expiresAt"`
+	Name                string    `json:"name"`
+	Enabled             *bool     `json:"enabled"`
+	QuotaMicroUSD       *int64    `json:"quotaMicroUsd"`
+	QuotaUSD            *float64  `json:"quotaUsd"`
+	ClearQuota          bool      `json:"clearQuota"`
+	RPMLimit            *int      `json:"rpmLimit"`
+	AllowedModels       *[]string `json:"allowedModels"`
+	RoutingProfileID    *int64    `json:"routingProfileId"`
+	ClearRoutingProfile bool      `json:"clearRoutingProfile"`
+	ExpiresAt           *string   `json:"expiresAt"`
 }
 
 func (s *Server) listKeys(w http.ResponseWriter, r *http.Request) {
@@ -811,7 +830,11 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 	}
 	quota := body.QuotaMicroUSD
 	if body.QuotaUSD != nil {
-		value := int64(*body.QuotaUSD * 1_000_000)
+		value, err := quotaMicroUSDFromUSD(*body.QuotaUSD)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid_request")
+			return
+		}
 		quota = &value
 	}
 	models := []string{}
@@ -827,7 +850,10 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request")
 		return
 	}
-	id, err := s.store.CreateDownstreamKey(r.Context(), store.DownstreamKeyWrite{Name: firstNonEmpty(body.Name, "Default key"), Enabled: boolDefault(body.Enabled, true), QuotaMicroUSD: quota, RPMLimit: rpm, AllowedModels: models, ExpiresAt: expires}, prefix, raw)
+	id, err := s.store.CreateDownstreamKey(r.Context(), store.DownstreamKeyWrite{
+		Name: firstNonEmpty(body.Name, "Default key"), Enabled: boolDefault(body.Enabled, true),
+		QuotaMicroUSD: quota, RPMLimit: rpm, AllowedModels: models, RoutingProfileID: body.RoutingProfileID, ExpiresAt: expires,
+	}, prefix, raw)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -856,7 +882,11 @@ func (s *Server) updateKey(w http.ResponseWriter, r *http.Request) {
 	} else if body.QuotaMicroUSD != nil {
 		quota = body.QuotaMicroUSD
 	} else if body.QuotaUSD != nil {
-		value := int64(*body.QuotaUSD * 1_000_000)
+		value, quotaErr := quotaMicroUSDFromUSD(*body.QuotaUSD)
+		if quotaErr != nil {
+			writeError(w, http.StatusBadRequest, quotaErr.Error(), "invalid_request")
+			return
+		}
 		quota = &value
 	}
 	models := current.AllowedModels
@@ -875,7 +905,16 @@ func (s *Server) updateKey(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	err = s.store.UpdateDownstreamKey(r.Context(), id, store.DownstreamKeyWrite{Name: firstNonEmpty(body.Name, current.Name), Enabled: boolDefault(body.Enabled, current.Enabled), QuotaMicroUSD: quota, RPMLimit: rpm, AllowedModels: models, ExpiresAt: expires})
+	routingProfileID := current.RoutingProfileID
+	if body.ClearRoutingProfile {
+		routingProfileID = nil
+	} else if body.RoutingProfileID != nil {
+		routingProfileID = body.RoutingProfileID
+	}
+	err = s.store.UpdateDownstreamKey(r.Context(), id, store.DownstreamKeyWrite{
+		Name: firstNonEmpty(body.Name, current.Name), Enabled: boolDefault(body.Enabled, current.Enabled),
+		QuotaMicroUSD: quota, RPMLimit: rpm, AllowedModels: models, RoutingProfileID: routingProfileID, ExpiresAt: expires,
+	})
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -944,15 +983,17 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		DefaultCooldownSeconds *int `json:"defaultCooldownSeconds"`
-		CooldownSeconds        *int `json:"cooldownSeconds"`
-		FailureThreshold       *int `json:"failureThreshold"`
-		FailureWindowSeconds   *int `json:"failureWindowSeconds"`
-		ProbeIntervalSeconds   *int `json:"probeIntervalSeconds"`
-		RequestDeadlineSeconds *int `json:"requestDeadlineSeconds"`
-		RequestTimeoutSeconds  *int `json:"requestTimeoutSeconds"`
-		MaxAttempts            *int `json:"maxAttempts"`
-		LogRetentionDays       *int `json:"logRetentionDays"`
+		DefaultCooldownSeconds    *int `json:"defaultCooldownSeconds"`
+		CooldownSeconds           *int `json:"cooldownSeconds"`
+		FailureThreshold          *int `json:"failureThreshold"`
+		FailureWindowSeconds      *int `json:"failureWindowSeconds"`
+		ProbeIntervalSeconds      *int `json:"probeIntervalSeconds"`
+		FirstOutputTimeoutSeconds *int `json:"firstOutputTimeoutSeconds"`
+		StreamIdleTimeoutSeconds  *int `json:"streamIdleTimeoutSeconds"`
+		RequestDeadlineSeconds    *int `json:"requestDeadlineSeconds"`
+		RequestTimeoutSeconds     *int `json:"requestTimeoutSeconds"`
+		MaxAttempts               *int `json:"maxAttempts"`
+		LogRetentionDays          *int `json:"logRetentionDays"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -969,6 +1010,8 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	current.FailureThreshold = intDefault(body.FailureThreshold, current.FailureThreshold)
 	current.FailureWindowSeconds = intDefault(body.FailureWindowSeconds, current.FailureWindowSeconds)
 	current.ProbeIntervalSeconds = intDefault(body.ProbeIntervalSeconds, current.ProbeIntervalSeconds)
+	current.FirstOutputTimeoutSeconds = intDefault(body.FirstOutputTimeoutSeconds, current.FirstOutputTimeoutSeconds)
+	current.StreamIdleTimeoutSeconds = intDefault(body.StreamIdleTimeoutSeconds, current.StreamIdleTimeoutSeconds)
 	current.RequestDeadlineSeconds = intDefault(timeout, current.RequestDeadlineSeconds)
 	current.MaxAttempts = intDefault(body.MaxAttempts, current.MaxAttempts)
 	current.LogRetentionDays = intDefault(body.LogRetentionDays, current.LogRetentionDays)
@@ -1013,6 +1056,10 @@ func respond(w http.ResponseWriter, value any, err error) {
 	writeJSON(w, http.StatusOK, value)
 }
 func writeStoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrRevisionConflict) {
+		writeError(w, http.StatusConflict, "resource changed; refresh and try again", "revision_conflict")
+		return
+	}
 	if errors.Is(err, store.ErrDownstreamKeyHasReservations) {
 		writeError(w, http.StatusConflict, "downstream key still has active requests", "key_in_use")
 		return
@@ -1099,6 +1146,17 @@ func parseOptionalTime(value *string) (*int64, error) {
 	}
 	ms := parsed.UnixMilli()
 	return &ms, nil
+}
+
+func quotaMicroUSDFromUSD(value float64) (int64, error) {
+	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return 0, fmt.Errorf("quotaUsd must be a finite non-negative number")
+	}
+	scaled := value * 1_000_000
+	if math.IsInf(scaled, 0) || scaled > float64(int64(^uint64(0)>>1)) {
+		return 0, fmt.Errorf("quotaUsd is too large")
+	}
+	return int64(math.Round(scaled)), nil
 }
 
 func securityHeaders(next http.Handler) http.Handler {

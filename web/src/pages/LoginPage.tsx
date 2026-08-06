@@ -43,7 +43,7 @@ export function LoginPage({ onLogin, onDemo }: { onLogin: (password: string) => 
     <main className="login-page">
       <section className="login-panel">
         <div className="login-brand">
-          <div className="brand-mark login-mark" aria-hidden="true">J</div>
+          <div className="brand-mark login-mark" aria-hidden="true"><img src="/jieshan-brand.jpg" alt="" /></div>
           <div><strong>JieShan</strong><span>API Gateway</span></div>
         </div>
         <div className="login-heading">

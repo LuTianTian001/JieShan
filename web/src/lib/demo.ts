@@ -208,28 +208,28 @@ function seedState(): DemoState {
   ];
 
   const keys: DownstreamKey[] = [
-    { id: 201, name: '个人主密钥', prefix: 'sk-js-8F3A', enabled: true, quotaUsd: 50, spentUsd: 7.8642, allowedModels: [], rpmLimit: 60, expiresAt: null, lastUsedAt: isoAgo(3 * 60_000), createdAt: isoAgo(16 * 86_400_000) },
-    { id: 202, name: '笔记本测试', prefix: 'sk-js-20D1', enabled: true, quotaUsd: 5, spentUsd: 1.1038, allowedModels: ['claude-sonnet-4-5'], rpmLimit: 20, expiresAt: isoAhead(18 * 86_400_000), lastUsedAt: isoAgo(8 * 3_600_000), createdAt: isoAgo(5 * 86_400_000) },
+    { id: 201, name: '个人主密钥', prefix: 'sk-js-8F3A', enabled: true, quotaUsd: 50, spentUsd: 7.8642, allowedModels: [], routingProfileId: null, routingProfileName: '默认路由', usesDefaultRouting: true, rpmLimit: 60, expiresAt: null, lastUsedAt: isoAgo(3 * 60_000), createdAt: isoAgo(16 * 86_400_000) },
+    { id: 202, name: '笔记本测试', prefix: 'sk-js-20D1', enabled: true, quotaUsd: 5, spentUsd: 1.1038, allowedModels: ['claude-sonnet-4-5'], routingProfileId: null, routingProfileName: '默认路由', usesDefaultRouting: true, rpmLimit: 20, expiresAt: isoAhead(18 * 86_400_000), lastUsedAt: isoAgo(8 * 3_600_000), createdAt: isoAgo(5 * 86_400_000) },
   ];
 
   const logs: RequestLog[] = [
     {
       id: 'req_01K22H8SJ3Q2', startedAt: isoAgo(3 * 60_000), keyName: '个人主密钥', requestedModel: 'claude-sonnet-4-5', actualModel: 'claude-sonnet-4-5', status: 'success', durationMs: 4821, ttftMs: 721, inputTokens: 1832, cacheTokens: 1044, outputTokens: 616, reasoningTokens: 0, costUsd: 0.0117, switchCount: 0, reasoningEffort: 'medium',
-      attempts: [{ id: 1, sequence: 1, upstreamName: '主线路', model: 'claude-sonnet-4-5', state: 'success', startedAt: isoAgo(3 * 60_000), durationMs: 4821, ttftMs: 721, statusCode: 200 }],
+      attempts: [{ id: 1, sequence: 1, upstreamId: 1, upstreamName: '主线路', model: 'claude-sonnet-4-5', state: 'success', startedAt: isoAgo(3 * 60_000), durationMs: 4821, ttftMs: 721, statusCode: 200 }],
     },
     {
       id: 'req_01K22H4W9P8D', startedAt: isoAgo(11 * 60_000), keyName: '个人主密钥', requestedModel: 'gpt-5.2', actualModel: 'gpt-5.2', status: 'success', durationMs: 6388, ttftMs: 1062, inputTokens: 4210, cacheTokens: 0, outputTokens: 908, reasoningTokens: 1280, costUsd: 0.0346, switchCount: 1, reasoningEffort: 'high', thinkingBudget: 4096,
       attempts: [
-        { id: 2, sequence: 1, upstreamName: '备用线路 A', model: 'gpt-5.2', state: 'failed', startedAt: isoAgo(11 * 60_000), durationMs: 1800, ttftMs: null, statusCode: 504, switchReason: '首字节超时，切换下一目标', error: 'upstream timeout' },
-        { id: 3, sequence: 2, upstreamName: '主线路', model: 'gpt-5.2', state: 'success', startedAt: isoAgo(11 * 60_000 - 1_830), durationMs: 4558, ttftMs: 1062, statusCode: 200 },
+        { id: 2, sequence: 1, upstreamId: 2, upstreamName: '备用线路 A', model: 'gpt-5.2', state: 'failed', startedAt: isoAgo(11 * 60_000), durationMs: 1800, ttftMs: null, statusCode: 504, switchReason: '首字节超时，切换下一目标', error: 'upstream timeout' },
+        { id: 3, sequence: 2, upstreamId: 1, upstreamName: '主线路', model: 'gpt-5.2', state: 'success', startedAt: isoAgo(11 * 60_000 - 1_830), durationMs: 4558, ttftMs: 1062, statusCode: 200 },
       ],
     },
     {
       id: 'req_01K22GVR6QY8', startedAt: isoAgo(36 * 60_000), keyName: '笔记本测试', requestedModel: 'claude-sonnet-4-5', actualModel: 'claude-sonnet-4-5', status: 'failed', durationMs: 5014, ttftMs: null, inputTokens: 744, cacheTokens: 0, outputTokens: 0, reasoningTokens: 0, costUsd: 0, switchCount: 2, reasoningEffort: 'low',
       attempts: [
-        { id: 4, sequence: 1, upstreamName: '主线路', model: 'claude-sonnet-4-5', state: 'failed', startedAt: isoAgo(36 * 60_000), durationMs: 2110, ttftMs: null, statusCode: 503, switchReason: '上游暂不可用' },
-        { id: 5, sequence: 2, upstreamName: '备用线路 A', model: 'claude-sonnet-4-5', state: 'failed', startedAt: isoAgo(36 * 60_000 - 2_130), durationMs: 1810, ttftMs: null, statusCode: 504, switchReason: '首字节超时' },
-        { id: 6, sequence: 3, upstreamName: '备用线路 B', model: 'claude-sonnet-4-5', state: 'failed', startedAt: isoAgo(36 * 60_000 - 3_960), durationMs: 1054, ttftMs: null, statusCode: null, error: 'connection refused' },
+        { id: 4, sequence: 1, upstreamId: 1, upstreamName: '主线路', model: 'claude-sonnet-4-5', state: 'failed', startedAt: isoAgo(36 * 60_000), durationMs: 2110, ttftMs: null, statusCode: 503, switchReason: '上游暂不可用' },
+        { id: 5, sequence: 2, upstreamId: 2, upstreamName: '备用线路 A', model: 'claude-sonnet-4-5', state: 'failed', startedAt: isoAgo(36 * 60_000 - 2_130), durationMs: 1810, ttftMs: null, statusCode: 504, switchReason: '首字节超时' },
+        { id: 6, sequence: 3, upstreamId: 3, upstreamName: '备用线路 B', model: 'claude-sonnet-4-5', state: 'failed', startedAt: isoAgo(36 * 60_000 - 3_960), durationMs: 1054, ttftMs: null, statusCode: null, error: 'connection refused' },
       ],
     },
   ];
@@ -244,7 +244,10 @@ function seedState(): DemoState {
     settings: {
       probeIntervalSeconds: 300,
       failureThreshold: 2,
+      failureWindowSeconds: 300,
       cooldownSeconds: 300,
+      firstOutputTimeoutSeconds: 30,
+      streamIdleTimeoutSeconds: 60,
       requestTimeoutSeconds: 120,
       maxAttempts: 3,
       logRetentionDays: 30,
@@ -595,6 +598,9 @@ export const demo = {
       quotaUsd: input.quotaUsd,
       spentUsd: 0,
       allowedModels: input.allowedModels,
+      routingProfileId: input.routingProfileId,
+      routingProfileName: '默认路由',
+      usesDefaultRouting: input.routingProfileId == null,
       rpmLimit: input.rpmLimit,
       expiresAt: input.expiresAt,
       lastUsedAt: null,
@@ -608,7 +614,16 @@ export const demo = {
     const item = state.keys.find((entry) => entry.id === id);
     if (!item) throw new Error('密钥不存在');
     if (patch.clearQuota) item.quotaUsd = null;
-    const { clearQuota: _clearQuota, ...values } = patch;
+    if (patch.clearRoutingProfile) {
+      item.routingProfileId = null;
+      item.routingProfileName = '默认路由';
+      item.usesDefaultRouting = true;
+    } else if (patch.routingProfileId != null) {
+      item.routingProfileId = patch.routingProfileId;
+      item.routingProfileName = `方案 #${patch.routingProfileId}`;
+      item.usesDefaultRouting = false;
+    }
+    const { clearQuota: _clearQuota, clearRoutingProfile: _clearRoutingProfile, routingProfileId: _routingProfileId, ...values } = patch;
     Object.assign(item, values);
     save();
     return copy(item);

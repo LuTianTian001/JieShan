@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -49,14 +50,27 @@ func (g *Gateway) Models(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusUnauthorized, err.Error(), "invalid_api_key")
 		return
 	}
+	published, err := g.store.ListPublishedModels(r.Context())
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "cannot load model list", "internal_error")
+		return
+	}
 	routes, err := g.store.ListPublicModels(r.Context())
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "cannot load model list", "internal_error")
 		return
 	}
-	data := make([]map[string]any, 0, len(routes))
+	data := make([]map[string]any, 0, len(published)+len(routes))
+	seen := make(map[string]struct{}, len(published)+len(routes))
+	for _, model := range published {
+		if !model.Enabled || !store.KeyAllowsModel(key, model.PublicName) {
+			continue
+		}
+		seen[model.PublicName] = struct{}{}
+		data = append(data, map[string]any{"id": model.PublicName, "object": "model", "created": model.CreatedAt / 1000, "owned_by": "jieshan"})
+	}
 	for _, route := range routes {
-		if !store.KeyAllowsModel(key, route.PublicModel) {
+		if _, exists := seen[route.PublicModel]; exists || !store.KeyAllowsModel(key, route.PublicModel) {
 			continue
 		}
 		data = append(data, map[string]any{"id": route.PublicModel, "object": "model", "created": route.CreatedAt / 1000, "owned_by": "jieshan"})
@@ -64,7 +78,35 @@ func (g *Gateway) Models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
+type inferenceSurface struct {
+	name             string
+	parseMeta        func([]byte) (chatMeta, error)
+	buildRequest     func(context.Context, store.RouteTarget, []byte) (*http.Request, error)
+	buildResolved    func(context.Context, store.ResolvedRouteSiteTarget, store.InferenceCredentialSecret, []byte) (*http.Request, error)
+	validateResponse func([]byte) error
+}
+
 func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
+	g.serveInference(w, r, inferenceSurface{
+		name:             "chat_completions",
+		parseMeta:        parseChatMeta,
+		buildRequest:     g.upstream.BuildChatRequest,
+		buildResolved:    g.upstream.BuildResolvedChatRequest,
+		validateResponse: validateChatCompletionResponse,
+	})
+}
+
+func (g *Gateway) Responses(w http.ResponseWriter, r *http.Request) {
+	g.serveInference(w, r, inferenceSurface{
+		name:             "responses",
+		parseMeta:        parseResponsesMeta,
+		buildRequest:     g.upstream.BuildResponsesRequest,
+		buildResolved:    g.upstream.BuildResolvedResponsesRequest,
+		validateResponse: validateResponsesResponse,
+	})
+}
+
+func (g *Gateway) serveInference(w http.ResponseWriter, r *http.Request, surface inferenceSurface) {
 	key, err := g.authenticate(r, "")
 	if err != nil {
 		status := http.StatusUnauthorized
@@ -86,13 +128,31 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "cannot read request", "invalid_request_error")
 		return
 	}
-	meta, err := parseChatMeta(body)
+	meta, err := surface.parseMeta(body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
 	if !store.KeyAllowsModel(key, meta.Model) {
 		writeOpenAIError(w, http.StatusForbidden, "model is not allowed for this API key", "model_not_allowed")
+		return
+	}
+	published, publishedErr := g.store.GetPublishedModelByName(r.Context(), meta.Model)
+	if publishedErr == nil {
+		if !published.Enabled {
+			writeOpenAIError(w, http.StatusNotFound, "model is not published", "model_not_found")
+			return
+		}
+		resolved, resolveErr := g.store.ResolvePublishedModelForProfile(r.Context(), meta.Model, time.Now().UnixMilli(), key.RoutingProfileID)
+		if resolveErr != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "cannot resolve published model", "internal_error")
+			return
+		}
+		g.serveV3Inference(w, r, key, meta, body, surface, resolved)
+		return
+	}
+	if !errors.Is(publishedErr, sql.ErrNoRows) {
+		writeOpenAIError(w, http.StatusInternalServerError, "cannot load published model", "internal_error")
 		return
 	}
 	route, err := g.store.RouteByPublicModel(r.Context(), meta.Model)
@@ -117,7 +177,8 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	requestID := newID()
 	startInput := store.RequestStart{
-		ID: requestID, DownstreamKeyID: key.ID, RouteID: route.ID, RouteRevision: route.Revision,
+		ID: requestID, RoutingGeneration: "legacy", Surface: surface.name,
+		DownstreamKeyID: key.ID, RouteID: route.ID, RouteRevision: route.Revision,
 		RequestedModel: meta.Model, ReasoningEffort: meta.ReasoningEffort, ThinkingBudget: meta.ThinkingBudget,
 		Stream: meta.Stream, StartedAt: started.UnixMilli(),
 	}
@@ -200,7 +261,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		currentAttempt := attemptIndex
 		attemptIndex++
 		attemptStarted := time.Now()
-		upstreamRequest, buildErr := g.upstream.BuildChatRequest(attemptCtx, target, body)
+		upstreamRequest, buildErr := surface.buildRequest(attemptCtx, target, body)
 		if buildErr != nil {
 			attemptCancel()
 			decision := health.Decision{Class: health.ClassTargetMisconfigured, Failover: true, PenalizeTarget: true}
@@ -326,7 +387,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		decision := health.Classify(response.StatusCode, responseBody, nil, false, response.Header)
 		semanticFailure := ""
 		if decision.Class == health.ClassNone {
-			if err := validateChatCompletionResponse(responseBody); err != nil {
+			if err := surface.validateResponse(responseBody); err != nil {
 				semanticFailure = err.Error()
 				decision = health.ClassifyInvalidSuccess(responseBody)
 			}
@@ -415,6 +476,14 @@ const (
 )
 
 func parseChatMeta(body []byte) (chatMeta, error) {
+	return parseInferenceMeta(body, []string{"max_tokens", "max_completion_tokens"})
+}
+
+func parseResponsesMeta(body []byte) (chatMeta, error) {
+	return parseInferenceMeta(body, []string{"max_output_tokens"})
+}
+
+func parseInferenceMeta(body []byte, outputFields []string) (chatMeta, error) {
 	var payload map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
@@ -429,8 +498,13 @@ func parseChatMeta(body []byte) (chatMeta, error) {
 	meta := chatMeta{Model: model, MaxOutputTokens: defaultMaxOutputTokens}
 	meta.Stream, _ = payload["stream"].(bool)
 	meta.ReasoningEffort, _ = payload["reasoning_effort"].(string)
+	if reasoning, ok := payload["reasoning"].(map[string]any); ok {
+		if effort, ok := reasoning["effort"].(string); ok && strings.TrimSpace(effort) != "" {
+			meta.ReasoningEffort = strings.TrimSpace(effort)
+		}
+	}
 	outputLimitSeen := false
-	for _, field := range []string{"max_tokens", "max_completion_tokens"} {
+	for _, field := range outputFields {
 		value, exists := payload[field]
 		if !exists {
 			continue
@@ -448,7 +522,7 @@ func parseChatMeta(body []byte) (chatMeta, error) {
 		// Preserve an explicit value below the default instead of reserving the
 		// default maximum.
 		meta.MaxOutputTokens = 0
-		for _, field := range []string{"max_tokens", "max_completion_tokens"} {
+		for _, field := range outputFields {
 			if value, exists := payload[field]; exists {
 				limit, _ := numberInt64(value)
 				if limit > meta.MaxOutputTokens {
@@ -492,6 +566,10 @@ type requestAccounting struct {
 }
 
 func (g *Gateway) prepareAccounting(key store.DownstreamKey, meta chatMeta, body []byte) (requestAccounting, error) {
+	return g.prepareAccountingForModel(key, meta, body, meta.Model)
+}
+
+func (g *Gateway) prepareAccountingForModel(key store.DownstreamKey, meta chatMeta, body []byte, priceModel string) (requestAccounting, error) {
 	if g.billing == nil {
 		return requestAccounting{}, fmt.Errorf("billing engine is unavailable")
 	}
@@ -507,13 +585,18 @@ func (g *Gateway) prepareAccounting(key store.DownstreamKey, meta chatMeta, body
 		maximum.ReasoningTokens = *meta.ThinkingBudget
 	}
 	maximum.OutputTokens = completionLimit - maximum.ReasoningTokens
-	reservation, err := g.billing.Reserve(meta.Model, maximum)
+	priceModel = strings.TrimSpace(priceModel)
+	if priceModel == "" {
+		priceModel = meta.Model
+	}
+	reservation, err := g.billing.Reserve(priceModel, maximum)
 	if err != nil {
 		if key.QuotaMicroUSD == nil && isPricingUnavailable(err) {
 			return requestAccounting{keyID: key.ID, maximum: maximum}, nil
 		}
-		return requestAccounting{}, fmt.Errorf("price %q: %w", meta.Model, err)
+		return requestAccounting{}, fmt.Errorf("price %q: %w", priceModel, err)
 	}
+	maximum = reservation.MaximumUsage
 	reserved := int64(0)
 	if key.QuotaMicroUSD != nil {
 		reserved = int64(reservation.ReservedMicroUSD)
@@ -562,6 +645,10 @@ func isDownstreamWriteError(err error) bool {
 }
 
 func proxyDelayedStream(w http.ResponseWriter, response *http.Response, attemptStarted time.Time) (bool, *int64, string, usage, error) {
+	return proxyDelayedStreamControlled(w, response, attemptStarted, nil)
+}
+
+func proxyDelayedStreamControlled(w http.ResponseWriter, response *http.Response, attemptStarted time.Time, watchdog *streamWatchdog) (bool, *int64, string, usage, error) {
 	reader := bufio.NewReaderSize(response.Body, 64<<10)
 	var buffered bytes.Buffer
 	var committed bool
@@ -570,6 +657,9 @@ func proxyDelayedStream(w http.ResponseWriter, response *http.Response, attemptS
 	var observed usage
 	for {
 		lineBytes, err := reader.ReadSlice('\n')
+		if len(lineBytes) > 0 && committed {
+			watchdog.activity()
+		}
 		if errors.Is(err, bufio.ErrBufferFull) {
 			return committed, firstToken, actualModel, observed, errors.New("upstream stream line exceeds 64 KiB")
 		}
@@ -591,6 +681,7 @@ func proxyDelayedStream(w http.ResponseWriter, response *http.Response, attemptS
 				}
 			}
 			if !committed && semanticSSELine(line) {
+				watchdog.semanticOutput()
 				first := time.Since(attemptStarted).Milliseconds()
 				firstToken = &first
 				copyResponseHeaders(w.Header(), response.Header)
@@ -662,6 +753,33 @@ func validateChatCompletionResponse(body []byte) error {
 		}
 	}
 	return errors.New("upstream chat completion contained no semantic model output")
+}
+
+func validateResponsesResponse(body []byte) error {
+	var payload struct {
+		Error      json.RawMessage   `json:"error"`
+		Object     string            `json:"object"`
+		Status     string            `json:"status"`
+		OutputText string            `json:"output_text"`
+		Output     []json.RawMessage `json:"output"`
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return errors.New("upstream returned an empty response")
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return errors.New("upstream returned a non-JSON response")
+	}
+	if nonNullJSON(payload.Error) {
+		return errors.New("upstream returned an error envelope with a success status")
+	}
+	switch strings.ToLower(strings.TrimSpace(payload.Status)) {
+	case "failed", "cancelled", "canceled":
+		return fmt.Errorf("upstream response ended with status %s", payload.Status)
+	}
+	if strings.TrimSpace(payload.OutputText) != "" || len(payload.Output) > 0 {
+		return nil
+	}
+	return errors.New("upstream response did not contain semantic output")
 }
 
 func nonNullJSON(raw json.RawMessage) bool {
@@ -749,33 +867,53 @@ func semanticSSELine(line string) bool {
 }
 
 type usage struct {
-	Input, CacheRead, Output, Reasoning *int64
+	Input, CacheRead, CacheWrite, CacheWrite1H, Output, Reasoning *int64
+}
+
+type usagePayload struct {
+	PromptTokens             *int64 `json:"prompt_tokens"`
+	InputTokens              *int64 `json:"input_tokens"`
+	CompletionTokens         *int64 `json:"completion_tokens"`
+	OutputTokens             *int64 `json:"output_tokens"`
+	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens"`
+	CacheCreation            struct {
+		Ephemeral5MInputTokens *int64 `json:"ephemeral_5m_input_tokens"`
+		Ephemeral1HInputTokens *int64 `json:"ephemeral_1h_input_tokens"`
+	} `json:"cache_creation"`
+	PromptDetails struct {
+		CachedTokens        *int64 `json:"cached_tokens"`
+		CacheWriteTokens    *int64 `json:"cache_write_tokens"`
+		CacheCreationTokens *int64 `json:"cache_creation_tokens"`
+	} `json:"prompt_tokens_details"`
+	InputDetails struct {
+		CachedTokens        *int64 `json:"cached_tokens"`
+		CacheWriteTokens    *int64 `json:"cache_write_tokens"`
+		CacheCreationTokens *int64 `json:"cache_creation_tokens"`
+	} `json:"input_tokens_details"`
+	CompletionDetails struct {
+		ReasoningTokens *int64 `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
+	OutputDetails struct {
+		ReasoningTokens *int64 `json:"reasoning_tokens"`
+	} `json:"output_tokens_details"`
+}
+
+type usageEnvelope struct {
+	Model    string         `json:"model"`
+	Usage    *usagePayload  `json:"usage"`
+	Response *usageEnvelope `json:"response"`
 }
 
 func parseUsage(body []byte, fallbackModel string) (string, usage) {
-	var payload struct {
-		Model string `json:"model"`
-		Usage *struct {
-			PromptTokens     *int64 `json:"prompt_tokens"`
-			InputTokens      *int64 `json:"input_tokens"`
-			CompletionTokens *int64 `json:"completion_tokens"`
-			OutputTokens     *int64 `json:"output_tokens"`
-			PromptDetails    struct {
-				CachedTokens *int64 `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-			InputDetails struct {
-				CachedTokens *int64 `json:"cached_tokens"`
-			} `json:"input_tokens_details"`
-			CompletionDetails struct {
-				ReasoningTokens *int64 `json:"reasoning_tokens"`
-			} `json:"completion_tokens_details"`
-			OutputDetails struct {
-				ReasoningTokens *int64 `json:"reasoning_tokens"`
-			} `json:"output_tokens_details"`
-		} `json:"usage"`
-	}
+	var payload usageEnvelope
 	if json.Unmarshal(body, &payload) != nil {
 		return fallbackModel, usage{}
+	}
+	if payload.Response != nil {
+		if strings.TrimSpace(payload.Response.Model) != "" || payload.Response.Usage != nil {
+			payload = *payload.Response
+		}
 	}
 	payload.Model = strings.TrimSpace(payload.Model)
 	if payload.Model == "" {
@@ -786,14 +924,54 @@ func parseUsage(body []byte, fallbackModel string) (string, usage) {
 	}
 	promptTotal := firstInt64(payload.Usage.PromptTokens, payload.Usage.InputTokens)
 	cacheRead := firstInt64(payload.Usage.PromptDetails.CachedTokens, payload.Usage.InputDetails.CachedTokens)
+	cacheWrite := firstInt64(payload.Usage.PromptDetails.CacheWriteTokens, payload.Usage.InputDetails.CacheWriteTokens,
+		payload.Usage.PromptDetails.CacheCreationTokens, payload.Usage.InputDetails.CacheCreationTokens)
 	completionTotal := firstInt64(payload.Usage.CompletionTokens, payload.Usage.OutputTokens)
 	reasoning := firstInt64(payload.Usage.CompletionDetails.ReasoningTokens, payload.Usage.OutputDetails.ReasoningTokens)
-	input, cached, promptOK := canonicalTokenPair(promptTotal, cacheRead)
+	var input, cached, written, written1H *int64
+	var promptOK bool
+	if payload.Usage.CacheReadInputTokens != nil || payload.Usage.CacheCreationInputTokens != nil {
+		input, cached, written, written1H, promptOK = canonicalAnthropicPrompt(payload.Usage)
+	} else {
+		input, cached, written, promptOK = canonicalTokenGroups(promptTotal, cacheRead, cacheWrite)
+		written1H = int64Value(0)
+	}
 	output, reasoned, completionOK := canonicalTokenPair(completionTotal, reasoning)
 	if !promptOK || !completionOK {
 		return payload.Model, usage{}
 	}
-	return payload.Model, usage{Input: input, CacheRead: cached, Output: output, Reasoning: reasoned}
+	return payload.Model, usage{Input: input, CacheRead: cached, CacheWrite: written, CacheWrite1H: written1H, Output: output, Reasoning: reasoned}
+}
+
+func canonicalAnthropicPrompt(value *usagePayload) (*int64, *int64, *int64, *int64, bool) {
+	input := int64(0)
+	if value.InputTokens != nil {
+		input = *value.InputTokens
+	}
+	read := int64(0)
+	if value.CacheReadInputTokens != nil {
+		read = *value.CacheReadInputTokens
+	}
+	creation := int64(0)
+	if value.CacheCreationInputTokens != nil {
+		creation = *value.CacheCreationInputTokens
+	}
+	write5m, write1h := int64(0), int64(0)
+	if value.CacheCreation.Ephemeral5MInputTokens != nil {
+		write5m = *value.CacheCreation.Ephemeral5MInputTokens
+	}
+	if value.CacheCreation.Ephemeral1HInputTokens != nil {
+		write1h = *value.CacheCreation.Ephemeral1HInputTokens
+	}
+	if input < 0 || read < 0 || creation < 0 || write5m < 0 || write1h < 0 || write5m > creation || write1h > creation-write5m {
+		return nil, nil, nil, nil, false
+	}
+	if write5m == 0 && write1h == 0 {
+		write5m = creation
+	} else if write5m+write1h != creation {
+		return nil, nil, nil, nil, false
+	}
+	return int64Value(input), int64Value(read), int64Value(write5m), int64Value(write1h), true
 }
 
 func firstInt64(values ...*int64) *int64 {
@@ -820,19 +998,41 @@ func canonicalTokenPair(total, subset *int64) (*int64, *int64, bool) {
 	return int64Value(base), int64Value(detail), true
 }
 
+func canonicalTokenGroups(total *int64, subsets ...*int64) (*int64, *int64, *int64, bool) {
+	if total == nil || *total < 0 || len(subsets) != 2 {
+		return nil, nil, nil, false
+	}
+	values := [2]int64{}
+	remaining := *total
+	for i, subset := range subsets {
+		if subset == nil {
+			continue
+		}
+		if *subset < 0 || *subset > remaining {
+			return nil, nil, nil, false
+		}
+		values[i] = *subset
+		remaining -= *subset
+	}
+	return int64Value(remaining), int64Value(values[0]), int64Value(values[1]), true
+}
+
 func (u usage) complete() bool {
-	if u.Input == nil || u.CacheRead == nil || u.Output == nil || u.Reasoning == nil {
+	if u.Input == nil || u.CacheRead == nil || u.CacheWrite == nil || u.CacheWrite1H == nil || u.Output == nil || u.Reasoning == nil {
 		return false
 	}
-	return *u.Input > 0 || *u.CacheRead > 0 || *u.Output > 0 || *u.Reasoning > 0
+	return *u.Input > 0 || *u.CacheRead > 0 || *u.CacheWrite > 0 || *u.CacheWrite1H > 0 || *u.Output > 0 || *u.Reasoning > 0
 }
 
 func (u usage) billingUsage() billing.Usage {
-	return billing.Usage{InputTokens: *u.Input, CacheReadTokens: *u.CacheRead, OutputTokens: *u.Output, ReasoningTokens: *u.Reasoning}
+	return billing.Usage{InputTokens: *u.Input, CacheReadTokens: *u.CacheRead, CacheWriteTokens: *u.CacheWrite,
+		CacheWrite1HTokens: *u.CacheWrite1H, OutputTokens: *u.Output, ReasoningTokens: *u.Reasoning}
 }
 
 func usageFromBilling(value billing.Usage) usage {
-	return usage{Input: int64Value(value.InputTokens), CacheRead: int64Value(value.CacheReadTokens), Output: int64Value(value.OutputTokens), Reasoning: int64Value(value.ReasoningTokens)}
+	return usage{Input: int64Value(value.InputTokens), CacheRead: int64Value(value.CacheReadTokens),
+		CacheWrite: int64Value(value.CacheWriteTokens), CacheWrite1H: int64Value(value.CacheWrite1HTokens),
+		Output: int64Value(value.OutputTokens), Reasoning: int64Value(value.ReasoningTokens)}
 }
 
 func int64Value(value int64) *int64 {
@@ -851,7 +1051,9 @@ func (g *Gateway) addAttempt(requestID string, index int, target store.RouteTarg
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := g.store.AddRequestAttempt(ctx, store.RequestAttempt{RequestID: requestID, AttemptIndex: index, TargetID: &targetID, UpstreamID: &upstreamID,
-		UpstreamModel: target.UpstreamModel, Status: status, HTTPStatus: statusPtr, SwitchReason: reason, ErrorClass: class,
+		RoutingGeneration: "legacy",
+		UpstreamName:      target.UpstreamName,
+		UpstreamModel:     target.UpstreamModel, Status: status, HTTPStatus: statusPtr, SwitchReason: reason, ErrorClass: class,
 		ErrorMessage: message, LatencyMS: &latencyMS, FirstTokenMS: firstToken, CreatedAt: startedAt.UnixMilli()}); err != nil {
 		slog.Error("cannot persist request attempt", "request_id", requestID, "attempt", index, "error", err)
 	}
@@ -910,7 +1112,8 @@ func (g *Gateway) finish(requestID string, started time.Time, account requestAcc
 	return g.store.FinishRequestAndSettle(ctx, requestID, account.keyID, account.reservedMicroUSD, charged, store.RequestFinish{
 		ActualModel: params.model, Status: params.status, HTTPStatus: params.httpStatus,
 		FirstTokenMS: params.firstToken, DurationMS: time.Since(started).Milliseconds(), InputTokens: tokens.Input,
-		CacheReadTokens: tokens.CacheRead, OutputTokens: tokens.Output, ReasoningTokens: tokens.Reasoning,
+		CacheReadTokens: tokens.CacheRead, CacheWriteTokens: tokens.CacheWrite, CacheWrite1HTokens: tokens.CacheWrite1H,
+		OutputTokens: tokens.Output, ReasoningTokens: tokens.Reasoning,
 		CostMicroUSD: charged, PriceSnapshotJSON: priceSnapshot, ErrorMessage: message, FinishedAt: time.Now().UnixMilli(),
 	})
 }

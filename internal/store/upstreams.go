@@ -81,7 +81,10 @@ func (s *Store) GetUpstreamSecret(ctx context.Context, id int64) (UpstreamSecret
 	err := s.DB.QueryRowContext(ctx, `SELECT u.id,u.name,u.kind,u.dashboard_url,u.enabled,u.custom_headers_json,
 u.created_at,u.updated_at,e.id,e.base_url,c.id,c.secret_cipher,c.management_cipher,c.runtime_state,
 c.balance_value,c.balance_currency,c.subscription_json,c.last_balance_sync_at,
-(SELECT COUNT(*) FROM upstream_models m WHERE m.upstream_id=u.id AND m.enabled=1)
+(SELECT COUNT(*) FROM upstream_models m WHERE m.upstream_id=u.id AND m.enabled=1),
+(SELECT COUNT(*) FROM upstream_credentials c2 WHERE c2.upstream_id=u.id),
+(SELECT COUNT(*) FROM upstream_credentials c2 WHERE c2.upstream_id=u.id AND c2.enabled=1),
+(SELECT COUNT(*) FROM upstream_credentials c2 WHERE c2.upstream_id=u.id AND c2.enabled=1 AND c2.runtime_state NOT IN ('active','healthy'))
 FROM upstreams u
 JOIN upstream_endpoints e ON e.id=(SELECT id FROM upstream_endpoints WHERE upstream_id=u.id AND enabled=1 ORDER BY position,id LIMIT 1)
 JOIN upstream_credentials c ON c.id=(SELECT id FROM upstream_credentials WHERE upstream_id=u.id AND enabled=1 ORDER BY id LIMIT 1)
@@ -90,6 +93,7 @@ WHERE u.id=?`, id).Scan(
 		&result.CreatedAt, &result.UpdatedAt, &result.EndpointID, &result.BaseURL,
 		&result.CredentialID, &result.SecretCipher, &result.ManagementCipher, &result.CredentialState,
 		&balanceValue, &balanceCurrency, &subscription, &lastSync, &result.ModelCount,
+		&result.CredentialCount, &result.EnabledCredentialCount, &result.UnavailableCredentialCount,
 	)
 	if err != nil {
 		return UpstreamSecret{}, err
@@ -357,7 +361,10 @@ u.created_at,u.updated_at,
 COALESCE(e.id,0),COALESCE(e.base_url,''),COALESCE(c.id,0),
 CASE WHEN length(c.secret_cipher)>0 THEN 1 ELSE 0 END,COALESCE(c.runtime_state,'active'),
 c.balance_value,c.balance_currency,c.subscription_json,c.last_balance_sync_at,
-(SELECT COUNT(*) FROM upstream_models m WHERE m.upstream_id=u.id AND m.enabled=1)
+(SELECT COUNT(*) FROM upstream_models m WHERE m.upstream_id=u.id AND m.enabled=1),
+(SELECT COUNT(*) FROM upstream_credentials c2 WHERE c2.upstream_id=u.id),
+(SELECT COUNT(*) FROM upstream_credentials c2 WHERE c2.upstream_id=u.id AND c2.enabled=1),
+(SELECT COUNT(*) FROM upstream_credentials c2 WHERE c2.upstream_id=u.id AND c2.enabled=1 AND c2.runtime_state NOT IN ('active','healthy'))
 FROM upstreams u
 LEFT JOIN upstream_endpoints e ON e.id=(SELECT id FROM upstream_endpoints WHERE upstream_id=u.id ORDER BY enabled DESC,position,id LIMIT 1)
 LEFT JOIN upstream_credentials c ON c.id=(SELECT id FROM upstream_credentials WHERE upstream_id=u.id ORDER BY enabled DESC,id LIMIT 1)`
@@ -375,6 +382,7 @@ func scanUpstream(row scanner) (Upstream, error) {
 		&item.CreatedAt, &item.UpdatedAt, &item.EndpointID, &item.BaseURL,
 		&item.CredentialID, &configured, &item.CredentialState,
 		&balanceValue, &balanceCurrency, &subscription, &lastSync, &item.ModelCount,
+		&item.CredentialCount, &item.EnabledCredentialCount, &item.UnavailableCredentialCount,
 	)
 	if err != nil {
 		return Upstream{}, err

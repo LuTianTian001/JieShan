@@ -8,17 +8,20 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+	"time"
 )
 
 type MicroUSD int64
 
 type Usage struct {
-	// InputTokens excludes cached input. OutputTokens excludes reasoning tokens.
+	// InputTokens excludes cached input and cache writes. OutputTokens excludes reasoning tokens.
 	// Adapters must canonicalize provider usage into these non-overlapping fields.
-	InputTokens     int64 `json:"input_tokens"`
-	CacheReadTokens int64 `json:"cache_read_tokens"`
-	OutputTokens    int64 `json:"output_tokens"`
-	ReasoningTokens int64 `json:"reasoning_tokens"`
+	InputTokens        int64 `json:"input_tokens"`
+	CacheReadTokens    int64 `json:"cache_read_tokens"`
+	CacheWriteTokens   int64 `json:"cache_write_tokens"`
+	CacheWrite1HTokens int64 `json:"cache_write_1h_tokens"`
+	OutputTokens       int64 `json:"output_tokens"`
+	ReasoningTokens    int64 `json:"reasoning_tokens"`
 }
 
 func (u Usage) PromptTokens() (int64, error) {
@@ -28,11 +31,19 @@ func (u Usage) PromptTokens() (int64, error) {
 	if u.InputTokens > int64(^uint64(0)>>1)-u.CacheReadTokens {
 		return 0, &PricingError{Kind: ErrInvalidUsage, Reason: "prompt token count overflows int64"}
 	}
-	return u.InputTokens + u.CacheReadTokens, nil
+	prompt := u.InputTokens + u.CacheReadTokens
+	if prompt > int64(^uint64(0)>>1)-u.CacheWriteTokens {
+		return 0, &PricingError{Kind: ErrInvalidUsage, Reason: "prompt token count overflows int64"}
+	}
+	prompt += u.CacheWriteTokens
+	if prompt > int64(^uint64(0)>>1)-u.CacheWrite1HTokens {
+		return 0, &PricingError{Kind: ErrInvalidUsage, Reason: "prompt token count overflows int64"}
+	}
+	return prompt + u.CacheWrite1HTokens, nil
 }
 
 func (u Usage) Validate() error {
-	if u.InputTokens < 0 || u.CacheReadTokens < 0 || u.OutputTokens < 0 || u.ReasoningTokens < 0 {
+	if u.InputTokens < 0 || u.CacheReadTokens < 0 || u.CacheWriteTokens < 0 || u.CacheWrite1HTokens < 0 || u.OutputTokens < 0 || u.ReasoningTokens < 0 {
 		return &PricingError{Kind: ErrInvalidUsage, Reason: "token counts cannot be negative"}
 	}
 	return nil
@@ -46,11 +57,13 @@ type ComponentCost struct {
 }
 
 type CostBreakdown struct {
-	Input     ComponentCost `json:"input"`
-	CacheRead ComponentCost `json:"cache_read"`
-	Output    ComponentCost `json:"output"`
-	Reasoning ComponentCost `json:"reasoning"`
-	Total     MicroUSD      `json:"total_micro_usd"`
+	Input        ComponentCost `json:"input"`
+	CacheRead    ComponentCost `json:"cache_read"`
+	CacheWrite   ComponentCost `json:"cache_write"`
+	CacheWrite1H ComponentCost `json:"cache_write_1h"`
+	Output       ComponentCost `json:"output"`
+	Reasoning    ComponentCost `json:"reasoning"`
+	Total        MicroUSD      `json:"total_micro_usd"`
 }
 
 type PriceSnapshot struct {
@@ -66,6 +79,8 @@ type PriceSnapshot struct {
 	Bands              []RateBand  `json:"bands"`
 	SourceURL          string      `json:"source_url"`
 	SourceCheckedAt    string      `json:"source_checked_at"`
+	EffectiveFrom      string      `json:"effective_from,omitempty"`
+	EffectiveUntil     string      `json:"effective_until,omitempty"`
 	Notes              string      `json:"notes,omitempty"`
 }
 
@@ -112,6 +127,10 @@ func (e *Engine) Catalog() *Catalog {
 }
 
 func (e *Engine) Quote(model string, usage Usage) (Quote, error) {
+	return e.QuoteAt(model, usage, time.Now().UTC())
+}
+
+func (e *Engine) QuoteAt(model string, usage Usage, at time.Time) (Quote, error) {
 	if e == nil || e.catalog == nil {
 		return Quote{}, invalidCatalog("engine has no catalog")
 	}
@@ -122,14 +141,14 @@ func (e *Engine) Quote(model string, usage Usage) (Quote, error) {
 	if !price.Priced {
 		return Quote{}, &PricingError{Kind: ErrModelUnpriced, Model: model, Reason: price.UnpricedReason}
 	}
-	snapshot, err := e.snapshot(model, price)
+	snapshot, err := e.snapshot(model, price, at)
 	if err != nil {
 		return Quote{}, err
 	}
 	return snapshot.Quote(usage)
 }
 
-func (e *Engine) snapshot(requestedModel string, price ModelPrice) (PriceSnapshot, error) {
+func (e *Engine) snapshot(requestedModel string, price ModelPrice, at time.Time) (PriceSnapshot, error) {
 	var fx *FXSnapshot
 	if price.Currency != "USD" {
 		value, ok := e.catalog.FX[price.Currency]
@@ -139,8 +158,12 @@ func (e *Engine) snapshot(requestedModel string, price ModelPrice) (PriceSnapsho
 		copy := value
 		fx = &copy
 	}
-	bands := make([]RateBand, len(price.Bands))
-	for i, band := range price.Bands {
+	selectedBands, effectiveFrom, effectiveUntil, err := selectEffectiveBands(price, at)
+	if err != nil {
+		return PriceSnapshot{}, err
+	}
+	bands := make([]RateBand, len(selectedBands))
+	for i, band := range selectedBands {
 		bands[i] = band
 		if band.MaxInputTokens != nil {
 			limit := *band.MaxInputTokens
@@ -152,8 +175,31 @@ func (e *Engine) snapshot(requestedModel string, price ModelPrice) (PriceSnapsho
 		CatalogPublishedAt: e.catalog.PublishedAt, CatalogCheckedAt: e.catalog.CheckedAt,
 		Provider: price.Provider, RequestedModel: requestedModel, PriceName: price.Name,
 		Currency: price.Currency, FX: fx, Bands: bands, SourceURL: price.SourceURL,
-		SourceCheckedAt: price.SourceCheckedAt, Notes: price.Notes,
+		SourceCheckedAt: price.SourceCheckedAt, EffectiveFrom: effectiveFrom,
+		EffectiveUntil: effectiveUntil, Notes: price.Notes,
 	}, nil
+}
+
+func selectEffectiveBands(price ModelPrice, at time.Time) ([]RateBand, string, string, error) {
+	if len(price.PricePeriods) == 0 {
+		return price.Bands, "", "", nil
+	}
+	at = at.UTC()
+	for _, period := range price.PricePeriods {
+		from, _ := time.Parse("2006-01-02", period.EffectiveFrom)
+		if at.Before(from) {
+			continue
+		}
+		if period.EffectiveUntil != "" {
+			until, _ := time.Parse("2006-01-02", period.EffectiveUntil)
+			if !at.Before(until) {
+				continue
+			}
+		}
+		return period.Bands, period.EffectiveFrom, period.EffectiveUntil, nil
+	}
+	return nil, "", "", &PricingError{Kind: ErrOutsidePriceRange, Model: price.Name,
+		Reason: fmt.Sprintf("no official price period is active at %s UTC", at.Format(time.RFC3339))}
 }
 
 func (s PriceSnapshot) Quote(usage Usage) (Quote, error) {
@@ -171,6 +217,8 @@ func (s PriceSnapshot) Quote(usage Usage) (Quote, error) {
 	components := []componentWork{
 		{name: "input", tokens: usage.InputTokens, rate: band.InputPerMillion},
 		{name: "cache_read", tokens: usage.CacheReadTokens, rate: band.CachePerMillion},
+		{name: "cache_write", tokens: usage.CacheWriteTokens, rate: band.CacheWritePerMillion},
+		{name: "cache_write_1h", tokens: usage.CacheWrite1HTokens, rate: band.CacheWrite1HPerMillion},
 		{name: "output", tokens: usage.OutputTokens, rate: band.OutputPerMillion},
 		{name: "reasoning", tokens: usage.ReasoningTokens, rate: band.ReasoningPerMillion},
 	}
@@ -201,11 +249,13 @@ func (s PriceSnapshot) Quote(usage Usage) (Quote, error) {
 		return Quote{}, err
 	}
 	breakdown := CostBreakdown{
-		Input:     componentCost(components[0], amounts[0], s.Currency),
-		CacheRead: componentCost(components[1], amounts[1], s.Currency),
-		Output:    componentCost(components[2], amounts[2], s.Currency),
-		Reasoning: componentCost(components[3], amounts[3], s.Currency),
-		Total:     total,
+		Input:        componentCost(components[0], amounts[0], s.Currency),
+		CacheRead:    componentCost(components[1], amounts[1], s.Currency),
+		CacheWrite:   componentCost(components[2], amounts[2], s.Currency),
+		CacheWrite1H: componentCost(components[3], amounts[3], s.Currency),
+		Output:       componentCost(components[4], amounts[4], s.Currency),
+		Reasoning:    componentCost(components[5], amounts[5], s.Currency),
+		Total:        total,
 	}
 	return Quote{Usage: usage, Cost: breakdown, AppliedBand: band, Snapshot: s}, nil
 }
@@ -231,13 +281,73 @@ type Reservation struct {
 }
 
 func (e *Engine) Reserve(model string, maximum Usage) (Reservation, error) {
-	quote, err := e.Quote(model, maximum)
+	return e.ReserveAt(model, maximum, time.Now().UTC())
+}
+
+func (e *Engine) ReserveAt(model string, maximum Usage, at time.Time) (Reservation, error) {
+	price, ok := e.catalog.Lookup(model)
+	if !ok {
+		return Reservation{}, &PricingError{Kind: ErrModelNotFound, Model: model}
+	}
+	if !price.Priced {
+		return Reservation{}, &PricingError{Kind: ErrModelUnpriced, Model: model, Reason: price.UnpricedReason}
+	}
+	snapshot, err := e.snapshot(model, price, at)
+	if err != nil {
+		return Reservation{}, err
+	}
+	maximum, err = conservativeMaximumUsage(snapshot, maximum)
+	if err != nil {
+		return Reservation{}, err
+	}
+	quote, err := snapshot.Quote(maximum)
 	if err != nil {
 		return Reservation{}, err
 	}
 	return Reservation{
 		MaximumUsage: maximum, ReservedMicroUSD: quote.Cost.Total, Snapshot: quote.Snapshot,
 	}, nil
+}
+
+func conservativeMaximumUsage(snapshot PriceSnapshot, maximum Usage) (Usage, error) {
+	prompt, err := maximum.PromptTokens()
+	if err != nil {
+		return Usage{}, err
+	}
+	band, ok := selectBand(snapshot.Bands, prompt)
+	if !ok {
+		return Usage{}, &PricingError{Kind: ErrOutsidePriceRange, Model: snapshot.RequestedModel}
+	}
+	type promptRate struct {
+		rate string
+		set  func(*Usage, int64)
+	}
+	rates := []promptRate{
+		{band.InputPerMillion, func(u *Usage, n int64) { u.InputTokens = n }},
+		{band.CachePerMillion, func(u *Usage, n int64) { u.CacheReadTokens = n }},
+		{band.CacheWritePerMillion, func(u *Usage, n int64) { u.CacheWriteTokens = n }},
+		{band.CacheWrite1HPerMillion, func(u *Usage, n int64) { u.CacheWrite1HTokens = n }},
+	}
+	best := -1
+	var bestRate *big.Rat
+	for i, candidate := range rates {
+		if candidate.rate == "" {
+			continue
+		}
+		rate, parseErr := nonNegativeDecimal(candidate.rate)
+		if parseErr != nil {
+			return Usage{}, invalidCatalog("reservation prompt rate: %v", parseErr)
+		}
+		if bestRate == nil || rate.Cmp(bestRate) > 0 {
+			best, bestRate = i, rate
+		}
+	}
+	if best < 0 {
+		return Usage{}, &PricingError{Kind: ErrCategoryUnpriced, Model: snapshot.RequestedModel, Category: "input"}
+	}
+	result := Usage{OutputTokens: maximum.OutputTokens, ReasoningTokens: maximum.ReasoningTokens}
+	rates[best].set(&result, prompt)
+	return result, nil
 }
 
 type Settlement struct {

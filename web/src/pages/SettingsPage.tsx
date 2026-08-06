@@ -1,4 +1,4 @@
-import { BookOpenCheck, Database, RefreshCw, Route as RouteIcon, Save, ShieldCheck, TimerReset } from 'lucide-react';
+import { Activity, BookOpenCheck, Database, RefreshCw, Route as RouteIcon, Save, ShieldCheck, TimerReset } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
 import { Badge, Button, ErrorState, Field, LoadingState, PageHeader, SectionHeader, Surface } from '../components/ui';
 import { useToast } from '../components/Toast';
@@ -18,7 +18,12 @@ export function SettingsPage() {
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    if (state.data) setDraft(state.data);
+    if (state.data) setDraft({
+      ...state.data,
+      failureWindowSeconds: state.data.failureWindowSeconds ?? 300,
+      firstOutputTimeoutSeconds: state.data.firstOutputTimeoutSeconds ?? 30,
+      streamIdleTimeoutSeconds: state.data.streamIdleTimeoutSeconds ?? 60,
+    });
   }, [state.data]);
 
   const setNumber = (field: keyof GatewaySettings, value: string) => {
@@ -29,6 +34,10 @@ export function SettingsPage() {
 
   const save = async () => {
     if (!draft) return;
+    if (draft.requestTimeoutSeconds < Math.max(draft.firstOutputTimeoutSeconds, draft.streamIdleTimeoutSeconds)) {
+      toast.show('请求总时限不能短于首输出或流空闲超时', 'error');
+      return;
+    }
     setSaving(true);
     try {
       const updated = await api.updateSettings(draft);
@@ -53,8 +62,9 @@ export function SettingsPage() {
         <Surface>
           <SectionHeader title="路由与健康" description="探针和真实请求使用同一套健康状态机。" />
           <div className="setting-list">
-            <SettingRow icon={<RefreshCw size={17} />} title="模型探针周期" description="仅探测监控页已选择的模型。"><div className="number-with-unit"><input className="input" type="number" min="60" step="30" value={draft.probeIntervalSeconds} onChange={(event) => setNumber('probeIntervalSeconds', event.target.value)} /><span>秒</span></div></SettingRow>
+            <SettingRow icon={<RefreshCw size={17} />} title="模型探针周期" description="作为新模型的默认自动探测周期。"><div className="number-with-unit"><input className="input" type="number" min="30" step="30" value={draft.probeIntervalSeconds} onChange={(event) => setNumber('probeIntervalSeconds', event.target.value)} /><span>秒</span></div></SettingRow>
             <SettingRow icon={<ShieldCheck size={17} />} title="连续失败阈值" description="首次失败只观察，达到阈值后进入冷却。"><div className="number-with-unit"><input className="input" type="number" min="2" max="10" value={draft.failureThreshold} onChange={(event) => setNumber('failureThreshold', event.target.value)} /><span>次</span></div></SettingRow>
+            <SettingRow icon={<Activity size={17} />} title="失败统计窗口" description="只累计这个时间范围内的连续失败。"><div className="number-with-unit"><input className="input" type="number" min="1" max="86400" step="30" value={draft.failureWindowSeconds} onChange={(event) => setNumber('failureWindowSeconds', event.target.value)} /><span>秒</span></div></SettingRow>
             <SettingRow icon={<TimerReset size={17} />} title="冷却时间" description="到期后通过单个半开请求恢复。"><div className="number-with-unit"><input className="input" type="number" min="30" step="30" value={draft.cooldownSeconds} onChange={(event) => setNumber('cooldownSeconds', event.target.value)} /><span>秒</span></div></SettingRow>
           </div>
         </Surface>
@@ -62,8 +72,10 @@ export function SettingsPage() {
         <Surface>
           <SectionHeader title="请求边界" description="限制单次请求在上游之间切换的总成本。" />
           <div className="setting-list">
-            <SettingRow icon={<RouteIcon size={17} />} title="最大尝试次数" description="包括首选目标在内的上游尝试总数。"><div className="number-with-unit"><input className="input" type="number" min="1" max="10" value={draft.maxAttempts} onChange={(event) => setNumber('maxAttempts', event.target.value)} /><span>次</span></div></SettingRow>
-            <SettingRow icon={<TimerReset size={17} />} title="请求总超时" description="整个路由修订内共享的总截止时间。"><div className="number-with-unit"><input className="input" type="number" min="10" max="600" value={draft.requestTimeoutSeconds} onChange={(event) => setNumber('requestTimeoutSeconds', event.target.value)} /><span>秒</span></div></SettingRow>
+            <SettingRow icon={<Activity size={17} />} title="首输出超时" description="上游未开始返回内容时切换到下一网站。"><div className="number-with-unit"><input className="input" type="number" min="1" max="600" value={draft.firstOutputTimeoutSeconds} onChange={(event) => setNumber('firstOutputTimeoutSeconds', event.target.value)} /><span>秒</span></div></SettingRow>
+            <SettingRow icon={<TimerReset size={17} />} title="流空闲超时" description="流式响应开始后，长时间无新数据即终止。"><div className="number-with-unit"><input className="input" type="number" min="1" max="3600" value={draft.streamIdleTimeoutSeconds} onChange={(event) => setNumber('streamIdleTimeoutSeconds', event.target.value)} /><span>秒</span></div></SettingRow>
+            <SettingRow icon={<RouteIcon size={17} />} title="最大尝试网站" description="包括首选网站在内的严格顺序尝试总数。"><div className="number-with-unit"><input className="input" type="number" min="1" max="20" value={draft.maxAttempts} onChange={(event) => setNumber('maxAttempts', event.target.value)} /><span>站</span></div></SettingRow>
+            <SettingRow icon={<TimerReset size={17} />} title="请求总时限" description="整次聚合调用跨网站共享的截止时间。"><div className="number-with-unit"><input className="input" type="number" min="1" max="3600" value={draft.requestTimeoutSeconds} onChange={(event) => setNumber('requestTimeoutSeconds', event.target.value)} /><span>秒</span></div></SettingRow>
           </div>
         </Surface>
 

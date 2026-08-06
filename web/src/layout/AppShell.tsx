@@ -45,7 +45,7 @@ export function AppShell({ user, onLogout }: { user: User; onLogout: () => Promi
     <div className={`app-shell ${collapsed ? 'sidebar-collapsed' : ''}`}>
       <aside className={`sidebar ${mobileOpen ? 'is-mobile-open' : ''}`}>
         <div className="sidebar-brand">
-          <div className="brand-mark" aria-hidden="true">J</div>
+          <div className="brand-mark" aria-hidden="true"><img src="/jieshan-brand.jpg" alt="" /></div>
           {!collapsed && <div className="brand-copy"><strong>JieShan</strong><span>API Gateway</span></div>}
           <IconButton className="mobile-close" label="关闭导航" onClick={() => setMobileOpen(false)}><X size={18} /></IconButton>
         </div>

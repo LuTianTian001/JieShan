@@ -1,20 +1,20 @@
 import { KeyRound, RefreshCw, ShieldCheck } from 'lucide-react';
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { Badge, Button, Dialog, Field, Switch } from '../../components/ui';
+import { Button, Dialog, Field, Switch } from '../../components/ui';
 import { useToast } from '../../components/Toast';
 import { api } from '../../lib/api';
 import type {
   AccountAdapter,
   AccountAdapterKey,
   AccountAuthKind,
+  AccountTarget,
   ConfigureUpstreamAccountInput,
-  Upstream,
   UpstreamAccount,
 } from '../../lib/types';
 
 interface AccountConfigDialogProps {
   open: boolean;
-  upstream: Upstream;
+  target: AccountTarget;
   adapters: AccountAdapter[];
   account: UpstreamAccount;
   onClose: () => void;
@@ -22,15 +22,15 @@ interface AccountConfigDialogProps {
 }
 
 const authLabels: Record<AccountAuthKind, { title: string; description: string }> = {
-  api_token: { title: 'API Token', description: '使用站点提供的账户令牌读取原始账户数据。' },
-  access_refresh: { title: '双 Token', description: '使用 Access Token，并由 Refresh Token 续期。' },
+  api_token: { title: '管理 Token', description: '只用于读取站点后台的余额、套餐和使用记录。' },
+  access_refresh: { title: '管理 Access + Refresh', description: '使用站点登录 Token，并由 Refresh Token 自动续期。' },
 };
 
-function defaultDashboardUrl(upstream: Upstream): string {
-  return upstream.baseUrl.replace(/\/(?:v1|api)\/?$/i, '');
+function defaultDashboardUrl(target: AccountTarget): string {
+  return target.dashboardUrl || target.baseUrl.replace(/\/(?:v1|api)\/?$/i, '');
 }
 
-export function AccountConfigDialog({ open, upstream, adapters, account, onClose, onSaved }: AccountConfigDialogProps) {
+export function AccountConfigDialog({ open, target, adapters, account, onClose, onSaved }: AccountConfigDialogProps) {
   const toast = useToast();
   const [adapterKey, setAdapterKey] = useState<AccountAdapterKey>('new_api');
   const [authKind, setAuthKind] = useState<AccountAuthKind>('api_token');
@@ -59,13 +59,13 @@ export function AccountConfigDialog({ open, upstream, adapters, account, onClose
 
     setAdapterKey(initialAdapterKey);
     setAuthKind(initialAuthKind);
-    setDashboardUrl(account.dashboardUrl || defaultDashboardUrl(upstream));
+    setDashboardUrl(account.dashboardUrl || defaultDashboardUrl(target));
     setEnabled(account.configured ? account.enabled : true);
     setApiToken('');
     setAccessToken('');
     setRefreshToken('');
     setError(null);
-  }, [account, adapters, open, upstream]);
+  }, [account, adapters, open, target]);
 
   const selectedAdapter = useMemo(
     () => adapters.find((item) => item.key === adapterKey) ?? null,
@@ -119,7 +119,7 @@ export function AccountConfigDialog({ open, upstream, adapters, account, onClose
     if (authKind === 'api_token') {
       const hasExisting = keepsExistingAuth && account.auth?.hasApiToken;
       if (!apiToken.trim() && !hasExisting) {
-        setError('请输入 API Token。切换认证方式后必须填写完整凭据。');
+        setError('请输入管理 Token。切换认证方式后必须填写完整凭据。');
         return;
       }
     } else {
@@ -142,13 +142,16 @@ export function AccountConfigDialog({ open, upstream, adapters, account, onClose
     setSaving(true);
     setError(null);
     try {
-      const updated = await api.configureUpstreamAccount(upstream.id, {
+      const input: ConfigureUpstreamAccountInput = {
         adapterKey,
         dashboardUrl: normalizedUrl,
         enabled,
         auth,
         refreshNow: true,
-      });
+      };
+      const updated = target.kind === 'site'
+        ? await api.configureSiteAccount(target.id, input)
+        : await api.configureUpstreamAccount(target.id, input);
       onSaved(updated);
       if (updated.sync.state === 'error' || updated.sync.error) {
         toast.show('连接已保存，但同步失败', 'error');
@@ -171,7 +174,7 @@ export function AccountConfigDialog({ open, upstream, adapters, account, onClose
     <Dialog
       open={open}
       title={account.configured ? '编辑账户连接' : '配置账户连接'}
-      description="仅用于读取站点余额、套餐和原始使用记录。"
+      description="管理凭据只读取余额、套餐和原始使用记录，不会参与模型调用。"
       onClose={close}
       width="lg"
       footer={<><Button onClick={close}>取消</Button><Button type="submit" form="account-config-form" variant="primary" busy={saving}>保存并同步</Button></>}
@@ -188,12 +191,14 @@ export function AccountConfigDialog({ open, upstream, adapters, account, onClose
           </Field>
         </div>
 
-        {selectedAdapter && <div className="adapter-capabilities" aria-label="适配器能力">
-          <span>{selectedAdapter.label} 可读取</span>
-          {selectedAdapter.capabilities.balance && <Badge tone="success">余额</Badge>}
-          {selectedAdapter.capabilities.subscription && <Badge tone="info">套餐</Badge>}
-          {selectedAdapter.capabilities.usage && <Badge tone="neutral">使用记录</Badge>}
-          {selectedAdapter.capabilities.tokenRefresh && <Badge tone="warning">自动续期</Badge>}
+        {selectedAdapter && <div className="adapter-capabilities" aria-label="账户同步能力">
+          <strong>{selectedAdapter.label}</strong>
+          <span>{[
+            selectedAdapter.capabilities.balance && '余额',
+            selectedAdapter.capabilities.subscription && '套餐',
+            selectedAdapter.capabilities.usage && '使用记录',
+            selectedAdapter.capabilities.tokenRefresh && 'Token 自动续期',
+          ].filter(Boolean).join(' · ')}</span>
         </div>}
 
         <div className="account-form-section">
@@ -201,7 +206,11 @@ export function AccountConfigDialog({ open, upstream, adapters, account, onClose
             <span className="field-label">认证方式</span>
             <span>更换方式时需要重新填写完整凭据</span>
           </div>
-          <div className="account-auth-selector" role="radiogroup" aria-label="账户认证方式">
+          {selectedAdapter && selectedAdapter.authKinds.length === 1 ? (() => {
+            const kind = selectedAdapter.authKinds[0];
+            const Icon = kind === 'api_token' ? KeyRound : RefreshCw;
+            return <div className="account-auth-fixed"><Icon size={17} aria-hidden="true" /><span><strong>{authLabels[kind].title}</strong><small>{authLabels[kind].description}</small></span></div>;
+          })() : <div className="account-auth-selector" role="radiogroup" aria-label="账户认证方式">
             {selectedAdapter?.authKinds.map((kind) => {
               const Icon = kind === 'api_token' ? KeyRound : RefreshCw;
               return (
@@ -211,21 +220,21 @@ export function AccountConfigDialog({ open, upstream, adapters, account, onClose
                 </button>
               );
             })}
-          </div>
+          </div>}
         </div>
 
         <div className="account-secret-fields">
           {authKind === 'api_token' ? (
-            <Field label="API Token" hint={sameAuth && account.auth?.hasApiToken ? '留空会保留现有 Token。' : 'Token 只提交到服务端，不会写入浏览器存储。'}>
-              <input className="input" type="password" autoComplete="new-password" value={apiToken} onChange={(event) => setApiToken(event.target.value)} placeholder={sameAuth && account.auth?.hasApiToken ? '留空保留现有 Token' : '输入 API Token'} />
+            <Field label="管理 Token" hint={sameAuth && account.auth?.hasApiToken ? '留空会保留现有管理 Token。' : '只提交到服务端加密保存，不会写入浏览器存储。'}>
+              <input className="input" type="password" autoComplete="new-password" value={apiToken} onChange={(event) => setApiToken(event.target.value)} placeholder={sameAuth && account.auth?.hasApiToken ? '留空保留现有管理 Token' : '输入站点管理 Token'} />
             </Field>
           ) : (
             <>
-              <Field label="Access Token" hint={sameAuth && account.auth?.hasAccessToken ? '留空会保留现有 Access Token。' : undefined}>
-                <input className="input" type="password" autoComplete="new-password" value={accessToken} onChange={(event) => setAccessToken(event.target.value)} placeholder={sameAuth && account.auth?.hasAccessToken ? '留空保留现有 Token' : '输入 Access Token'} />
+              <Field label="管理 Access Token" hint={sameAuth && account.auth?.hasAccessToken ? '留空会保留现有 Access Token。' : undefined}>
+                <input className="input" type="password" autoComplete="new-password" value={accessToken} onChange={(event) => setAccessToken(event.target.value)} placeholder={sameAuth && account.auth?.hasAccessToken ? '留空保留现有 Token' : '输入管理 Access Token'} />
               </Field>
-              <Field label="Refresh Token" hint={sameAuth && account.auth?.hasRefreshToken ? '留空会保留现有 Refresh Token。' : '用于服务端自动续期。'}>
-                <input className="input" type="password" autoComplete="new-password" value={refreshToken} onChange={(event) => setRefreshToken(event.target.value)} placeholder={sameAuth && account.auth?.hasRefreshToken ? '留空保留现有 Token' : '输入 Refresh Token'} />
+              <Field label="管理 Refresh Token" hint={sameAuth && account.auth?.hasRefreshToken ? '留空会保留现有 Refresh Token。' : '用于服务端自动续期管理会话。'}>
+                <input className="input" type="password" autoComplete="new-password" value={refreshToken} onChange={(event) => setRefreshToken(event.target.value)} placeholder={sameAuth && account.auth?.hasRefreshToken ? '留空保留现有 Token' : '输入管理 Refresh Token'} />
               </Field>
             </>
           )}
@@ -233,7 +242,7 @@ export function AccountConfigDialog({ open, upstream, adapters, account, onClose
 
         <div className="account-config-footer-row">
           <Switch checked={enabled} onChange={setEnabled} label="启用定时账户同步" />
-          <span><ShieldCheck size={15} aria-hidden="true" />账户凭据与代理调用 Key 分开保存</span>
+          <span><ShieldCheck size={15} aria-hidden="true" />管理 Token 与推理 API Key 完全分开保存</span>
         </div>
         {error && <div className="account-form-error" role="alert">{error}</div>}
       </form>

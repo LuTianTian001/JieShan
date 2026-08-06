@@ -1,229 +1,275 @@
-import { Check, Eye, FlaskConical, ListFilter, Pencil, Plus, RefreshCw, Trash2, Waypoints } from 'lucide-react';
+import {
+  ArrowRight,
+  CircleDollarSign,
+  KeyRound,
+  ListFilter,
+  Package,
+  Plus,
+  RefreshCw,
+  Route as RouteIcon,
+  Server,
+  Waypoints,
+} from 'lucide-react';
 import { useMemo, useState, type FormEvent } from 'react';
-import { Badge, Button, Dialog, Drawer, EmptyState, ErrorState, Field, LoadingState, PageHeader, SectionHeader, StatusBadge, Surface, Switch, Tabs } from '../components/ui';
+import { useNavigate } from 'react-router-dom';
+import { Badge, Button, Dialog, EmptyState, ErrorState, Field, IconButton, LoadingState, PageHeader, Surface } from '../components/ui';
 import { useToast } from '../components/Toast';
 import { api } from '../lib/api';
-import { formatDateTime, formatLatency, formatRelativeTime } from '../lib/format';
-import { useAsyncData } from '../lib/hooks';
-import type { CreateUpstreamInput, ModelDiscovery, Protocol, Upstream, UpdateUpstreamInput } from '../lib/types';
-import { AccountTab } from './upstreams/AccountTab';
+import { formatRelativeTime } from '../lib/format';
+import { inferenceProtocolAuthScheme, inferenceProtocolHint } from '../lib/inferenceProtocols';
+import type { Protocol } from '../lib/types';
+import { UpstreamErrorBoundary } from './upstreams/UpstreamErrorBoundary';
+import { formatSourceAmount, type UpstreamSiteView } from './upstreams/siteAdapter';
+import { useUpstreamSites } from './upstreams/useUpstreamSites';
 
-type UpstreamTab = 'overview' | 'models' | 'account';
+interface AddSiteForm {
+  name: string;
+  dashboardUrl: string;
+  baseUrl: string;
+  apiKey: string;
+  protocol: Protocol;
+}
 
-const protocolLabels: Record<Protocol, string> = {
-  openai: 'OpenAI',
-  anthropic: 'Anthropic',
-  gemini: 'Gemini',
-  compatible: '兼容协议',
-};
-
-const creatableProtocols: Protocol[] = ['openai', 'compatible'];
-
-const emptyForm: CreateUpstreamInput = { name: '', baseUrl: '', protocol: 'openai', apiKey: '' };
+const emptyForm: AddSiteForm = { name: '', dashboardUrl: '', baseUrl: '', apiKey: '', protocol: 'compatible' };
 
 export function UpstreamsPage() {
+  return <UpstreamErrorBoundary resetKey="upstream-list"><UpstreamList /></UpstreamErrorBoundary>;
+}
+
+function UpstreamList() {
+  const navigate = useNavigate();
   const toast = useToast();
-  const state = useAsyncData(() => api.upstreams(), []);
+  const inventory = useUpstreamSites();
   const [query, setQuery] = useState('');
   const [addOpen, setAddOpen] = useState(false);
-  const [form, setForm] = useState<CreateUpstreamInput>(emptyForm);
+  const [form, setForm] = useState<AddSiteForm>(emptyForm);
   const [saving, setSaving] = useState(false);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [tab, setTab] = useState<UpstreamTab>('overview');
-  const [busyAction, setBusyAction] = useState<string | null>(null);
-  const [discovery, setDiscovery] = useState<ModelDiscovery | null>(null);
-  const [editing, setEditing] = useState<Upstream | null>(null);
-  const [editForm, setEditForm] = useState<UpdateUpstreamInput | null>(null);
-  const [deleting, setDeleting] = useState<Upstream | null>(null);
 
-  const upstreams = state.data ?? [];
-  const selected = upstreams.find((item) => item.id === selectedId) ?? null;
+  const sites = inventory.data ?? [];
   const filtered = useMemo(() => {
     const normalized = query.trim().toLowerCase();
-    return upstreams.filter((item) => !normalized || `${item.name} ${item.baseUrl} ${item.protocol}`.toLowerCase().includes(normalized));
-  }, [query, upstreams]);
+    if (!normalized) return sites;
+    return sites.filter((site) => `${site.name} ${site.origin} ${site.baseUrl}`.toLowerCase().includes(normalized));
+  }, [query, sites]);
 
-  const replaceUpstream = (updated: Upstream) => state.setData((current) => current?.map((item) => item.id === updated.id ? updated : item) ?? [updated]);
-
-  const openDetail = (upstream: Upstream) => {
-    setSelectedId(upstream.id);
-    setTab('overview');
-    setDiscovery(null);
-  };
-
-  const openEdit = (upstream: Upstream) => {
-    setSelectedId(null);
-    setEditing(upstream);
-    setEditForm({ name: upstream.name, baseUrl: upstream.baseUrl, protocol: upstream.protocol, enabled: upstream.enabled, apiKey: '' });
-  };
-
-  const create = async (event: FormEvent) => {
+  const createSite = async (event: FormEvent) => {
     event.preventDefault();
-    if (!form.name.trim() || !form.baseUrl.trim() || !form.apiKey.trim()) return;
+    const baseUrl = form.baseUrl.trim();
+    const apiKey = form.apiKey.trim();
+    if (!baseUrl || !apiKey) return;
+    const name = form.name.trim() || inferredName(baseUrl);
+    let createdSiteId: number | null = null;
     setSaving(true);
     try {
-      const created = await api.createUpstream({ ...form, name: form.name.trim(), baseUrl: form.baseUrl.trim(), apiKey: form.apiKey.trim() });
-      state.setData((current) => [created, ...(current ?? [])]);
+      const created = await api.createV2Site({
+        name,
+        dashboardUrl: form.dashboardUrl.trim() || inferredDashboardUrl(baseUrl),
+        enabled: true,
+      });
+      createdSiteId = created.id;
+      await api.createV2Endpoint(created.id, {
+        name: '主要接入地址',
+        baseUrl,
+        wireProtocol: form.protocol,
+        compatibilityProfile: 'generic',
+        authScheme: inferenceProtocolAuthScheme(form.protocol),
+        enabled: true,
+      });
+      await api.createV2Credential(created.id, { name: '默认 Key', apiKey, enabled: true });
       setForm(emptyForm);
       setAddOpen(false);
-      setSelectedId(created.id);
-      toast.show('上游已添加，建议立即测试并获取模型', 'success');
+      toast.show('站点、接入地址和 API Key 已创建', 'success');
+      navigate(`/upstreams/${created.id}?tab=models&discover=1`);
     } catch (reason) {
-      toast.show(reason instanceof Error ? reason.message : '添加失败', 'error');
+      if (createdSiteId !== null) {
+        try {
+          await api.deleteV2Site(createdSiteId);
+        } catch {
+          toast.show('创建未完成，且自动清理失败，请刷新后删除残留站点', 'error');
+          return;
+        }
+      }
+      toast.show(reason instanceof Error ? `添加站点失败：${reason.message}` : '添加站点失败', 'error');
     } finally {
       setSaving(false);
     }
   };
 
-  const saveEdit = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!editing || !editForm || !editForm.name.trim() || !editForm.baseUrl.trim()) return;
-    setSaving(true);
-    try {
-      const payload: UpdateUpstreamInput = { ...editForm, name: editForm.name.trim(), baseUrl: editForm.baseUrl.trim() };
-      if (!payload.apiKey?.trim()) delete payload.apiKey;
-      const updated = await api.updateUpstream(editing.id, payload);
-      replaceUpstream(updated);
-      setEditing(null);
-      setEditForm(null);
-      toast.show('上游配置已更新，健康状态将重新确认', 'success');
-    } catch (reason) {
-      toast.show(reason instanceof Error ? reason.message : '更新失败', 'error');
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const deleteUpstream = async () => {
-    if (!deleting) return;
-    setBusyAction(`delete-${deleting.id}`);
-    try {
-      await api.deleteUpstream(deleting.id);
-      state.setData((current) => current?.filter((item) => item.id !== deleting.id) ?? []);
-      if (selectedId === deleting.id) setSelectedId(null);
-      setDeleting(null);
-      toast.show('上游已删除，相关路由目标已同步移除', 'success');
-    } catch (reason) {
-      toast.show(reason instanceof Error ? reason.message : '删除失败', 'error');
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const test = async (upstream: Upstream) => {
-    setBusyAction(`test-${upstream.id}`);
-    try {
-      const updated = await api.testUpstream(upstream.id);
-      replaceUpstream(updated);
-      toast.show(`${upstream.name} 连接正常`, 'success');
-    } catch (reason) {
-      toast.show(reason instanceof Error ? reason.message : '连接测试失败', 'error');
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const discover = async (upstream: Upstream) => {
-    setBusyAction(`discover-${upstream.id}`);
-    try {
-      const result = await api.discoverModels(upstream.id);
-      setDiscovery(result);
-      setSelectedId(upstream.id);
-      setTab('models');
-      toast.show(`发现完成：新增 ${result.added.length} 个模型`, 'success');
-    } catch (reason) {
-      toast.show(reason instanceof Error ? reason.message : '模型发现失败', 'error');
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const applyDiscovery = async () => {
-    if (!selected || !discovery) return;
-    setBusyAction(`apply-${selected.id}`);
-    try {
-      replaceUpstream(await api.applyModels(selected.id, discovery));
-      setDiscovery(null);
-      toast.show('模型列表已原子更新', 'success');
-    } catch (reason) {
-      toast.show(reason instanceof Error ? reason.message : '应用失败', 'error');
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  if (state.loading && !state.data) return <div className="page"><LoadingState label="正在读取上游" /></div>;
-  if (state.error && !state.data) return <div className="page"><ErrorState message={state.error} onRetry={() => void state.refresh()} /></div>;
+  if (inventory.loading && !inventory.data) return <div className="page"><LoadingState label="正在读取上游站点" /></div>;
+  if (inventory.error && !inventory.data) return <div className="page"><ErrorState message={inventory.error} onRetry={() => void inventory.refresh()} /></div>;
 
   return (
-    <div className="page">
-      <PageHeader title="上游管理" description="管理 API Key 上游、连接状态与模型发现。余额和套餐仅按站点原始数据展示。" actions={<Button variant="primary" icon={Plus} onClick={() => setAddOpen(true)}>添加上游</Button>} />
-      <Surface>
-        <div className="toolbar">
-          <div className="search-box"><ListFilter size={15} /><input className="input" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索名称、地址或协议" /></div>
-          <span className="toolbar-note">{upstreams.filter((item) => item.enabled).length} 个已启用</span>
-          <span className="toolbar-spacer" />
-          <Button size="sm" variant="ghost" icon={RefreshCw} busy={state.loading} onClick={() => void state.refresh()}>刷新</Button>
-        </div>
-        {filtered.length === 0 ? <EmptyState title="还没有上游" description="添加第一个 API Key 上游后，即可发现模型并配置路由。" action={<Button variant="primary" icon={Plus} onClick={() => setAddOpen(true)}>添加上游</Button>} /> : (
-          <div className="data-scroller">
-            <table className="data-table upstream-table">
-              <thead><tr><th>上游</th><th>状态</th><th>协议</th><th>模型</th><th>延迟</th><th>最近同步</th><th aria-label="操作" /></tr></thead>
-              <tbody>{filtered.map((upstream) => (
-                <tr key={upstream.id}>
-                  <td><div className="cell-main"><button type="button" className="table-primary-link" onClick={() => openDetail(upstream)}>{upstream.name}</button><code>{upstream.baseUrl}</code></div></td>
-                  <td><StatusBadge state={upstream.enabled ? upstream.state : 'disabled'} /></td>
-                  <td><Badge>{protocolLabels[upstream.protocol]}</Badge></td>
-                  <td className="numeric">{upstream.modelCount}</td>
-                  <td className="numeric">{formatLatency(upstream.latencyMs)}</td>
-                  <td>{formatRelativeTime(upstream.lastSyncAt)}</td>
-                  <td><div className="row-actions"><Button size="sm" variant="ghost" icon={Eye} onClick={() => openDetail(upstream)}>详情</Button><Button size="sm" variant="ghost" icon={Pencil} onClick={() => openEdit(upstream)}>编辑</Button><Button size="sm" variant="ghost" icon={Waypoints} busy={busyAction === `discover-${upstream.id}`} onClick={() => void discover(upstream)}>获取模型</Button></div></td>
-                </tr>
-              ))}</tbody>
-            </table>
+    <div className="page upstream-sites-page">
+      <PageHeader
+        title="上游站点"
+        description="一个网站只显示一次，API Key、模型、账户数据和路由状态在站点内统一管理。"
+        actions={<Button variant="primary" icon={Plus} onClick={() => setAddOpen(true)}>添加站点</Button>}
+      />
+
+      <Surface className="upstream-sites-surface">
+        <div className="toolbar upstream-sites-toolbar">
+          <div className="search-box">
+            <ListFilter size={15} />
+            <input className="input" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索站点或域名" />
           </div>
+          <span className="toolbar-note">{sites.length} 个站点 · {sites.reduce((sum, site) => sum + site.credentials.filter((item) => item.enabled).length, 0)} 枚启用 Key</span>
+          <span className="toolbar-spacer" />
+          <Button size="sm" variant="ghost" icon={RefreshCw} busy={inventory.loading} onClick={() => void inventory.refresh()}>刷新</Button>
+        </div>
+
+        {filtered.length === 0 ? (
+          <EmptyState
+            title={sites.length ? '没有匹配的站点' : '还没有上游站点'}
+            description={sites.length ? '换一个关键词试试。' : '添加站点和 API Key 后即可获取模型并加入路由。'}
+            action={!sites.length ? <Button variant="primary" icon={Plus} onClick={() => setAddOpen(true)}>添加站点</Button> : undefined}
+          />
+        ) : (
+          <>
+            <div className="data-scroller upstream-sites-desktop">
+              <table className="data-table upstream-site-table">
+                <thead><tr><th>站点</th><th>API Key</th><th>模型</th><th>余额</th><th>套餐</th><th>路由可用性</th><th>最近同步</th><th aria-label="操作" /></tr></thead>
+                <tbody>{filtered.map((site) => (
+                  <tr key={site.id} onDoubleClick={() => navigate(`/upstreams/${site.id}`)}>
+                    <td><SiteIdentity site={site} /></td>
+                    <td><CountCell icon={KeyRound} value={site.credentials.length} hint={`${site.credentials.filter((item) => item.enabled).length} 枚启用`} /></td>
+                    <td><CountCell icon={Waypoints} value={site.modelCount} hint={site.lastModelSyncAt ? `${formatRelativeTime(site.lastModelSyncAt)}更新` : '尚未获取'} /></td>
+                    <td><BalanceCell site={site} /></td>
+                    <td><PlanCell site={site} /></td>
+                    <td><AvailabilityCell site={site} /></td>
+                    <td><SyncCell site={site} /></td>
+                    <td><div className="row-actions"><IconButton label={`打开 ${site.name}`} onClick={() => navigate(`/upstreams/${site.id}`)}><ArrowRight size={17} /></IconButton></div></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+            <div className="upstream-mobile-list">
+              {filtered.map((site) => <MobileSiteCard key={site.id} site={site} onOpen={() => navigate(`/upstreams/${site.id}`)} />)}
+            </div>
+          </>
         )}
       </Surface>
 
-      <Dialog open={addOpen} title="添加上游" description="凭据会由服务端加密保存，不会写入浏览器存储。" onClose={() => setAddOpen(false)} footer={<><Button onClick={() => setAddOpen(false)}>取消</Button><Button type="submit" form="upstream-form" variant="primary" busy={saving}>保存上游</Button></>}>
-        <form id="upstream-form" className="form-grid" onSubmit={(event) => void create(event)}>
-          <Field label="名称"><input className="input" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="例如：主线路" /></Field>
-          <Field label="协议"><select className="select" value={form.protocol} onChange={(event) => setForm({ ...form, protocol: event.target.value as Protocol })}>{creatableProtocols.map((value) => <option value={value} key={value}>{protocolLabels[value]}</option>)}</select></Field>
-          <div className="field-span-2"><Field label="API Base URL" hint="填写中转站实际兼容地址，末尾斜杠会自动处理。"><input className="input" type="url" value={form.baseUrl} onChange={(event) => setForm({ ...form, baseUrl: event.target.value })} placeholder="https://example.com/v1" /></Field></div>
-          <div className="field-span-2"><Field label="API Key"><input className="input" type="password" value={form.apiKey} onChange={(event) => setForm({ ...form, apiKey: event.target.value })} autoComplete="new-password" placeholder="sk-..." /></Field></div>
+      <Dialog
+        open={addOpen}
+        title="添加上游站点"
+        description="一次创建网站、主要接入地址和首枚 API Key。"
+        onClose={() => setAddOpen(false)}
+        footer={<><Button onClick={() => setAddOpen(false)}>取消</Button><Button type="submit" form="add-site-form" variant="primary" busy={saving}>添加并检测</Button></>}
+      >
+        <form id="add-site-form" className="site-create-form" onSubmit={(event) => void createSite(event)}>
+          <Field label="站点名称" hint="留空时使用站点域名。">
+            <input className="input" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="例如：Ciii" />
+          </Field>
+          <Field label="站点网址" hint="用于打开控制台和后续连接余额；留空时取 API 域名。">
+            <input className="input" type="url" value={form.dashboardUrl} onChange={(event) => setForm({ ...form, dashboardUrl: event.target.value })} placeholder="https://example.com" />
+          </Field>
+          <Field label="API 地址">
+            <input className="input" type="url" value={form.baseUrl} onChange={(event) => setForm({ ...form, baseUrl: event.target.value })} placeholder="https://example.com/v1" required />
+          </Field>
+          <Field label="API 格式" hint={inferenceProtocolHint(form.protocol)}>
+            <select className="select" value={form.protocol} onChange={(event) => setForm({ ...form, protocol: event.target.value as Protocol })}>
+              <option value="compatible">OpenAI 兼容 · 可路由</option>
+              <option value="openai">OpenAI 官方 · 可路由</option>
+              <option value="anthropic">Anthropic 原生 · 仅获取模型</option>
+              <option value="gemini">Gemini 原生 · 仅获取模型</option>
+            </select>
+          </Field>
+          <Field label="API Key">
+            <input className="input" type="password" value={form.apiKey} onChange={(event) => setForm({ ...form, apiKey: event.target.value })} autoComplete="new-password" placeholder="sk-..." required />
+          </Field>
         </form>
       </Dialog>
-
-      <Dialog open={Boolean(editing && editForm)} title="编辑上游" description="API Key 留空会保留现有凭据；修改连接信息后健康状态会重新确认。" onClose={() => { setEditing(null); setEditForm(null); }} footer={<><Button onClick={() => { setEditing(null); setEditForm(null); }}>取消</Button><Button type="submit" form="edit-upstream-form" variant="primary" busy={saving}>保存更改</Button></>}>
-        {editForm && <form id="edit-upstream-form" className="form-grid" onSubmit={(event) => void saveEdit(event)}>
-          <Field label="名称"><input className="input" value={editForm.name} onChange={(event) => setEditForm({ ...editForm, name: event.target.value })} /></Field>
-          <Field label="协议"><select className="select" value={editForm.protocol} onChange={(event) => setEditForm({ ...editForm, protocol: event.target.value as Protocol })}>{creatableProtocols.map((value) => <option value={value} key={value}>{protocolLabels[value]}</option>)}</select></Field>
-          <div className="field-span-2"><Field label="API Base URL"><input className="input" type="url" value={editForm.baseUrl} onChange={(event) => setEditForm({ ...editForm, baseUrl: event.target.value })} /></Field></div>
-          <div className="field-span-2"><Field label="替换 API Key" hint="留空表示不更换现有 API Key。"><input className="input" type="password" value={editForm.apiKey || ''} onChange={(event) => setEditForm({ ...editForm, apiKey: event.target.value })} autoComplete="new-password" placeholder="留空保留现有密钥" /></Field></div>
-          <div className="field-span-2"><Switch checked={editForm.enabled} onChange={(enabled) => setEditForm({ ...editForm, enabled })} label="启用此上游" /></div>
-        </form>}
-      </Dialog>
-
-      <Dialog open={Boolean(deleting)} title="删除上游" description="删除会同步移除使用该上游的路由目标，此操作无法撤销。" onClose={() => setDeleting(null)} width="sm" footer={<><Button onClick={() => setDeleting(null)}>取消</Button><Button variant="danger" icon={Trash2} busy={Boolean(deleting && busyAction === `delete-${deleting.id}`)} onClick={() => void deleteUpstream()}>确认删除</Button></>}>
-        {deleting && <div className="delete-summary"><strong>{deleting.name}</strong><code>{deleting.baseUrl}</code><span>{deleting.modelCount} 个已应用模型</span></div>}
-      </Dialog>
-
-      <Drawer open={Boolean(selected)} title={selected?.name || ''} description={selected?.baseUrl} onClose={() => { setSelectedId(null); setDiscovery(null); }} footer={selected && <><Button variant="ghost" icon={Trash2} onClick={() => { setSelectedId(null); setDeleting(selected); }}>删除</Button><Button icon={Pencil} onClick={() => openEdit(selected)}>编辑</Button><Button variant="primary" icon={Waypoints} busy={busyAction === `discover-${selected.id}`} onClick={() => void discover(selected)}>获取模型</Button></>}>
-        {selected && <div className="upstream-detail">
-          <Tabs label="上游详情" items={[{ value: 'overview', label: '概览' }, { value: 'models', label: `模型 ${selected.modelCount}` }, { value: 'account', label: '账户' }]} value={tab} onChange={setTab} />
-          {tab === 'overview' && <div className="detail-stack">
-            <div className="detail-summary"><StatusBadge state={selected.enabled ? selected.state : 'disabled'} /><Badge>{protocolLabels[selected.protocol]}</Badge></div>
-            <dl className="detail-definition"><div><dt>接口地址</dt><dd><code>{selected.baseUrl}</code></dd></div><div><dt>凭据</dt><dd>{selected.credentialCount} 个 API Key</dd></div><div><dt>探针延迟</dt><dd>{formatLatency(selected.latencyMs)}</dd></div><div><dt>模型同步</dt><dd>{formatDateTime(selected.lastSyncAt)}</dd></div></dl>
-            {selected.lastError && <div className="inline-warning">{selected.lastError}</div>}
-            <Button icon={FlaskConical} busy={busyAction === `test-${selected.id}`} onClick={() => void test(selected)}>测试连接</Button>
-          </div>}
-          {tab === 'models' && <div className="detail-stack">
-            {discovery && discovery.upstreamId === selected.id && <div className={`sync-review ${discovery.complete ? '' : 'is-incomplete'}`}><div className="sync-review-heading"><div><Check size={17} /><strong>{discovery.complete ? '发现结果待应用' : '发现结果不完整'}</strong></div><span>{discovery.complete ? '完整响应' : '保留旧模型'}</span></div><div className="sync-counts"><span className="added">+{discovery.added.length} 新增</span><span>-{discovery.removed.length} 待移除</span><span>{discovery.unchanged.length} 未变化</span></div>{discovery.added.length > 0 && <div className="model-chip-list">{discovery.added.map((model) => <code key={model}>{model}</code>)}</div>}{!discovery.complete && <p className="muted-copy">本次响应不完整，不能覆盖当前模型列表。请检查上游后重新获取。</p>}<Button variant="primary" disabled={!discovery.complete} busy={busyAction === `apply-${selected.id}`} onClick={() => void applyDiscovery()}>确认并应用</Button></div>}
-            <div className="model-list">{selected.models?.length ? selected.models.map((model) => <div className="model-list-row" key={model.id}><code>{model.name}</code><Badge tone={model.enabled ? 'success' : 'neutral'}>{model.enabled ? '可路由' : '未发布'}</Badge></div>) : <EmptyState title="尚未同步模型" description="点击获取上游模型，确认差异后再应用。" />}</div>
-          </div>}
-          {tab === 'account' && <AccountTab key={selected.id} upstream={selected} />}
-        </div>}
-      </Drawer>
     </div>
   );
+}
+
+function SiteIdentity({ site }: { site: UpstreamSiteView }) {
+  return (
+    <div className="site-identity">
+      <span className="site-icon"><Server size={16} aria-hidden="true" /></span>
+      <div><strong>{site.name}</strong><code>{site.origin || site.baseUrl}</code></div>
+    </div>
+  );
+}
+
+function CountCell({ icon: Icon, value, hint }: { icon: typeof KeyRound; value: number; hint: string }) {
+  return <div className="site-count-cell"><span><Icon size={14} aria-hidden="true" />{value}</span><small>{hint}</small></div>;
+}
+
+function BalanceCell({ site }: { site: UpstreamSiteView }) {
+  const account = site.account;
+  if (!account?.configured) return <div className="site-value-cell is-muted"><strong>未连接账户</strong><small>不影响 API 路由</small></div>;
+  const stale = account.sync.stale || account.sync.state === 'stale';
+  return (
+    <div className="site-value-cell">
+      <strong>{formatSourceAmount(account.snapshot?.balance)}</strong>
+      <small className={account.sync.state === 'error' ? 'is-danger' : stale ? 'is-warning' : ''}>
+        {account.sync.state === 'error' ? '同步失败' : stale ? '数据陈旧' : account.snapshot ? '站点原始余额' : '等待首次同步'}
+      </small>
+    </div>
+  );
+}
+
+function PlanCell({ site }: { site: UpstreamSiteView }) {
+  const subscription = site.account?.snapshot?.subscription;
+  if (!subscription) return <div className="site-value-cell is-muted"><strong>未返回套餐</strong><small>{site.account?.configured ? '站点未提供' : '账户未连接'}</small></div>;
+  return (
+    <div className="site-value-cell">
+      <strong>{subscription.planName || '未命名套餐'}</strong>
+      <small>{subscription.remaining ? formatSourceAmount(subscription.remaining) : subscription.expiresAt ? `${formatRelativeTime(subscription.expiresAt)}到期` : subscription.status || '有效期未提供'}</small>
+    </div>
+  );
+}
+
+function AvailabilityCell({ site }: { site: UpstreamSiteView }) {
+  const availability = site.routeAvailability;
+  if (!availability.total) return <div className="site-value-cell is-muted"><strong>未加入监控</strong><small>按所选模型统计</small></div>;
+  if (availability.unknown === availability.total) return <div className="site-availability-cell"><Badge tone="warning">等待探针</Badge><small>{availability.total} 个监控目标</small></div>;
+  const tone = availability.attention ? 'danger' : availability.unknown ? 'warning' : 'success';
+  return (
+    <div className="site-availability-cell">
+      <Badge tone={tone}>{availability.healthy}/{availability.total} 可用</Badge>
+      <small>{availability.attention ? `${availability.attention} 个需处理` : availability.unknown ? `${availability.unknown} 个待探测` : '所选模型正常'}</small>
+    </div>
+  );
+}
+
+function SyncCell({ site }: { site: UpstreamSiteView }) {
+  return (
+    <div className="site-sync-cell">
+      <span><CircleDollarSign size={13} />账户 <strong>{site.lastAccountSyncAt ? formatRelativeTime(site.lastAccountSyncAt) : site.sourceVersion === 'v2' ? '未关联' : '从未'}</strong></span>
+      <span><Waypoints size={13} />模型 <strong>{site.lastModelSyncAt ? formatRelativeTime(site.lastModelSyncAt) : '从未'}</strong></span>
+    </div>
+  );
+}
+
+function MobileSiteCard({ site, onOpen }: { site: UpstreamSiteView; onOpen: () => void }) {
+  return (
+    <button type="button" className="upstream-mobile-card" onClick={onOpen}>
+      <div className="upstream-mobile-heading"><SiteIdentity site={site} /><ArrowRight size={17} /></div>
+      <div className="upstream-mobile-balance"><span>余额</span><strong>{formatSourceAmount(site.account?.snapshot?.balance)}</strong></div>
+      <div className="upstream-mobile-plan"><Package size={14} /><span>{site.account?.snapshot?.subscription?.planName || '未返回套餐'}</span></div>
+      <div className="upstream-mobile-meta">
+        <span><KeyRound size={13} />{site.credentials.length} Keys</span>
+        <span><Waypoints size={13} />{site.modelCount} 模型</span>
+        <span><RouteIcon size={13} />{site.routeAvailability.unknown === site.routeAvailability.total && site.routeAvailability.total ? '待探针' : site.routeAvailability.total ? `${site.routeAvailability.healthy}/${site.routeAvailability.total}` : '未监控'}</span>
+      </div>
+    </button>
+  );
+}
+
+function inferredName(baseUrl: string): string {
+  try {
+    return new URL(baseUrl).hostname;
+  } catch {
+    return '新站点';
+  }
+}
+
+function inferredDashboardUrl(baseUrl: string): string {
+  try {
+    return new URL(baseUrl).origin;
+  } catch {
+    return '';
+  }
 }

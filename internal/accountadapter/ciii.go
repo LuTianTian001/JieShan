@@ -362,6 +362,7 @@ func ciiiUsageItem(values map[string]any) *UsageItem {
 		CompletionTokens:    completion,
 		CacheReadTokens:     cacheRead,
 		CacheCreationTokens: cacheCreation,
+		ReasoningTokens:     int64Value(lookup(values, "reasoning_tokens")),
 		TotalTokens:         total,
 		Quota:               amountValue(lookup(values, "quota")),
 		TotalCost:           amountValue(lookup(values, "total_cost", "original_cost")),

@@ -205,7 +205,7 @@ func targetRouteCooldown(target RouteTarget) int {
 }
 
 func targetRouteFailureThreshold(target RouteTarget) int {
-	if target.FailureThreshold <= 0 {
+	if target.FailureThreshold < 2 {
 		return 2
 	}
 	return target.FailureThreshold

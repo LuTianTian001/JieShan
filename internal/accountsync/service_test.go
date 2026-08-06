@@ -529,6 +529,45 @@ func newAccountSyncTestService(t *testing.T, server *httptest.Server) (*Service,
 	return New(database, cipher, server.Client(), logger, time.Hour), database, upstreamID
 }
 
+func TestSiteAccountConfigurationIsIndependentFromInferenceCredentials(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	service, database, _ := newAccountSyncTestService(t, server)
+	ctx := context.Background()
+	siteID, err := database.CreateSite(ctx, store.SiteWrite{Name: "site-account", DashboardURL: server.URL, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	initial, err := service.GetSite(ctx, siteID)
+	if err != nil || initial.Configured || initial.DashboardURL != server.URL {
+		t.Fatalf("GetSite() unconfigured = %+v, %v", initial, err)
+	}
+	configured, err := service.ConfigureSite(ctx, siteID, ConfigureInput{
+		AdapterKey: "new_api", DashboardURL: server.URL, Enabled: true,
+		Auth: AuthInput{Kind: "api_token", APIToken: "management-token"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !configured.Configured || configured.Adapter == nil || configured.Adapter.Key != "new_api" || configured.Auth == nil || !configured.Auth.HasAPIToken {
+		t.Fatalf("ConfigureSite() = %+v", configured)
+	}
+	assertViewDoesNotContainSecrets(t, configured, "management-token")
+	if credentials, err := database.ListInferenceCredentials(ctx, siteID); err != nil || len(credentials) != 0 {
+		t.Fatalf("management account changed inference credentials: %+v, %v", credentials, err)
+	}
+	if err := service.DeleteSite(ctx, siteID); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := service.GetSite(ctx, siteID)
+	if err != nil || removed.Configured {
+		t.Fatalf("GetSite() after delete = %+v, %v", removed, err)
+	}
+}
+
 func configureCiiiAccount(t *testing.T, service *Service, upstreamID int64, scenario *ciiiScenario) {
 	t.Helper()
 	view, err := service.Configure(context.Background(), upstreamID, ConfigureInput{
