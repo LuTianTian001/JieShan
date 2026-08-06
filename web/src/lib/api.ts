@@ -1,5 +1,8 @@
 import { demo } from './demo';
 import type {
+  AccountAdapter,
+  AccountUsageRange,
+  ConfigureUpstreamAccountInput,
   CreateKeyInput,
   CreateRouteInput,
   CreateUpstreamInput,
@@ -11,6 +14,8 @@ import type {
   RequestLog,
   Route,
   Upstream,
+  UpstreamAccount,
+  UpstreamUsagePage,
   UpdateKeyInput,
   UpdateRouteInput,
   UpdateUpstreamInput,
@@ -103,6 +108,35 @@ export const api = {
     if (isDemoMode()) return demo.upstreams();
     const result = await request<{ items: Upstream[] }>('/upstreams');
     return result.items;
+  },
+  async accountAdapters(): Promise<AccountAdapter[]> {
+    if (isDemoMode()) return demo.accountAdapters();
+    const result = await request<{ items: AccountAdapter[] }>('/account-adapters');
+    return result.items;
+  },
+  async upstreamAccount(id: number): Promise<UpstreamAccount> {
+    if (isDemoMode()) return demo.upstreamAccount(id);
+    const result = await request<{ account: UpstreamAccount }>(`/upstreams/${id}/account`);
+    return result.account;
+  },
+  async configureUpstreamAccount(id: number, input: ConfigureUpstreamAccountInput): Promise<UpstreamAccount> {
+    if (isDemoMode()) return demo.configureUpstreamAccount(id, input);
+    const result = await request<{ account: UpstreamAccount }>(`/upstreams/${id}/account`, { method: 'PUT', body: JSON.stringify(input) });
+    return result.account;
+  },
+  async deleteUpstreamAccount(id: number): Promise<void> {
+    if (isDemoMode()) return demo.deleteUpstreamAccount(id);
+    await request<void>(`/upstreams/${id}/account`, { method: 'DELETE' });
+  },
+  async refreshUpstreamAccount(id: number): Promise<UpstreamAccount> {
+    if (isDemoMode()) return demo.refreshUpstreamAccount(id);
+    const result = await request<{ account: UpstreamAccount }>(`/upstreams/${id}/account/refresh`, { method: 'POST' });
+    return result.account;
+  },
+  async upstreamAccountUsage(id: number, range: AccountUsageRange, limit = 50): Promise<UpstreamUsagePage> {
+    if (isDemoMode()) return demo.upstreamAccountUsage(id, range, limit);
+    const query = new URLSearchParams({ range, limit: String(limit) });
+    return request<UpstreamUsagePage>(`/upstreams/${id}/account/usage?${query.toString()}`);
   },
   async createUpstream(input: CreateUpstreamInput): Promise<Upstream> {
     if (isDemoMode()) return demo.createUpstream(input);

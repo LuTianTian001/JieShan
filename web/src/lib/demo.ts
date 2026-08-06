@@ -1,4 +1,7 @@
 import type {
+  AccountAdapter,
+  AccountUsageRange,
+  ConfigureUpstreamAccountInput,
   CreateKeyInput,
   CreateRouteInput,
   CreateUpstreamInput,
@@ -10,6 +13,9 @@ import type {
   RequestLog,
   Route,
   Upstream,
+  UpstreamAccount,
+  UpstreamUsageItem,
+  UpstreamUsagePage,
   User,
   UpdateKeyInput,
   UpdateRouteInput,
@@ -18,6 +24,8 @@ import type {
 
 interface DemoState {
   upstreams: Upstream[];
+  accounts: Record<number, UpstreamAccount>;
+  accountUsage: Record<number, UpstreamUsageItem[]>;
   routes: Route[];
   keys: DownstreamKey[];
   logs: RequestLog[];
@@ -26,12 +34,37 @@ interface DemoState {
 
 const STORAGE_KEY = 'jieshan.demo.state.v1';
 
+const accountAdapterItems: AccountAdapter[] = [
+  { key: 'new_api', label: 'New API', authKinds: ['api_token'], capabilities: { balance: true, subscription: true, usage: true, tokenRefresh: false } },
+  { key: 'one_api', label: 'One API', authKinds: ['api_token'], capabilities: { balance: true, subscription: false, usage: true, tokenRefresh: false } },
+  { key: 'ciii', label: 'Ciii', authKinds: ['access_refresh'], capabilities: { balance: true, subscription: true, usage: true, tokenRefresh: true } },
+];
+
+function emptyAccount(dashboardUrl = ''): UpstreamAccount {
+  return {
+    configured: false,
+    enabled: false,
+    dashboardUrl,
+    capabilities: { balance: false, subscription: false, usage: false, tokenRefresh: false },
+    sync: { state: 'unconfigured', lastAttemptAt: null, lastSuccessAt: null, nextAt: null, stale: false, error: null },
+    snapshot: null,
+  };
+}
+
 function isoAgo(milliseconds: number): string {
   return new Date(Date.now() - milliseconds).toISOString();
 }
 
 function isoAhead(milliseconds: number): string {
   return new Date(Date.now() + milliseconds).toISOString();
+}
+
+function dashboardURL(baseURL: string): string {
+  try {
+    return new URL(baseURL).origin;
+  } catch {
+    return baseURL.replace(/\/$/, '');
+  }
 }
 
 function seedState(): DemoState {
@@ -47,8 +80,6 @@ function seedState(): DemoState {
       modelCount: 8,
       credentialCount: 1,
       lastSyncAt: isoAgo(18 * 60_000),
-      balanceSupported: false,
-      usageSupported: false,
       models: [
         { id: '1', name: 'claude-sonnet-4-5', enabled: true, discoveredAt: isoAgo(18 * 60_000) },
         { id: '2', name: 'gpt-5.2', enabled: true, discoveredAt: isoAgo(18 * 60_000) },
@@ -67,8 +98,6 @@ function seedState(): DemoState {
       credentialCount: 2,
       lastSyncAt: isoAgo(2 * 3_600_000),
       lastError: '最近一次探针首字节超时',
-      balanceSupported: false,
-      usageSupported: false,
       models: [
         { id: '4', name: 'claude-sonnet-4-5', enabled: true, discoveredAt: isoAgo(2 * 3_600_000) },
         { id: '5', name: 'gpt-5.2', enabled: true, discoveredAt: isoAgo(2 * 3_600_000) },
@@ -86,13 +115,58 @@ function seedState(): DemoState {
       credentialCount: 1,
       lastSyncAt: isoAgo(33 * 60_000),
       lastError: '连续两次连接失败，等待半开探测',
-      balanceSupported: false,
-      usageSupported: false,
       models: [
         { id: '6', name: 'claude-sonnet-4-5', enabled: true, discoveredAt: isoAgo(33 * 60_000) },
       ],
     },
   ];
+
+  const accounts: Record<number, UpstreamAccount> = {
+    1: {
+      configured: true,
+      enabled: true,
+      dashboardUrl: 'https://api.primary.example',
+      adapter: { key: 'new_api', label: 'New API' },
+      auth: { kind: 'api_token', hasApiToken: true, hasAccessToken: false, hasRefreshToken: false, accessTokenExpiresAt: null },
+      capabilities: { balance: true, subscription: true, usage: true, tokenRefresh: false },
+      sync: { state: 'ready', lastAttemptAt: isoAgo(12 * 60_000), lastSuccessAt: isoAgo(12 * 60_000), nextAt: isoAhead(18 * 60_000), stale: false, error: null },
+      snapshot: {
+        capturedAt: isoAgo(12 * 60_000),
+        balance: { value: '23.4700', currency: 'USD', display: '$23.47', sourceLabel: '站点余额' },
+        subscription: { planName: 'Pro 月付', status: 'active', expiresAt: isoAhead(24 * 86_400_000), renewsAt: isoAhead(24 * 86_400_000), periodStart: isoAgo(6 * 86_400_000), periodEnd: isoAhead(24 * 86_400_000) },
+      },
+    },
+    2: {
+      configured: true,
+      enabled: true,
+      dashboardUrl: 'https://relay-a.example',
+      adapter: { key: 'ciii', label: 'Ciii' },
+      auth: { kind: 'access_refresh', hasApiToken: false, hasAccessToken: true, hasRefreshToken: true, accessTokenExpiresAt: isoAhead(42 * 60_000) },
+      capabilities: { balance: true, subscription: true, usage: true, tokenRefresh: true },
+      sync: { state: 'stale', lastAttemptAt: isoAgo(46 * 60_000), lastSuccessAt: isoAgo(2 * 3_600_000), nextAt: isoAhead(14 * 60_000), stale: true, error: { code: 'account_timeout', message: '最近一次账户同步超时，继续展示上次成功数据。' } },
+      snapshot: {
+        capturedAt: isoAgo(2 * 3_600_000),
+        balance: { value: '104.2500', currency: 'CNY', display: '¥104.25', sourceLabel: '账户余额' },
+        subscription: { planName: '月度订阅', status: 'active', expiresAt: isoAhead(11 * 86_400_000), renewsAt: null, periodStart: isoAgo(19 * 86_400_000), periodEnd: isoAhead(11 * 86_400_000), remaining: { value: '68.4', currency: 'percent', display: '剩余 68.4%' } },
+      },
+    },
+    3: emptyAccount('https://relay-b.example'),
+  };
+
+  const accountUsage: Record<number, UpstreamUsageItem[]> = {
+    1: [
+      { id: 'usage-primary-1', externalId: 'primary-9021', occurredAt: isoAgo(9 * 60_000), model: 'claude-sonnet-4-5', amount: { value: '0.01482', currency: 'USD', display: '$0.01482' }, inputTokens: 2214, outputTokens: 638, status: 'success', sourceText: '站点原始扣费' },
+      { id: 'usage-primary-2', externalId: 'primary-9017', occurredAt: isoAgo(41 * 60_000), model: 'gpt-5.2', amount: { value: '0.02810', currency: 'USD', display: '$0.02810' }, inputTokens: 3810, outputTokens: 946, status: 'success', sourceText: '站点原始扣费' },
+      { id: 'usage-primary-3', externalId: 'primary-8982', occurredAt: isoAgo(8 * 3_600_000), model: 'deepseek-v3.1', amount: { value: '0.00360', currency: 'USD', display: '$0.00360' }, inputTokens: 1440, outputTokens: 512, status: 'success', sourceText: '站点原始扣费' },
+      { id: 'usage-primary-4', externalId: 'primary-8711', occurredAt: isoAgo(3 * 86_400_000), model: 'claude-sonnet-4-5', amount: { value: '0.02100', currency: 'USD', display: '$0.02100' }, inputTokens: 2892, outputTokens: 816, status: 'success', sourceText: '站点原始扣费' },
+    ],
+    2: [
+      { id: 'usage-relay-a-1', externalId: 'relay-a-482', occurredAt: isoAgo(22 * 60_000), model: 'claude-sonnet-4-5', amount: { value: '0.0840', currency: 'CNY', display: '¥0.0840' }, inputTokens: 1602, outputTokens: 428, status: 'success', sourceText: '套餐内记录' },
+      { id: 'usage-relay-a-2', externalId: 'relay-a-479', occurredAt: isoAgo(5 * 3_600_000), model: 'gpt-5.2', amount: { value: '0.1900', currency: 'CNY', display: '¥0.1900' }, inputTokens: 4077, outputTokens: 1031, status: 'success', sourceText: '套餐内记录' },
+      { id: 'usage-relay-a-3', externalId: 'relay-a-433', occurredAt: isoAgo(4 * 86_400_000), model: 'claude-sonnet-4-5', amount: { value: '0.1260', currency: 'CNY', display: '¥0.1260' }, inputTokens: 2940, outputTokens: 711, status: 'success', sourceText: '套餐内记录' },
+    ],
+    3: [],
+  };
 
   const routes: Route[] = [
     {
@@ -162,6 +236,8 @@ function seedState(): DemoState {
 
   return {
     upstreams,
+    accounts,
+    accountUsage,
     routes,
     keys,
     logs,
@@ -181,13 +257,27 @@ function seedState(): DemoState {
 }
 
 function loadState(): DemoState {
+  const seeded = seedState();
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) return JSON.parse(stored) as DemoState;
+    if (stored) {
+      const parsed = JSON.parse(stored) as Partial<DemoState>;
+      return {
+        ...seeded,
+        ...parsed,
+        upstreams: parsed.upstreams ?? seeded.upstreams,
+        accounts: { ...seeded.accounts, ...(parsed.accounts ?? {}) },
+        accountUsage: { ...seeded.accountUsage, ...(parsed.accountUsage ?? {}) },
+        routes: parsed.routes ?? seeded.routes,
+        keys: parsed.keys ?? seeded.keys,
+        logs: parsed.logs ?? seeded.logs,
+        settings: { ...seeded.settings, ...(parsed.settings ?? {}) },
+      };
+    }
   } catch {
     // A private browser window may reject storage access.
   }
-  return seedState();
+  return seeded;
 }
 
 let state = loadState();
@@ -202,6 +292,42 @@ function save(): void {
 
 function copy<T>(value: T): T {
   return structuredClone(value);
+}
+
+function usageWindow(range: AccountUsageRange): number {
+  if (range === '24h') return 86_400_000;
+  if (range === '7d') return 7 * 86_400_000;
+  return 30 * 86_400_000;
+}
+
+function snapshotFor(adapterKey: AccountAdapter['key']): NonNullable<UpstreamAccount['snapshot']> {
+  const currency = adapterKey === 'ciii' ? 'CNY' : 'USD';
+  return {
+    capturedAt: new Date().toISOString(),
+    balance: adapterKey === 'ciii'
+      ? { value: '104.2500', currency, display: '¥104.25', sourceLabel: '账户余额' }
+      : { value: '23.4700', currency, display: '$23.47', sourceLabel: '站点余额' },
+    subscription: adapterKey === 'one_api' ? null : {
+      planName: adapterKey === 'ciii' ? '月度订阅' : 'Pro 月付',
+      status: 'active',
+      expiresAt: isoAhead(21 * 86_400_000),
+      renewsAt: adapterKey === 'ciii' ? null : isoAhead(21 * 86_400_000),
+      periodStart: isoAgo(9 * 86_400_000),
+      periodEnd: isoAhead(21 * 86_400_000),
+    },
+  };
+}
+
+function refreshDemoAccount(id: number): UpstreamAccount {
+  const account = state.accounts[id];
+  if (!account?.configured) throw new Error('账户观测尚未配置');
+  if (!account.enabled) throw new Error('账户观测已停用');
+  const now = new Date().toISOString();
+  account.snapshot = account.snapshot ?? snapshotFor(account.adapter?.key ?? 'new_api');
+  account.snapshot.capturedAt = now;
+  account.sync = { state: 'ready', lastAttemptAt: now, lastSuccessAt: now, nextAt: isoAhead(30 * 60_000), stale: false, error: null };
+  save();
+  return copy(account);
 }
 
 export const demo = {
@@ -226,6 +352,72 @@ export const demo = {
   upstreams(): Upstream[] {
     return copy(state.upstreams);
   },
+  accountAdapters(): AccountAdapter[] {
+    return copy(accountAdapterItems);
+  },
+  upstreamAccount(id: number): UpstreamAccount {
+    const upstream = state.upstreams.find((entry) => entry.id === id);
+    if (!upstream) throw new Error('上游不存在');
+    state.accounts[id] ??= emptyAccount(dashboardURL(upstream.baseUrl));
+    return copy(state.accounts[id]);
+  },
+  configureUpstreamAccount(id: number, input: ConfigureUpstreamAccountInput): UpstreamAccount {
+    const upstream = state.upstreams.find((entry) => entry.id === id);
+    if (!upstream) throw new Error('上游不存在');
+    const adapter = accountAdapterItems.find((entry) => entry.key === input.adapterKey);
+    if (!adapter) throw new Error('账户适配器不存在');
+    if (!adapter.authKinds.includes(input.auth.kind)) throw new Error('该适配器不支持所选认证方式');
+    const previous = state.accounts[id] ?? emptyAccount(dashboardURL(upstream.baseUrl));
+    const previousAuth = previous.auth?.kind === input.auth.kind ? previous.auth : undefined;
+    const auth = input.auth.kind === 'api_token'
+      ? {
+          kind: 'api_token' as const,
+          hasApiToken: Boolean(input.auth.apiToken?.trim()) || Boolean(previousAuth?.hasApiToken),
+          hasAccessToken: false,
+          hasRefreshToken: false,
+          accessTokenExpiresAt: null,
+        }
+      : {
+          kind: 'access_refresh' as const,
+          hasApiToken: false,
+          hasAccessToken: Boolean(input.auth.accessToken?.trim()) || Boolean(previousAuth?.hasAccessToken),
+          hasRefreshToken: Boolean(input.auth.refreshToken?.trim()) || Boolean(previousAuth?.hasRefreshToken),
+          accessTokenExpiresAt: previousAuth?.accessTokenExpiresAt ?? isoAhead(60 * 60_000),
+        };
+    if (auth.kind === 'api_token' && !auth.hasApiToken) throw new Error('请输入 API Token');
+    if (auth.kind === 'access_refresh' && (!auth.hasAccessToken || !auth.hasRefreshToken)) throw new Error('请输入 Access Token 和 Refresh Token');
+    state.accounts[id] = {
+      configured: true,
+      enabled: input.enabled,
+      dashboardUrl: input.dashboardUrl.trim().replace(/\/$/, ''),
+      adapter: { key: adapter.key, label: adapter.label },
+      auth,
+      capabilities: copy(adapter.capabilities),
+      sync: { state: 'ready', lastAttemptAt: previous.sync.lastAttemptAt, lastSuccessAt: previous.sync.lastSuccessAt, nextAt: previous.sync.nextAt, stale: false, error: null },
+      snapshot: previous.adapter?.key === adapter.key ? previous.snapshot : null,
+    };
+    save();
+    return input.refreshNow && input.enabled ? refreshDemoAccount(id) : copy(state.accounts[id]);
+  },
+  deleteUpstreamAccount(id: number): void {
+    const upstream = state.upstreams.find((entry) => entry.id === id);
+    if (!upstream) throw new Error('上游不存在');
+    state.accounts[id] = emptyAccount(dashboardURL(upstream.baseUrl));
+    state.accountUsage[id] = [];
+    save();
+  },
+  refreshUpstreamAccount(id: number): UpstreamAccount {
+    return refreshDemoAccount(id);
+  },
+  upstreamAccountUsage(id: number, range: AccountUsageRange, limit: number): UpstreamUsagePage {
+    const account = state.accounts[id];
+    if (!account?.configured) throw new Error('账户观测尚未配置');
+    const cutoff = Date.now() - usageWindow(range);
+    const items = (state.accountUsage[id] ?? [])
+      .filter((item) => item.occurredAt == null || new Date(item.occurredAt).getTime() >= cutoff)
+      .slice(0, Math.min(200, Math.max(1, limit)));
+    return { items: copy(items), range, lastSyncedAt: account.sync.lastSuccessAt };
+  },
   createUpstream(input: CreateUpstreamInput): Upstream {
     const item: Upstream = {
       id: Math.max(0, ...state.upstreams.map((entry) => entry.id)) + 1,
@@ -238,11 +430,11 @@ export const demo = {
       modelCount: 0,
       credentialCount: 1,
       lastSyncAt: null,
-      balanceSupported: false,
-      usageSupported: false,
       models: [],
     };
     state.upstreams.unshift(item);
+    state.accounts[item.id] = emptyAccount(dashboardURL(item.baseUrl));
+    state.accountUsage[item.id] = [];
     save();
     return copy(item);
   },
@@ -266,6 +458,8 @@ export const demo = {
     const before = state.upstreams.length;
     state.upstreams = state.upstreams.filter((entry) => entry.id !== id);
     if (before === state.upstreams.length) throw new Error('上游不存在');
+    delete state.accounts[id];
+    delete state.accountUsage[id];
     state.routes = state.routes.map((route) => ({ ...route, revision: route.targets.some((target) => target.upstreamId === id) ? route.revision + 1 : route.revision, targets: route.targets.filter((target) => target.upstreamId !== id) }));
     save();
   },

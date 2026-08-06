@@ -1,4 +1,4 @@
-import { Check, CircleDollarSign, Eye, FlaskConical, KeyRound, ListFilter, Pencil, Plus, RefreshCw, Server, Trash2, Waypoints } from 'lucide-react';
+import { Check, Eye, FlaskConical, ListFilter, Pencil, Plus, RefreshCw, Trash2, Waypoints } from 'lucide-react';
 import { useMemo, useState, type FormEvent } from 'react';
 import { Badge, Button, Dialog, Drawer, EmptyState, ErrorState, Field, LoadingState, PageHeader, SectionHeader, StatusBadge, Surface, Switch, Tabs } from '../components/ui';
 import { useToast } from '../components/Toast';
@@ -6,6 +6,7 @@ import { api } from '../lib/api';
 import { formatDateTime, formatLatency, formatRelativeTime } from '../lib/format';
 import { useAsyncData } from '../lib/hooks';
 import type { CreateUpstreamInput, ModelDiscovery, Protocol, Upstream, UpdateUpstreamInput } from '../lib/types';
+import { AccountTab } from './upstreams/AccountTab';
 
 type UpstreamTab = 'overview' | 'models' | 'account';
 
@@ -19,24 +20,6 @@ const protocolLabels: Record<Protocol, string> = {
 const creatableProtocols: Protocol[] = ['openai', 'compatible'];
 
 const emptyForm: CreateUpstreamInput = { name: '', baseUrl: '', protocol: 'openai', apiKey: '' };
-
-function BalanceBlock({ upstream }: { upstream: Upstream }) {
-  const supported = upstream.balanceSupported === true;
-  const balance = upstream.balance;
-  return (
-    <div className="detail-block balance-block">
-      <div className="detail-block-heading"><div><CircleDollarSign size={17} /><strong>站点账户</strong></div><Badge tone={supported ? 'success' : 'neutral'}>{supported ? '已配置' : '未配置'}</Badge></div>
-      {!supported ? <p className="muted-copy">当前版本尚未配置该站点的余额适配器，因此不会调用占位接口或展示推测数据。</p> : balance ? (
-        <div className="balance-value">
-          <strong>{new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 4 }).format(balance.amount)}</strong>
-          <span>{balance.currency}</span>
-          {balance.sourceLabel && <Badge tone="neutral">{balance.sourceLabel}</Badge>}
-        </div>
-      ) : <p className="muted-copy">适配器已启用，但尚未返回余额数据。</p>}
-      {supported && balance?.plan && <dl className="compact-definition"><div><dt>套餐</dt><dd>{balance.plan}</dd></div><div><dt>续期</dt><dd>{formatDateTime(balance.renewalAt || null)}</dd></div></dl>}
-    </div>
-  );
-}
 
 export function UpstreamsPage() {
   const toast = useToast();
@@ -227,7 +210,7 @@ export function UpstreamsPage() {
 
       <Drawer open={Boolean(selected)} title={selected?.name || ''} description={selected?.baseUrl} onClose={() => { setSelectedId(null); setDiscovery(null); }} footer={selected && <><Button variant="ghost" icon={Trash2} onClick={() => { setSelectedId(null); setDeleting(selected); }}>删除</Button><Button icon={Pencil} onClick={() => openEdit(selected)}>编辑</Button><Button variant="primary" icon={Waypoints} busy={busyAction === `discover-${selected.id}`} onClick={() => void discover(selected)}>获取模型</Button></>}>
         {selected && <div className="upstream-detail">
-          <Tabs label="上游详情" items={[{ value: 'overview', label: '概览' }, { value: 'models', label: `模型 ${selected.modelCount}` }, { value: 'account', label: '账户适配' }]} value={tab} onChange={setTab} />
+          <Tabs label="上游详情" items={[{ value: 'overview', label: '概览' }, { value: 'models', label: `模型 ${selected.modelCount}` }, { value: 'account', label: '账户' }]} value={tab} onChange={setTab} />
           {tab === 'overview' && <div className="detail-stack">
             <div className="detail-summary"><StatusBadge state={selected.enabled ? selected.state : 'disabled'} /><Badge>{protocolLabels[selected.protocol]}</Badge></div>
             <dl className="detail-definition"><div><dt>接口地址</dt><dd><code>{selected.baseUrl}</code></dd></div><div><dt>凭据</dt><dd>{selected.credentialCount} 个 API Key</dd></div><div><dt>探针延迟</dt><dd>{formatLatency(selected.latencyMs)}</dd></div><div><dt>模型同步</dt><dd>{formatDateTime(selected.lastSyncAt)}</dd></div></dl>
@@ -238,7 +221,7 @@ export function UpstreamsPage() {
             {discovery && discovery.upstreamId === selected.id && <div className={`sync-review ${discovery.complete ? '' : 'is-incomplete'}`}><div className="sync-review-heading"><div><Check size={17} /><strong>{discovery.complete ? '发现结果待应用' : '发现结果不完整'}</strong></div><span>{discovery.complete ? '完整响应' : '保留旧模型'}</span></div><div className="sync-counts"><span className="added">+{discovery.added.length} 新增</span><span>-{discovery.removed.length} 待移除</span><span>{discovery.unchanged.length} 未变化</span></div>{discovery.added.length > 0 && <div className="model-chip-list">{discovery.added.map((model) => <code key={model}>{model}</code>)}</div>}{!discovery.complete && <p className="muted-copy">本次响应不完整，不能覆盖当前模型列表。请检查上游后重新获取。</p>}<Button variant="primary" disabled={!discovery.complete} busy={busyAction === `apply-${selected.id}`} onClick={() => void applyDiscovery()}>确认并应用</Button></div>}
             <div className="model-list">{selected.models?.length ? selected.models.map((model) => <div className="model-list-row" key={model.id}><code>{model.name}</code><Badge tone={model.enabled ? 'success' : 'neutral'}>{model.enabled ? '可路由' : '未发布'}</Badge></div>) : <EmptyState title="尚未同步模型" description="点击获取上游模型，确认差异后再应用。" />}</div>
           </div>}
-          {tab === 'account' && <div className="detail-stack"><BalanceBlock upstream={selected} /><div className="detail-block"><div className="detail-block-heading"><div><KeyRound size={17} /><strong>API Key 凭据</strong></div><Badge>{selected.credentialCount} 个</Badge></div><p className="muted-copy">凭据仅用于代理调用。账户登录、OAuth 和签到不属于核心连接方式。</p></div><div className="detail-block"><div className="detail-block-heading"><div><Server size={17} /><strong>上游日志适配</strong></div><Badge tone="neutral">{selected.usageSupported === true ? '已配置' : '未配置'}</Badge></div><p className="muted-copy">当前后端尚未实现真实使用日志适配，面板不会把空占位响应展示为成功。</p></div></div>}
+          {tab === 'account' && <AccountTab key={selected.id} upstream={selected} />}
         </div>}
       </Drawer>
     </div>

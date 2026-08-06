@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"strconv"
 	"time"
 
@@ -33,23 +32,9 @@ func upstreamDTO(item store.Upstream, models []store.UpstreamModel) map[string]a
 		"id": item.ID, "name": item.Name, "baseUrl": item.BaseURL, "protocol": item.Kind,
 		"enabled": item.Enabled, "state": state, "latencyMs": nil, "modelCount": item.ModelCount,
 		"credentialCount": 1, "lastSyncAt": isoOptional(lastSync),
-		"balanceSupported": item.BalanceValue != "" || len(item.Subscription) > 0 || item.LastBalanceSyncAt != nil,
-		"usageSupported":   false,
 	}
 	if models != nil {
 		result["models"] = modelItems
-	}
-	if item.BalanceValue != "" {
-		if amount, err := strconv.ParseFloat(item.BalanceValue, 64); err == nil {
-			balance := map[string]any{"amount": amount, "currency": firstNonEmpty(item.BalanceCurrency, "USD"), "sourceLabel": "上游返回"}
-			var subscription map[string]any
-			if len(item.Subscription) > 0 && json.Unmarshal(item.Subscription, &subscription) == nil {
-				if plan, ok := subscription["plan"].(string); ok {
-					balance["plan"] = plan
-				}
-			}
-			result["balance"] = balance
-		}
 	}
 	return result
 }

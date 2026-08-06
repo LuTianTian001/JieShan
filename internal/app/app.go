@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/LuTianTian001/JieShan/internal/accountsync"
 	"github.com/LuTianTian001/JieShan/internal/auth"
 	"github.com/LuTianTian001/JieShan/internal/billing"
 	"github.com/LuTianTian001/JieShan/internal/config"
@@ -24,6 +25,7 @@ type App struct {
 	store     *store.Store
 	server    *http.Server
 	monitor   *monitor.Scheduler
+	accounts  *accountsync.Service
 	logger    *slog.Logger
 	bootstrap string
 }
@@ -53,12 +55,16 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 	upstreamClient := upstream.NewClient(database, cipher, cfg.UpstreamTimeout, upstream.ClientOptions{
 		AllowPrivateUpstreams: cfg.AllowPrivateUpstreams,
 	})
+	accountHTTP := upstream.NewHTTPClient(cfg.UpstreamTimeout, upstream.ClientOptions{
+		AllowPrivateUpstreams: cfg.AllowPrivateUpstreams,
+	})
+	accountService := accountsync.New(database, cipher, accountHTTP, logger, accountsync.DefaultInterval)
 	priceEngine, err := billing.NewBuiltin()
 	if err != nil {
 		return fail(fmt.Errorf("load official price catalog: %w", err))
 	}
 	gatewayService := gateway.New(database, upstreamClient, priceEngine)
-	api := httpapi.New(cfg, database, authService, cipher, upstreamClient, gatewayService)
+	api := httpapi.New(cfg, database, authService, cipher, upstreamClient, gatewayService, accountService)
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           api.Handler(),
@@ -67,7 +73,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
-	return &App{cfg: cfg, store: database, server: server, monitor: monitor.New(database, gatewayService, logger), logger: logger, bootstrap: bootstrap}, nil
+	return &App{cfg: cfg, store: database, server: server, monitor: monitor.New(database, gatewayService, logger), accounts: accountService, logger: logger, bootstrap: bootstrap}, nil
 }
 
 func (a *App) Run(ctx context.Context) error {
@@ -80,6 +86,7 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	a.logger.Info("JieShan starting", "listen", a.cfg.ListenAddr, "database", a.cfg.DatabasePath)
 	go a.monitor.Run(ctx)
+	go a.accounts.Run(ctx)
 	go a.cleanupLoop(ctx)
 	errCh := make(chan error, 1)
 	go func() {
@@ -109,6 +116,7 @@ func (a *App) cleanupLoop(ctx context.Context) {
 		if err == nil {
 			cutoff := time.Now().Add(-time.Duration(settings.LogRetentionDays) * 24 * time.Hour).UnixMilli()
 			_ = a.store.DeleteOldLogs(ctx, cutoff)
+			_ = a.store.DeleteOldAccountData(ctx, cutoff)
 			_ = a.store.DeleteExpiredSessions(ctx, time.Now().UnixMilli())
 		}
 		select {

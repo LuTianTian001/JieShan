@@ -24,7 +24,8 @@ This document defines the boundaries that the implementation should preserve.
 | Module | Responsibility |
 | --- | --- |
 | Auth | Administrator session and downstream API-key authentication |
-| Upstream | Sites, credentials, protocol adapters, balance and usage adapters |
+| Upstream | Sites, inference credentials, model discovery, protocol adapters |
+| Account sync | Separate encrypted account credentials, balance, subscriptions, raw usage |
 | Catalog | Discovered models, publication state, official price snapshots |
 | Routing | Ordered route revisions, target selection, affinity, retry budget |
 | Health | Failure classification, suspect state, cooldown, half-open recovery |
@@ -94,6 +95,32 @@ after two complete successful synchronizations omit it.
 Monitoring is opt-in per published model. The default interval is five minutes
 with jitter. Probe outcomes use the same classifier and health reducer as real
 traffic, so the dashboard and router cannot disagree about target state.
+
+## Account synchronization
+
+Account connections are optional and have a separate lifecycle from inference
+credentials. The first adapters cover Ciii, New API, and One API. They refresh
+every 30 minutes by default and can also be refreshed manually.
+
+- Account tokens are stored in a versioned AES-GCM envelope and are never
+  returned by an administration API.
+- A refresh-token rotation, account snapshot, and newly discovered usage rows
+  are committed in one transaction.
+- A failed refresh preserves the last successful snapshot and cannot change
+  model health, route cooldown, inference credential state, or downstream
+  quota.
+- Manual duplicate refreshes return immediately, while account edits and
+  deletion serialize with an active refresh so stale results cannot overwrite
+  newer credentials.
+- Usage performs a 30-day initial import, then advances from the previous
+  successful synchronization with a five-minute overlap and a 100-record cap.
+- Monetary and quota values remain decimal strings. Ciii reports its source
+  currency; New API and One API retain raw `quota` plus `quota_per_unit`
+  metadata without being relabeled as USD.
+- One API subscriptions are explicitly unsupported rather than fabricated.
+- The legacy upstream-level `managementToken` request field is not migrated;
+  administrators configure an explicit adapter and authentication kind once in
+  the Account tab after upgrading.
 
 ## Data and consistency
 

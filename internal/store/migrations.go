@@ -272,6 +272,53 @@ CREATE TABLE upstream_usage_records (
 CREATE INDEX upstream_usage_records_upstream_idx ON upstream_usage_records(upstream_id, occurred_at DESC);
 `,
 	},
+	{
+		version: 2,
+		name:    "upstream_accounts_v2",
+		sql: `
+CREATE TABLE upstream_accounts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  upstream_id INTEGER NOT NULL UNIQUE REFERENCES upstreams(id) ON DELETE CASCADE,
+  adapter_kind TEXT NOT NULL CHECK (length(adapter_kind) > 0),
+  api_origin TEXT NOT NULL CHECK (length(api_origin) > 0),
+  auth_cipher BLOB NOT NULL CHECK (length(auth_cipher) > 0),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  capabilities_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(capabilities_json)),
+  sync_state TEXT NOT NULL DEFAULT 'pending',
+  last_attempt_at INTEGER,
+  last_success_at INTEGER,
+  last_error_code TEXT,
+  last_error_message TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX upstream_accounts_sync_idx ON upstream_accounts(enabled, sync_state, last_attempt_at);
+
+CREATE TABLE upstream_account_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  upstream_account_id INTEGER NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
+  snapshot_json TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+  captured_at INTEGER NOT NULL
+);
+CREATE INDEX upstream_account_snapshots_latest_idx ON upstream_account_snapshots(upstream_account_id, captured_at DESC, id DESC);
+
+CREATE TABLE upstream_account_usage_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  upstream_account_id INTEGER NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
+  dedupe_key TEXT NOT NULL CHECK (length(dedupe_key) > 0),
+  external_id TEXT,
+  model_name TEXT,
+  amount_text TEXT,
+  unit TEXT,
+  raw_json TEXT NOT NULL CHECK (json_valid(raw_json)),
+  occurred_at INTEGER,
+  synced_at INTEGER NOT NULL,
+  UNIQUE(upstream_account_id, dedupe_key)
+);
+CREATE INDEX upstream_account_usage_latest_idx ON upstream_account_usage_records(upstream_account_id, id DESC);
+CREATE INDEX upstream_account_usage_occurred_idx ON upstream_account_usage_records(upstream_account_id, occurred_at DESC, id DESC);
+`,
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {

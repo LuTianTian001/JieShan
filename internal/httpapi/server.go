@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LuTianTian001/JieShan/internal/accountsync"
 	"github.com/LuTianTian001/JieShan/internal/auth"
 	"github.com/LuTianTian001/JieShan/internal/config"
 	"github.com/LuTianTian001/JieShan/internal/gateway"
@@ -24,31 +25,54 @@ import (
 )
 
 type Server struct {
-	cfg          config.Config
-	store        *store.Store
-	auth         *auth.Service
-	cipher       *secrets.Cipher
-	upstream     *upstream.Client
-	gateway      *gateway.Gateway
-	mux          *http.ServeMux
-	requestSlots chan struct{}
-	loginSlots   chan struct{}
-	loginLimiter *loginFailureLimiter
+	cfg             config.Config
+	store           *store.Store
+	auth            *auth.Service
+	cipher          *secrets.Cipher
+	upstream        *upstream.Client
+	gateway         *gateway.Gateway
+	accounts        *accountsync.Service
+	mux             *http.ServeMux
+	inferenceSlots  chan struct{}
+	managementSlots chan struct{}
+	loginSlots      chan struct{}
+	loginLimiter    *loginFailureLimiter
 }
 
 type adminContextKey struct{}
 
-func New(cfg config.Config, s *store.Store, authService *auth.Service, cipher *secrets.Cipher, upstreamClient *upstream.Client, gatewayService *gateway.Gateway) *Server {
-	server := &Server{cfg: cfg, store: s, auth: authService, cipher: cipher, upstream: upstreamClient, gateway: gatewayService, mux: http.NewServeMux(), requestSlots: make(chan struct{}, 12), loginSlots: make(chan struct{}, 1), loginLimiter: newLoginFailureLimiter(loginLimiterMaxEntries)}
+const (
+	inferenceRequestLimit  = 8
+	managementRequestLimit = 4
+)
+
+func New(cfg config.Config, s *store.Store, authService *auth.Service, cipher *secrets.Cipher, upstreamClient *upstream.Client, gatewayService *gateway.Gateway, accountServices ...*accountsync.Service) *Server {
+	server := &Server{
+		cfg: cfg, store: s, auth: authService, cipher: cipher, upstream: upstreamClient,
+		gateway: gatewayService, mux: http.NewServeMux(),
+		inferenceSlots: make(chan struct{}, inferenceRequestLimit), managementSlots: make(chan struct{}, managementRequestLimit),
+		loginSlots: make(chan struct{}, 1), loginLimiter: newLoginFailureLimiter(loginLimiterMaxEntries),
+	}
+	if len(accountServices) > 0 {
+		server.accounts = accountServices[0]
+	}
 	server.routes()
 	return server
 }
 
 func (s *Server) Handler() http.Handler {
 	return securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			s.mux.ServeHTTP(w, r)
+			return
+		}
+		slots := s.managementSlots
+		if strings.HasPrefix(r.URL.Path, "/v1/") || r.URL.Path == "/chat/completions" {
+			slots = s.inferenceSlots
+		}
 		select {
-		case s.requestSlots <- struct{}{}:
-			defer func() { <-s.requestSlots }()
+		case slots <- struct{}{}:
+			defer func() { <-slots }()
 			s.mux.ServeHTTP(w, r)
 		default:
 			writeError(w, http.StatusServiceUnavailable, "server is busy", "server_busy")
@@ -63,6 +87,7 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/me", s.admin(http.HandlerFunc(s.me)))
 	s.mux.Handle("GET /api/v1/dashboard", s.admin(http.HandlerFunc(s.dashboard)))
 	s.mux.Handle("GET /api/v1/monitor/matrix", s.admin(http.HandlerFunc(s.monitorMatrix)))
+	s.mux.Handle("GET /api/v1/account-adapters", s.admin(http.HandlerFunc(s.listAccountAdapters)))
 
 	s.mux.Handle("GET /api/v1/upstreams", s.admin(http.HandlerFunc(s.listUpstreams)))
 	s.mux.Handle("POST /api/v1/upstreams", s.admin(http.HandlerFunc(s.createUpstream)))
@@ -73,8 +98,13 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/v1/upstreams/{id}/test", s.admin(http.HandlerFunc(s.testUpstream)))
 	s.mux.Handle("POST /api/v1/upstreams/{id}/models/discover", s.admin(http.HandlerFunc(s.discoverModels)))
 	s.mux.Handle("POST /api/v1/upstreams/{id}/models/apply", s.admin(http.HandlerFunc(s.applyModels)))
-	s.mux.Handle("POST /api/v1/upstreams/{id}/balance/refresh", s.admin(http.HandlerFunc(s.balancePlaceholder)))
-	s.mux.Handle("GET /api/v1/upstreams/{id}/usage", s.admin(http.HandlerFunc(s.usagePlaceholder)))
+	s.mux.Handle("GET /api/v1/upstreams/{id}/account", s.admin(http.HandlerFunc(s.getUpstreamAccount)))
+	s.mux.Handle("PUT /api/v1/upstreams/{id}/account", s.admin(http.HandlerFunc(s.configureUpstreamAccount)))
+	s.mux.Handle("DELETE /api/v1/upstreams/{id}/account", s.admin(http.HandlerFunc(s.deleteUpstreamAccount)))
+	s.mux.Handle("POST /api/v1/upstreams/{id}/account/refresh", s.admin(http.HandlerFunc(s.refreshUpstreamAccount)))
+	s.mux.Handle("GET /api/v1/upstreams/{id}/account/usage", s.admin(http.HandlerFunc(s.listUpstreamAccountUsage)))
+	s.mux.Handle("POST /api/v1/upstreams/{id}/balance/refresh", s.admin(http.HandlerFunc(s.refreshUpstreamAccount)))
+	s.mux.Handle("GET /api/v1/upstreams/{id}/usage", s.admin(http.HandlerFunc(s.listUpstreamAccountUsage)))
 
 	s.mux.Handle("GET /api/v1/routes", s.admin(http.HandlerFunc(s.listRoutes)))
 	s.mux.Handle("POST /api/v1/routes", s.admin(http.HandlerFunc(s.createRoute)))
@@ -234,15 +264,14 @@ func (s *Server) monitorMatrix(w http.ResponseWriter, r *http.Request) {
 }
 
 type upstreamPayload struct {
-	Name            string            `json:"name"`
-	Kind            string            `json:"kind"`
-	Protocol        string            `json:"protocol"`
-	DashboardURL    string            `json:"dashboardUrl"`
-	BaseURL         string            `json:"baseUrl"`
-	APIKey          *string           `json:"apiKey"`
-	ManagementToken *string           `json:"managementToken"`
-	Enabled         *bool             `json:"enabled"`
-	CustomHeaders   map[string]string `json:"customHeaders"`
+	Name          string            `json:"name"`
+	Kind          string            `json:"kind"`
+	Protocol      string            `json:"protocol"`
+	DashboardURL  string            `json:"dashboardUrl"`
+	BaseURL       string            `json:"baseUrl"`
+	APIKey        *string           `json:"apiKey"`
+	Enabled       *bool             `json:"enabled"`
+	CustomHeaders map[string]string `json:"customHeaders"`
 }
 
 func (s *Server) listUpstreams(w http.ResponseWriter, r *http.Request) {
@@ -296,20 +325,12 @@ func (s *Server) createUpstream(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	var management []byte
-	if body.ManagementToken != nil {
-		management, err = s.cipher.Encrypt(strings.TrimSpace(*body.ManagementToken))
-		if err != nil {
-			writeStoreError(w, err)
-			return
-		}
-	}
 	enabled := true
 	if body.Enabled != nil {
 		enabled = *body.Enabled
 	}
 	headers, _ := json.Marshal(body.CustomHeaders)
-	id, err := s.store.CreateUpstream(r.Context(), store.UpstreamWrite{Name: strings.TrimSpace(body.Name), Kind: kind, DashboardURL: strings.TrimSpace(body.DashboardURL), BaseURL: strings.TrimSpace(body.BaseURL), Enabled: enabled, CustomHeaders: headers, SecretCipher: secret, ManagementCipher: management})
+	id, err := s.store.CreateUpstream(r.Context(), store.UpstreamWrite{Name: strings.TrimSpace(body.Name), Kind: kind, DashboardURL: strings.TrimSpace(body.DashboardURL), BaseURL: strings.TrimSpace(body.BaseURL), Enabled: enabled, CustomHeaders: headers, SecretCipher: secret})
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -364,14 +385,7 @@ func (s *Server) updateUpstream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if body.ManagementToken != nil {
-		write.ManagementCipher, err = s.cipher.Encrypt(strings.TrimSpace(*body.ManagementToken))
-		if err != nil {
-			writeStoreError(w, err)
-			return
-		}
-	}
-	if err := s.store.UpdateUpstream(r.Context(), id, write, body.APIKey != nil, body.ManagementToken != nil); err != nil {
+	if err := s.store.UpdateUpstream(r.Context(), id, write, body.APIKey != nil, false); err != nil {
 		writeStoreError(w, err)
 		return
 	}
@@ -480,21 +494,112 @@ func (s *Server) applyModels(w http.ResponseWriter, r *http.Request) {
 	storedModels, _ := s.store.ListUpstreamModels(r.Context(), id)
 	writeJSON(w, http.StatusOK, map[string]any{"item": upstreamDTO(item, storedModels)})
 }
-func (s *Server) balancePlaceholder(w http.ResponseWriter, r *http.Request) {
+func (s *Server) listAccountAdapters(w http.ResponseWriter, _ *http.Request) {
+	if !s.requireAccounts(w) {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": s.accounts.Adapters()})
+}
+
+func (s *Server) getUpstreamAccount(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAccounts(w) {
+		return
+	}
 	id, ok := pathID(w, r)
 	if !ok {
 		return
 	}
-	item, err := s.store.GetUpstream(r.Context(), id)
+	account, err := s.accounts.Get(r.Context(), id)
 	if err != nil {
-		writeStoreError(w, err)
+		writeAccountError(w, err)
 		return
 	}
-	models, _ := s.store.ListUpstreamModels(r.Context(), id)
-	writeJSON(w, http.StatusOK, map[string]any{"item": upstreamDTO(item, models)})
+	writeJSON(w, http.StatusOK, map[string]any{"account": account})
 }
-func (s *Server) usagePlaceholder(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"items": []any{}, "supported": false})
+
+func (s *Server) configureUpstreamAccount(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAccounts(w) {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var body accountsync.ConfigureInput
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	account, err := s.accounts.Configure(r.Context(), id, body)
+	if err != nil {
+		writeAccountError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"account": account})
+}
+
+func (s *Server) deleteUpstreamAccount(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAccounts(w) {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.accounts.Delete(r.Context(), id); err != nil {
+		writeAccountError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) refreshUpstreamAccount(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAccounts(w) {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	account, err := s.accounts.Refresh(r.Context(), id)
+	if err != nil {
+		writeAccountError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"account": account})
+}
+
+func (s *Server) listUpstreamAccountUsage(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAccounts(w) {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	rangeName := firstNonEmpty(strings.TrimSpace(r.URL.Query().Get("range")), "7d")
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 100 {
+			writeError(w, http.StatusBadRequest, "limit must be between 1 and 100", "invalid_request")
+			return
+		}
+		limit = parsed
+	}
+	result, err := s.accounts.Usage(r.Context(), id, rangeName, limit)
+	if err != nil {
+		writeAccountError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) requireAccounts(w http.ResponseWriter) bool {
+	if s.accounts != nil {
+		return true
+	}
+	writeError(w, http.StatusServiceUnavailable, "account synchronization is unavailable", "service_unavailable")
+	return false
 }
 
 type routePayload struct {
@@ -921,6 +1026,39 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusBadRequest, err.Error(), "request_failed")
+}
+func writeAccountError(w http.ResponseWriter, err error) {
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "resource not found", "not_found")
+		return
+	}
+	if errors.Is(err, accountsync.ErrAccountDisabled) {
+		writeError(w, http.StatusConflict, err.Error(), "account_disabled")
+		return
+	}
+	if errors.Is(err, accountsync.ErrSyncInProgress) {
+		writeError(w, http.StatusConflict, err.Error(), "sync_in_progress")
+		return
+	}
+	if errors.Is(err, accountsync.ErrInvalidCredentials) || errors.Is(err, accountsync.ErrUnsupportedAdapter) {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_account_configuration")
+		return
+	}
+	var syncErr *accountsync.SyncError
+	if errors.As(err, &syncErr) {
+		status := http.StatusBadGateway
+		switch syncErr.Code {
+		case "invalid_configuration", "unsupported", "incompatible_response":
+			status = http.StatusUnprocessableEntity
+		case "rate_limited":
+			status = http.StatusTooManyRequests
+		case "timeout":
+			status = http.StatusGatewayTimeout
+		}
+		writeError(w, status, syncErr.Error(), syncErr.Code)
+		return
+	}
+	writeStoreError(w, err)
 }
 func writeError(w http.ResponseWriter, status int, message, code string) {
 	writeJSON(w, status, map[string]any{"message": message, "error": map[string]any{"message": message, "code": code}})

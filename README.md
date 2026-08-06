@@ -24,8 +24,16 @@ application structure of Metapi.
 Check-in, OAuth management, commerce, weighted routing, and balance-based
 routing are deliberately outside the core product.
 
-Upstream balance, subscription, and usage-log adapters are not implemented in
-the current release. They do not participate in routing or downstream billing.
+Optional account connections read upstream balance, subscription, and usage
+records for the administration panel. They are separate from inference API
+keys, never affect route order or cooldowns, and never participate in
+downstream billing. New API and One API quota values remain in the upstream's
+raw quota unit; JieShan does not guess a relay multiplier.
+
+Upgrades from the initial prototype must configure each balance connection
+once in the upstream Account tab. The former upstream-level `managementToken`
+input is intentionally not accepted because the site adapter and authentication
+scheme cannot be inferred safely from one opaque token.
 
 ## Architecture
 

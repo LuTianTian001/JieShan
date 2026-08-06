@@ -36,6 +36,24 @@ func NewClient(s *store.Store, cipher *secrets.Cipher, timeout time.Duration, co
 	if len(configured) > 0 {
 		options = configured[0]
 	}
+	httpClient, policy := newHTTPClient(timeout, options)
+	return &Client{
+		store:  s,
+		cipher: cipher,
+		policy: policy,
+		http:   httpClient,
+	}
+}
+
+// NewHTTPClient creates an outbound client with the same SSRF and DNS
+// rebinding protections used by inference requests.
+func NewHTTPClient(timeout time.Duration, options ClientOptions) *http.Client {
+	client, _ := newHTTPClient(timeout, options)
+	client.Timeout = timeout
+	return client
+}
+
+func newHTTPClient(timeout time.Duration, options ClientOptions) (*http.Client, *outboundPolicy) {
 	policy := newOutboundPolicy(options.AllowPrivateUpstreams)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
@@ -45,15 +63,10 @@ func NewClient(s *store.Store, cipher *secrets.Cipher, timeout time.Duration, co
 	transport.MaxIdleConns = 32
 	transport.MaxIdleConnsPerHost = 8
 	transport.IdleConnTimeout = 90 * time.Second
-	return &Client{
-		store:  s,
-		cipher: cipher,
-		policy: policy,
-		http: &http.Client{
-			Transport:     &guardedTransport{base: transport, policy: policy},
-			CheckRedirect: policy.checkRedirect,
-		},
-	}
+	return &http.Client{
+		Transport:     &guardedTransport{base: transport, policy: policy},
+		CheckRedirect: policy.checkRedirect,
+	}, policy
 }
 
 func (c *Client) DiscoverAndApply(ctx context.Context, upstreamID int64) (DiscoveryResult, error) {

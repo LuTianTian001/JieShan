@@ -176,6 +176,45 @@ func TestCrossOriginRedirectStripsCredentials(t *testing.T) {
 	}
 }
 
+func TestCrossOriginRedirectRejectsReplayedBody(t *testing.T) {
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var destinationRequests atomic.Int32
+			destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				destinationRequests.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(destination.Close)
+
+			source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				http.Redirect(w, req, destination.URL+"/capture", status)
+			}))
+			t.Cleanup(source.Close)
+
+			client := NewClient(nil, nil, 2*time.Second, ClientOptions{AllowPrivateUpstreams: true})
+			req, err := http.NewRequest(http.MethodPost, source.URL+"/refresh", strings.NewReader(`{"refresh_token":"secret"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			resp, err := client.Do(req)
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
+			if err == nil {
+				t.Fatal("Do() error = nil, want cross-origin body redirect rejected")
+			}
+			if !strings.Contains(err.Error(), "cross-origin redirect with request body") {
+				t.Fatalf("Do() error = %v, want cross-origin body rejection", err)
+			}
+			if got := destinationRequests.Load(); got != 0 {
+				t.Fatalf("destination requests = %d, want 0", got)
+			}
+		})
+	}
+}
+
 func TestSameOriginRedirectKeepsCredentials(t *testing.T) {
 	type capturedRequest struct {
 		header http.Header

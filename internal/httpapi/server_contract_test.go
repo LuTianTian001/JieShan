@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LuTianTian001/JieShan/internal/accountsync"
 	"github.com/LuTianTian001/JieShan/internal/auth"
 	"github.com/LuTianTian001/JieShan/internal/config"
 	"github.com/LuTianTian001/JieShan/internal/gateway"
@@ -182,7 +183,10 @@ func newAPIContractFixture(t *testing.T) *apiContractFixture {
 	}
 	upstreamClient := upstream.NewClient(s, cipher, 2*time.Second, upstream.ClientOptions{AllowPrivateUpstreams: true})
 	gatewayService := gateway.New(s, upstreamClient)
-	handler := New(config.Config{WebDir: filepath.Join(root, "missing-web"), SessionTTL: time.Hour, UpstreamTimeout: 2 * time.Second}, s, authService, cipher, upstreamClient, gatewayService).Handler()
+	accountHTTP := upstream.NewHTTPClient(2*time.Second, upstream.ClientOptions{AllowPrivateUpstreams: true})
+	accountHTTP.Timeout = 2 * time.Second
+	accountService := accountsync.New(s, cipher, accountHTTP, nil, accountsync.DefaultInterval)
+	handler := New(config.Config{WebDir: filepath.Join(root, "missing-web"), SessionTTL: time.Hour, UpstreamTimeout: 2 * time.Second}, s, authService, cipher, upstreamClient, gatewayService, accountService).Handler()
 	server := httptest.NewServer(handler)
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -348,6 +352,17 @@ func TestFrontendAPIContractEndToEnd(t *testing.T) {
 		return item
 	}
 
+	t.Run("legacy management token is rejected", func(t *testing.T) {
+		resp, body := fixture.request(t, http.MethodPost, "/api/v1/upstreams", map[string]any{
+			"name": "Legacy", "baseUrl": provider.URL, "protocol": "compatible",
+			"apiKey": "legacy-inference-key", "managementToken": "ambiguous-legacy-token",
+		}, nil)
+		requireStatus(t, resp, body, http.StatusBadRequest)
+		if !bytes.Contains(body, []byte("unknown field")) {
+			t.Fatalf("legacy managementToken rejection is not explicit: %s", body)
+		}
+	})
+
 	discoverAndApply := func(t *testing.T, item contractUpstream, wantModel string) contractUpstream {
 		t.Helper()
 		resp, body := fixture.request(t, http.MethodPost, fmt.Sprintf("/api/v1/upstreams/%d/models/discover", item.ID), nil, nil)
@@ -390,6 +405,60 @@ func TestFrontendAPIContractEndToEnd(t *testing.T) {
 
 	alpha := createUpstream(t, "Alpha", "upstream-key-alpha")
 	beta := createUpstream(t, "Beta", "upstream-key-beta")
+	t.Run("upstream account lifecycle", func(t *testing.T) {
+		resp, body := fixture.request(t, http.MethodGet, "/api/v1/account-adapters", nil, nil)
+		requireStatus(t, resp, body, http.StatusOK)
+		adapters := decodeContract[struct {
+			Items []accountsync.AdapterDescriptor `json:"items"`
+		}](t, body).Items
+		if len(adapters) != 3 {
+			t.Fatalf("expected three account adapters, got %+v", adapters)
+		}
+
+		accountPath := fmt.Sprintf("/api/v1/upstreams/%d/account", alpha.ID)
+		resp, body = fixture.request(t, http.MethodGet, accountPath, nil, nil)
+		requireStatus(t, resp, body, http.StatusOK)
+		initial := decodeContract[struct {
+			Account accountsync.AccountView `json:"account"`
+		}](t, body).Account
+		if initial.Configured || initial.Sync.State != "unconfigured" || initial.DashboardURL != provider.URL {
+			t.Fatalf("unexpected unconfigured account DTO: %+v", initial)
+		}
+
+		const managementSecret = "management-token-must-not-be-returned"
+		resp, body = fixture.request(t, http.MethodPut, accountPath, map[string]any{
+			"adapterKey": "new_api", "dashboardUrl": provider.URL, "enabled": true, "refreshNow": false,
+			"auth": map[string]any{"kind": "api_token", "apiToken": managementSecret},
+		}, nil)
+		requireStatus(t, resp, body, http.StatusOK)
+		if bytes.Contains(body, []byte(managementSecret)) {
+			t.Fatal("account response leaked the management token")
+		}
+		configured := decodeContract[struct {
+			Account accountsync.AccountView `json:"account"`
+		}](t, body).Account
+		if !configured.Configured || configured.Adapter == nil || configured.Adapter.Key != "new_api" || configured.Auth == nil || !configured.Auth.HasAPIToken {
+			t.Fatalf("unexpected configured account DTO: %+v", configured)
+		}
+
+		resp, body = fixture.request(t, http.MethodGet, accountPath+"/usage?range=7d&limit=50", nil, nil)
+		requireStatus(t, resp, body, http.StatusOK)
+		usage := decodeContract[accountsync.UsagePageView](t, body)
+		if usage.Range != "7d" || len(usage.Items) != 0 {
+			t.Fatalf("unexpected empty account usage DTO: %+v", usage)
+		}
+
+		resp, body = fixture.request(t, http.MethodDelete, accountPath, nil, nil)
+		requireStatus(t, resp, body, http.StatusNoContent)
+		resp, body = fixture.request(t, http.MethodGet, accountPath, nil, nil)
+		requireStatus(t, resp, body, http.StatusOK)
+		removed := decodeContract[struct {
+			Account accountsync.AccountView `json:"account"`
+		}](t, body).Account
+		if removed.Configured {
+			t.Fatalf("account should be unconfigured after delete: %+v", removed)
+		}
+	})
 	alpha = discoverAndApply(t, alpha, "provider-alpha")
 	beta = discoverAndApply(t, beta, "provider-beta")
 	if modelRequests != 2 {

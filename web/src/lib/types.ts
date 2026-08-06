@@ -14,12 +14,95 @@ export interface User {
   username: string;
 }
 
-export interface BalanceSnapshot {
-  amount: number;
+export type AccountAdapterKey = 'ciii' | 'new_api' | 'one_api';
+export type AccountAuthKind = 'api_token' | 'access_refresh';
+export type AccountSyncState = 'unconfigured' | 'ready' | 'syncing' | 'stale' | 'error';
+export type AccountUsageRange = '24h' | '7d' | '30d';
+
+export interface SourceAmount {
+  value: string;
   currency: string;
-  plan?: string;
-  renewalAt?: string;
+  display?: string;
   sourceLabel?: string;
+}
+
+export interface AccountAdapter {
+  key: AccountAdapterKey;
+  label: string;
+  authKinds: AccountAuthKind[];
+  capabilities: {
+    balance: boolean;
+    subscription: boolean;
+    usage: boolean;
+    tokenRefresh: boolean;
+  };
+}
+
+export interface UpstreamAccount {
+  configured: boolean;
+  enabled: boolean;
+  dashboardUrl: string;
+  adapter?: Pick<AccountAdapter, 'key' | 'label'>;
+  auth?: {
+    kind: AccountAuthKind;
+    hasApiToken: boolean;
+    hasAccessToken: boolean;
+    hasRefreshToken: boolean;
+    accessTokenExpiresAt: string | null;
+  };
+  capabilities: AccountAdapter['capabilities'];
+  sync: {
+    state: AccountSyncState;
+    lastAttemptAt: string | null;
+    lastSuccessAt: string | null;
+    nextAt: string | null;
+    stale: boolean;
+    error: { code: string; message: string } | null;
+  };
+  snapshot: {
+    capturedAt: string;
+    balance: SourceAmount | null;
+    subscription: {
+      planName: string;
+      status: string | null;
+      expiresAt: string | null;
+      renewsAt: string | null;
+      periodStart: string | null;
+      periodEnd: string | null;
+      remaining?: SourceAmount;
+      total?: SourceAmount;
+    } | null;
+  } | null;
+}
+
+export type UpstreamAccountAuthInput =
+  | { kind: 'api_token'; apiToken?: string }
+  | { kind: 'access_refresh'; accessToken?: string; refreshToken?: string };
+
+export interface ConfigureUpstreamAccountInput {
+  adapterKey: AccountAdapterKey;
+  dashboardUrl: string;
+  enabled: boolean;
+  auth: UpstreamAccountAuthInput;
+  refreshNow: boolean;
+}
+
+export interface UpstreamUsageItem {
+  id: string;
+  externalId?: string;
+  occurredAt: string | null;
+  model: string | null;
+  amount: SourceAmount | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  status: string | null;
+  sourceText?: string;
+}
+
+export interface UpstreamUsagePage {
+  items: UpstreamUsageItem[];
+  range: AccountUsageRange;
+  lastSyncedAt: string | null;
 }
 
 export interface UpstreamModel {
@@ -41,9 +124,6 @@ export interface Upstream {
   credentialCount: number;
   lastSyncAt: string | null;
   lastError?: string;
-  balance?: BalanceSnapshot;
-  balanceSupported?: boolean;
-  usageSupported?: boolean;
   models?: UpstreamModel[];
 }
 

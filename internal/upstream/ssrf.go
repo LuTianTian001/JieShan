@@ -84,9 +84,16 @@ func (p *outboundPolicy) checkRedirect(req *http.Request, via []*http.Request) e
 		return fmt.Errorf("refused upstream redirect: %w", err)
 	}
 	if len(via) > 0 && !sameOrigin(via[len(via)-1].URL, req.URL) {
+		if requestHasBody(req) {
+			return errors.New("refused cross-origin redirect with request body")
+		}
 		stripCrossOriginCredentials(req)
 	}
 	return nil
+}
+
+func requestHasBody(req *http.Request) bool {
+	return req != nil && req.Body != nil && req.Body != http.NoBody
 }
 
 func (p *outboundPolicy) validateURL(target *url.URL) error {
