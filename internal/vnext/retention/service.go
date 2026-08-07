@@ -108,8 +108,8 @@ func (service *Service) runPass(parent context.Context) {
 	now := service.now().UTC()
 	cutoff := now.Add(-time.Duration(settings.LogRetentionDays) * 24 * time.Hour)
 	ctx, cancel := context.WithTimeout(parent, service.timeout)
+	defer cancel()
 	result, err := service.repository.PruneOperationalHistory(ctx, cutoff)
-	cancel()
 	if err != nil {
 		service.logger.Warn("operational history cleanup failed", "error", err)
 		return

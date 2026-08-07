@@ -16,7 +16,10 @@ func TestRunCleansImmediatelyAndReadsLatestRetentionEveryPass(t *testing.T) {
 	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
 	clock := &retentionClock{now: now}
 	settings := &retentionSettings{days: 30}
-	repository := &retentionRepository{calls: make(chan retentionCall, 8)}
+	repository := &retentionRepository{
+		calls:            make(chan retentionCall, 8),
+		maintenanceCalls: make(chan maintenanceCall, 8),
+	}
 	service, err := New(repository, settings, Options{
 		Interval: 15 * time.Millisecond,
 		Timeout:  100 * time.Millisecond,
@@ -36,6 +39,7 @@ func TestRunCleansImmediatelyAndReadsLatestRetentionEveryPass(t *testing.T) {
 		t.Fatalf("immediate cutoff = %v, want %v", first.cutoff, want)
 	}
 	assertBoundedRetentionContext(t, first, 100*time.Millisecond)
+	assertMaintenanceContextActive(t, awaitMaintenanceCall(t, repository.maintenanceCalls), 100*time.Millisecond)
 
 	settings.SetDays(7)
 	nextNow := now.Add(2 * time.Hour)
@@ -45,6 +49,7 @@ func TestRunCleansImmediatelyAndReadsLatestRetentionEveryPass(t *testing.T) {
 		t.Fatalf("dynamic cutoff = %v, want %v", second.cutoff, want)
 	}
 	assertBoundedRetentionContext(t, second, 100*time.Millisecond)
+	assertMaintenanceContextActive(t, awaitMaintenanceCall(t, repository.maintenanceCalls), 100*time.Millisecond)
 
 	cancel()
 	select {
@@ -137,11 +142,19 @@ type retentionCall struct {
 	hasDeadline bool
 }
 
+type maintenanceCall struct {
+	observedAt  time.Time
+	deadline    time.Time
+	hasDeadline bool
+	err         error
+}
+
 type retentionRepository struct {
-	calls          chan retentionCall
-	blockUntilDone bool
-	mu             sync.Mutex
-	maintenance    int
+	calls            chan retentionCall
+	maintenanceCalls chan maintenanceCall
+	blockUntilDone   bool
+	mu               sync.Mutex
+	maintenance      int
 }
 
 func (repository *retentionRepository) PruneOperationalHistory(
@@ -158,10 +171,17 @@ func (repository *retentionRepository) PruneOperationalHistory(
 	return vnextstore.RetentionCleanupResult{CutoffAt: cutoff}, nil
 }
 
-func (repository *retentionRepository) Maintain(context.Context) error {
+func (repository *retentionRepository) Maintain(ctx context.Context) error {
+	observedAt := time.Now()
+	deadline, hasDeadline := ctx.Deadline()
 	repository.mu.Lock()
 	repository.maintenance++
 	repository.mu.Unlock()
+	if repository.maintenanceCalls != nil {
+		repository.maintenanceCalls <- maintenanceCall{
+			observedAt: observedAt, deadline: deadline, hasDeadline: hasDeadline, err: ctx.Err(),
+		}
+	}
 	return nil
 }
 
@@ -207,6 +227,31 @@ func awaitRetentionCall(t *testing.T, calls <-chan retentionCall) retentionCall 
 	case <-time.After(time.Second):
 		t.Fatal("retention cleanup was not called")
 		return retentionCall{}
+	}
+}
+
+func awaitMaintenanceCall(t *testing.T, calls <-chan maintenanceCall) maintenanceCall {
+	t.Helper()
+	select {
+	case call := <-calls:
+		return call
+	case <-time.After(time.Second):
+		t.Fatal("SQLite maintenance was not called")
+		return maintenanceCall{}
+	}
+}
+
+func assertMaintenanceContextActive(t *testing.T, call maintenanceCall, maximum time.Duration) {
+	t.Helper()
+	if call.err != nil {
+		t.Fatalf("SQLite maintenance context error = %v", call.err)
+	}
+	if !call.hasDeadline {
+		t.Fatal("SQLite maintenance context has no deadline")
+	}
+	duration := call.deadline.Sub(call.observedAt)
+	if duration <= 0 || duration > maximum {
+		t.Fatalf("SQLite maintenance deadline duration = %v, want within (0,%v]", duration, maximum)
 	}
 }
 
