@@ -1,85 +1,95 @@
 # JieShan
 
-JieShan is a clean-room AI relay aggregator for a single administrator. It
-combines personally managed upstream websites behind one OpenAI-compatible API,
-keeps routing order under explicit user control, and moves traffic away from
-unhealthy targets without turning the panel into a billing or commerce system.
+JieShan is a clean-room, self-hosted AI API gateway for one administrator or a
+small trusted team. It combines independently managed relay sites behind one
+stable downstream API, keeps model routing under explicit operator control,
+and automatically moves a request away from an unhealthy upstream target.
 
-It is a new implementation. The Metapi codebase and application structure are
-not used as its foundation.
+This repository is a new implementation. It does not run or fall back to the
+old Metapi application packages.
 
-## What it does
+## Product scope
 
-- Models an upstream as `Site -> Endpoint -> API Key`, so one website can have
-  multiple API addresses and multiple independently managed keys.
-- Discovers a site's model list through its model-list endpoint and records
-  per-key coverage instead of assuming every key has identical access.
-- Publishes only selected models through `/v1/models`,
-  `/v1/chat/completions`, and `/v1/responses`.
-- Routes sites strictly in the order selected in the panel. There is no weight,
-  random selection, balance-based ordering, or automatic priority rewrite.
-- Rotates keys inside the current site for key-local failures such as
-  `401`, `402`, and `429`; transport, TLS, first-output timeout, stream failure,
-  and retryable server errors move the request to the next site.
-- Switches the current request immediately after a retryable site failure, but
-  does not cool the site on the first independent failure. The default policy
-  cools it for five minutes after the second failure in the failure window.
-- Monitors only published models with `monitorEnabled` turned on. The default
-  interval is five minutes, and one model can be probed across all configured
-  sites on demand.
-- Issues downstream API keys with optional USD quotas. Usage is charged from a
-  versioned official-price snapshot, including a frozen FX snapshot when an
-  official price is published in another currency.
-- Keeps upstream account balance, subscription, and usage data in the site's
-  original units. Account data is informational and never changes routing or
-  downstream charges.
-- Stores request summaries and per-attempt timelines, including selected site,
-  endpoint, key, latency, first-output time, switch reason, token categories,
-  reasoning settings, and the price snapshot used for settlement.
+- Models an upstream as one `Site` with separate `Endpoint` and `API Key`
+  resources. One website can expose several API addresses and use several
+  independently managed inference keys.
+- Discovers models from an endpoint, records per-key availability, and lets the
+  operator publish only the models that should be visible downstream.
+- Routes each published model in strict drag order. There is no weighting,
+  random selection, balance-based sorting, or hidden priority rewrite.
+- Switches the current request immediately after a retryable target failure.
+  Under the default policy, one failure marks the target suspect; a second
+  independent failure inside five minutes starts a five-minute cooldown.
+- Rotates API keys inside the current site for credential-local failures such
+  as authentication, quota, and rate-limit errors without cooling the whole
+  route target.
+- Probes only models explicitly selected for monitoring. The global default
+  probe interval is five minutes, and one selected model can be probed across
+  all of its ordered targets on demand.
+- Supports native OpenAI Chat Completions and Responses, Anthropic Messages,
+  and Gemini GenerateContent request and streaming surfaces.
+- Issues downstream API keys with optional USD quota, RPM limit, expiry, and a
+  selectable routing profile. Custom profiles inherit the global default route
+  unless they explicitly override a model.
+- Charges downstream usage from an immutable, versioned official-price
+  snapshot. Unknown or unverified prices fail closed instead of being treated
+  as free.
+- Optionally connects a relay site's management API to display its exact
+  balance and synchronize raw upstream usage records. These values never
+  control routing or downstream billing.
+- Stores request summaries and per-attempt timelines with the selected model,
+  route profile, site, endpoint, API key snapshot, latency, first output,
+  switch reason, token categories, reasoning data, and settlement snapshot.
 
-JieShan deliberately has no check-in workflow, provider OAuth management,
-weighted routing, storefront, recharge, or balance-based failover. Optional
-site account connections exist only to display upstream balance, subscription,
-and source usage records.
+JieShan deliberately has no check-in workflow, package or subscription
+inference, provider OAuth management, storefront, recharge system, weighted
+routing, or upstream-balance-based failover. Session refresh inside a site
+adapter is implementation plumbing for balance and raw-log synchronization,
+not an OAuth product feature.
 
 ## Architecture
 
-- Go modular monolith for the public gateway, administration API, health state
-  machines, background jobs, and SQLite persistence.
-- React, TypeScript, and Vite administration panel served by the Go process in
-  production.
+- Go modular monolith for the public gateway, administrator API, routing,
+  monitoring, account synchronization, pricing, retention, and SQLite storage.
+- React, TypeScript, and Vite panel served by the Go process in production.
 - SQLite in WAL mode. PostgreSQL and Redis are not required.
-- One application container, with Caddy recommended as the host reverse proxy.
+- One application container. Caddy is recommended as the host reverse proxy.
 
-Read [Architecture](docs/architecture.md) for the data model, routing rules,
-monitoring behavior, billing boundary, and `/api/v2` surface.
+Read [Architecture](docs/architecture.md) for the data model, global runtime
+policy, failure handling, monitoring, accounting boundary, and `/api/vnext`
+administration surface.
 
 ## Quick start
 
-Use Docker Engine with the Compose plugin. A two-core, one-gigabyte server is
-enough for one administrator and light request volume when it pulls a prebuilt
-image. Two gigabytes is recommended when the same host also provides a proxy or
-VPN service to other people.
+Use Docker Engine with the Compose plugin. The supplied limits target a
+two-core, two-gigabyte server shared with Caddy and a separately limited
+Mihomo/Clash service. A one-gigabyte host remains possible only for light
+personal traffic with a prebuilt image and tighter limits.
 
 ```bash
 cp .env.example .env
 chmod 600 .env
-openssl rand -hex 32
-```
-
-Put the generated value in `JIESHAN_SECRET_KEY`, set a strong
-`JIESHAN_ADMIN_PASSWORD`, then start JieShan:
-
-```bash
 docker compose pull
 docker compose up -d --no-build
 docker compose ps
 curl --fail http://127.0.0.1:4000/healthz
 ```
 
-The default Compose file binds the service to `127.0.0.1:4000`. Put Caddy or
-another TLS reverse proxy in front of it. Before DNS and TLS are ready, use an
-SSH tunnel:
+`JIESHAN_ADMIN_PASSWORD` and `JIESHAN_SECRET_KEY` are optional only for a new
+data volume. When the password is omitted, read the generated one-time
+bootstrap file after the first start, store it securely, and remove the file:
+
+```bash
+docker compose exec jieshan cat /data/initial-admin-password.txt
+docker compose exec jieshan rm /data/initial-admin-password.txt
+```
+
+When `JIESHAN_SECRET_KEY` is omitted, JieShan creates
+`/data/jieshan-secret.key`. That file must remain with the database because it
+protects stored upstream credentials.
+
+The supplied Compose file binds `127.0.0.1:4000`. Put Caddy or another TLS
+reverse proxy in front of it. Before DNS and TLS are ready, use an SSH tunnel:
 
 ```bash
 ssh -L 4000:127.0.0.1:4000 user@your-server
@@ -88,23 +98,38 @@ ssh -L 4000:127.0.0.1:4000 user@your-server
 Then open `http://127.0.0.1:4000` locally. Do not expose the panel, downstream
 API, or credentials over public plain HTTP.
 
-See [Deployment](docs/deployment.md) for production setup, one-gigabyte tuning,
+See [Deployment](docs/deployment.md) for production setup, 2C2G tuning,
 backup, upgrade, rollback, and VPN co-location guidance.
 
 ## API surfaces
 
+Public inference endpoints require a JieShan downstream API key:
+
 | Surface | Purpose |
 | --- | --- |
-| `/v1/models` | List enabled published models |
-| `/v1/chat/completions` | OpenAI-compatible chat requests |
-| `/v1/responses` | OpenAI-compatible Responses requests |
-| `/api/v2/sites/*` | Sites, endpoints, API keys, accounts, discovery |
-| `/api/v2/published-models/*` | Publication, ordered route targets, probe runs |
-| `/api/v2/monitor/matrix` | Selected-model and per-site health matrix |
-| `/api/v2/request-logs*` | Filtered request records and summaries |
+| `/v1/models` | OpenAI-style model list |
+| `/v1/chat/completions` | OpenAI Chat Completions |
+| `/v1/responses` | OpenAI Responses |
+| `/v1/messages` | Anthropic Messages |
+| `/v1beta/models` | Gemini model list |
+| `/v1beta/models/{model}:generateContent` | Gemini non-streaming generation |
+| `/v1beta/models/{model}:streamGenerateContent` | Gemini streaming generation |
 
-Administration endpoints require an administrator session. Public inference
-endpoints require a JieShan downstream API key.
+Administrator endpoints require an administrator session and use one
+versionless namespace:
+
+| Group | Responsibility |
+| --- | --- |
+| `/api/vnext/auth` | Login, logout, and session status |
+| `/api/vnext/inventory` | Sites, endpoints, API keys, discovery, and provider models |
+| `/api/vnext/downstream-keys` | Downstream keys, limits, profile binding, and visible models |
+| `/api/vnext/site-accounts` | Account adapters, exact balance, and raw upstream usage |
+| `/api/vnext/pricing` | Official catalog preview, import, activation, and state |
+| `/api/vnext/request-logs` | Request search, summary, and attempt details |
+| `/api/vnext/monitor` | Selected-model matrix, probes, and target history |
+| `/api/vnext/settings` | Persisted global routing, timeout, probe, and retention policy |
+
+There is no `/api/v2` compatibility surface in the VNext runtime.
 
 ## Local development
 
@@ -130,31 +155,38 @@ The backend reads the built frontend from `web/dist` by default. Run
 ## Configuration and data
 
 Environment variables and conservative container defaults are documented in
-`.env.example`. Production requires:
+`.env.example`. Runtime routing, timeout, probe interval, and log-retention
+values are persisted as one revisioned global settings record. Environment
+values initialize an untouched database only; later panel changes survive
+restarts and are not overwritten by container recreation.
 
-- `JIESHAN_ADMIN_PASSWORD`: administrator password enforced at startup.
-- `JIESHAN_SECRET_KEY`: 32 random bytes encoded as 64 hexadecimal characters,
-  used to protect upstream credentials and session material.
+Persistent state lives in `/data/jieshan.sqlite` inside the named Docker
+volume. Back up the SQLite files and `jieshan-secret.key` before every upgrade.
+Never commit `.env`, databases, backups, downstream keys, upstream keys,
+passwords, cookies, access tokens, or refresh tokens.
 
-Persistent state lives in `/data/jieshan.db` inside the named Docker volume.
-Back up both the SQLite data and the deployment secret before every upgrade or
-legacy-data migration. Never commit `.env`, databases, backups, downstream
-keys, upstream keys, passwords, cookies, or refresh tokens.
-
-Read [Migration](docs/migration.md) before moving data from the legacy
-prototype. The migration workflow is preview-first, idempotent, and preserves
-legacy logs instead of rewriting their meaning.
+Read [Migration](docs/migration.md) before upgrading a schema or preserving
+configuration from an older prototype. The production runtime never mutates a
+legacy database in place; `cmd/jieshan-migrate` performs an explicit offline,
+read-only-source conversion into a new VNext database.
 
 ## Repository layout
 
 ```text
-cmd/jieshan/       Application entry point
-internal/          Backend modules, adapters, routing, billing, and storage
-web/               React administration panel
-deploy/            Reverse-proxy and deployment examples
-docs/              Architecture, deployment, and migration guides
-.github/workflows/ Continuous integration and image publishing
+cmd/jieshan/          Application entry point
+internal/app/         Process lifecycle and HTTP server
+internal/config/      Environment bootstrap configuration
+internal/vnext/       Complete production gateway and control-plane modules
+internal/vnextmigration/ Offline legacy preview and conversion library
+web/                  React administration panel
+deploy/               Reverse-proxy examples
+docs/                 Architecture, deployment, and migration guides
+.github/workflows/    Continuous integration and image publishing
 ```
+
+The former legacy runtime package tree has been deleted. Production code is
+composed from `internal/vnext` and cannot silently fall back to the old store,
+gateway, routing, billing, account, or HTTP implementations.
 
 ## License
 

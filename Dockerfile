@@ -43,10 +43,11 @@ COPY --from=web-build --chown=jieshan:jieshan /src/web/dist /app/web
 
 ENV JIESHAN_LISTEN_ADDR=:4000 \
     JIESHAN_DATA_DIR=/data \
-    JIESHAN_DB_PATH=/data/jieshan.db \
+    JIESHAN_DB_PATH=/data/jieshan.sqlite \
     JIESHAN_WEB_DIR=/app/web \
     JIESHAN_LOG_LEVEL=info \
-    GOMEMLIMIT=480MiB \
+    GOMEMLIMIT=560MiB \
+    GOMAXPROCS=2 \
     TZ=Asia/Shanghai
 
 USER jieshan

@@ -1,187 +1,219 @@
-# Legacy to V3 migration
+# Data migration and upgrades
 
-Legacy data migration is separate from the automatic SQLite schema migration.
-Starting a new binary may create V3 tables, but it must not silently reinterpret
-legacy upstream rows, route priorities, account tokens, or request history.
+JieShan has two different migration concerns:
 
-The supported workflow is always:
+1. **VNext schema upgrades** update an existing VNext SQLite database when a
+   newer JieShan image starts.
+2. **Legacy application conversion** moves useful configuration from an older
+   Metapi or prototype database into the clean VNext model.
+
+Only the first path is automatic. The production runtime does not silently
+reinterpret an older application's tables, credentials, routes, balances, or
+request history.
+
+## VNext schema upgrades
+
+`internal/vnext/store` owns the production schema and applies ordered SQLite
+migrations when a VNext database opens. Schema migration is forward-only:
 
 ```text
-backup -> preview -> resolve conflicts -> apply -> verify -> remove legacy use
+verified backup -> start newer image -> automatic schema migration -> verify
 ```
 
-Never begin with Apply, and never delete legacy rows immediately after an
-apparently successful migration.
+Before an image upgrade:
 
-## Before preview
+1. Pin and record the currently running image tag.
+2. Stop JieShan for the simplest consistent backup.
+3. Archive the complete data volume, including `jieshan.sqlite`, any WAL files,
+   and `jieshan-secret.key`.
+4. Verify that the archive can be listed or extracted.
+5. Keep the old image and backup until the upgraded product path passes.
 
-1. Pin the currently running image tag and record the JieShan version.
-2. Stop write traffic or schedule a short maintenance window.
-3. Back up the complete SQLite volume as described in
-   [Deployment](deployment.md).
-4. Back up the unchanged `JIESHAN_SECRET_KEY` separately. Encrypted API keys
-   and account credentials cannot be migrated or restored without it.
-5. Confirm that the backup can be listed or extracted before continuing.
+The deployment secret is part of the data set. Restoring the database without
+the same key makes stored inference and management credentials unreadable.
 
-Preview is read-only. It must not create Sites, change route order, test keys,
-refresh account sessions, run probes, or modify legacy data.
+After upgrade, verify:
 
-The Preview response includes `item.planFingerprint`, an opaque SHA-256 digest
-of every legacy and existing V3 record that can affect the migration result,
-plus a versioned normalized manifest of the calculated Preview, Site grouping,
-upstream-to-group mapping, settings, and account migration units. Database
-values retain their SQLite storage class in the digest. The digest includes
-encrypted credential bytes without exposing them. Record the exact value from
-the reviewed Preview; it is required by Apply.
+- `/healthz` succeeds;
+- administrator login succeeds;
+- `/api/vnext/settings` returns the previously saved revisioned global policy;
+- Site, Endpoint, inference key, published model, and route order are intact;
+- selected monitor rows and recent health history are readable;
+- downstream quota and the active official-price catalog are unchanged;
+- one small inference request succeeds and its attempt log is complete;
+- configured Site accounts still show exact balance and raw upstream usage.
 
-## Mapping rules
+Do not run an older image against a database already migrated by a newer
+release. Rollback means restoring the matching pre-upgrade volume and secret,
+then starting the older image.
 
-The migration converts legacy concepts into the V3 hierarchy:
+## Legacy conversion boundary
 
-| Legacy data | V3 result |
+The VNext runtime is a clean implementation. The former top-level legacy
+runtime packages have been deleted, and production startup has no fallback to
+their store, gateway, routing, billing, account, or HTTP behavior. Legacy
+conversion is deliberately offline:
+
+- startup never guesses that a database belongs to an older application;
+- there is no `/api/v2` compatibility API or browser-accessible migration
+  endpoint;
+- the legacy SQLite source is opened in query-only mode;
+- the destination path must not already contain a database;
+- conversion is built in a temporary staging file and installed atomically;
+- a repeated run refuses to overwrite the installed destination.
+
+`cmd/jieshan-migrate` converts supported legacy configuration, encrypted
+inference credentials, downstream key digests and limits, account connections,
+exact balance snapshots, and raw upstream usage into a new VNext database. It
+requires the existing 32-byte `JIESHAN_SECRET_KEY`, because that key is needed
+to decrypt legacy secrets and seal them with the new record-bound format.
+
+## Supported legacy workflow
+
+```text
+stop old instance
+-> archive old database and secret
+-> copy the database to a read-only migration workspace
+-> run offline conversion into a new path
+-> start VNext on a different loopback port
+-> verify routes, keys, monitoring, accounting, balance, and logs
+-> switch the public endpoint
+-> retain the old image and backup until accepted
+```
+
+Never point both processes at the same SQLite file or mount one writable data
+volume into both containers.
+
+Build the migration binary on a machine with Go 1.25 or newer, then run it in a
+maintenance window. `--openai-surface` is mandatory because an older generic
+OpenAI endpoint does not prove whether it should become Chat Completions,
+Responses, or both. Models whose names are not exact built-in official pricing
+SKUs require one or more explicit `--price MODEL=SKU` mappings.
+
+```bash
+read -rsp 'Existing JIESHAN_SECRET_KEY: ' JIESHAN_SECRET_KEY
+echo
+export JIESHAN_SECRET_KEY
+./jieshan-migrate \
+  --source /migration/legacy.db \
+  --destination /migration/jieshan.sqlite \
+  --openai-surface chat \
+  --price old-public-alias=gpt-4o
+```
+
+The command prints a JSON result containing migrated row counts, non-revealable
+downstream key count, selected OpenAI policy, catalog version, and warnings.
+Review that output before the new database is installed into the production
+volume.
+
+## Converted resources
+
+The converter maps only resources used by the VNext product:
+
+| Old concept | VNext resource |
 | --- | --- |
-| Upstream rows for the same website | One Site after explicit grouping review |
-| Distinct inference base URL and protocol | Endpoint under that Site |
-| Each inference key | Ordered API Key under that Site |
-| Discovered upstream model | Site Model attached to its Endpoint |
-| Public legacy route | Published Model |
-| Legacy target order | Ordered Site route targets, preserving first appearance |
-| Account configuration, snapshots, and usage | One Site Account when every merged configuration is provably identical |
-| Request and attempt history | Preserved as `routingGeneration=legacy` |
+| One relay website or operator | Site |
+| One inference API base URL and native surface | Endpoint |
+| One upstream inference secret | Site inference API key |
+| Model available from an Endpoint | Provider Model Target |
+| Downstream-visible model name | Published Model |
+| Normal target priority | Default routing profile order |
+| Alternate ordered route for selected clients | Sparse custom routing profile |
+| Distributed client credential | New downstream key |
+| Optional management connection | Site Account Connection |
 
-Website grouping must use normalized, reviewable origins and never merge Sites
-only because their display names match. When two legacy rows point at the same
-website but have different inference addresses, they become separate Endpoints
-under the proposed Site.
+After conversion, inspect every Site/Endpoint boundary, the exact native
+surface, API-key binding order, published-model alias, and route order. Older
+generic OpenAI metadata and duplicated upstream rows can require manual review;
+the converter will not infer priority from balance, latency, historical
+success, multiplier, package size, or display name.
 
-API keys remain separate and retain deterministic order. The migration does not
-deduplicate secret values by displaying or exporting them. A key that cannot be
-decrypted is reported as blocked rather than replaced with an empty credential.
+Old weighted routes must be converted to explicit drag order. Do not derive
+priority from balance, latency, historical success, multiplier, package size,
+or display name.
 
-Legacy route order is converted to Site order. If several legacy keys from one
-website appeared as separate route targets, the Site occupies the position of
-its first occurrence and those keys become its ordered local key pool. The
-migration does not invent weights or sort by balance, latency, name, or current
-health.
+## Data intentionally not converted
 
-Check-in and provider OAuth management data are outside V3 and are not
-migrated. Account authentication stays encrypted throughout migration; the
-migration never decrypts and re-encrypts the credential envelope. Multiple
-legacy accounts in one proposed Site are merged only when adapter, API origin,
-encrypted authentication payload, enabled state, and capabilities are all
-identical. Any difference is a hard conflict that `force` cannot bypass because
-the authentication kind or credential equality cannot be inferred safely from
-opaque ciphertext.
+The following old product areas have no VNext destination and should remain
+only in the archived legacy database:
 
-For an eligible account, all distinct snapshots and usage rows are copied.
-Semantically equivalent JSON snapshots at the same capture time are deduplicated. Usage
-rows with the same dedupe key are copied once only when every source-owned field
-matches; conflicting rows block the migration rather than silently discarding
-history. Repeating Apply compares the V3 account and history before inserting,
-so it does not duplicate snapshots or usage.
+- check-in automation and check-in history;
+- provider OAuth configuration;
+- subscription, package, plan, or quota-to-money inference;
+- storefront, recharge, payment, or public-registration state;
+- weighted or random route configuration;
+- upstream balance-driven routing decisions;
+- obsolete application settings and UI preferences.
 
-Native Anthropic and Gemini Endpoints are retained for model discovery, but the
-current OpenAI gateway cannot route requests to them without translation. Such
-legacy targets are reported as skipped in Preview and are not written to
-`route_site_targets`. Their Sites, Endpoints, keys, and model catalogs still
-migrate normally.
+A Site account connection stores only exact balance snapshots and raw upstream
+usage records. It does not import or display a subscription or package model.
+Management-session refresh, when required by an adapter such as Ciii, is only a
+means to refresh those two data sets.
 
-## What preview must show
+Old gateway request logs are not recalculated using today's official prices.
+Historical request records and relay multipliers have different meanings, so
+the archived legacy database remains the source of truth for that history.
+Imported raw Site account usage stays informational and separate from VNext
+downstream billing.
 
-Review the preview totals and every conflict before applying:
+## Secrets and downstream keys
 
-- legacy upstream, model, route, target, account, and log counts;
-- proposed Site groups and the legacy rows included in each group;
-- Endpoint and API Key counts per Site;
-- proposed Published Models and exact ordered Site targets;
-- duplicate public names, duplicate endpoints, missing source models, disabled
-  records, and invalid URLs;
-- empty encrypted key or account credential fields;
-- account connections whose adapter, origin, opaque authentication payload, or
-  capabilities differ inside one proposed Site;
-- records that will be preserved only as legacy history;
-- rows that will be skipped, with a concrete reason.
+Do not export plaintext secrets into notes, shell history, screenshots, issue
+attachments, or source control. Re-enter upstream API keys through the VNext
+panel so they are encrypted by the current deployment secret.
 
-Treat unexpected merges, target-count reductions, lost route positions, and
-unexplained skipped rows as blockers. Correct the source data or the proposed
-grouping and run preview again.
+Legacy downstream key digests are preserved, so a client that still has its raw
+key can continue authenticating after cutover. The panel cannot reveal a key
+whose legacy database stored only the digest. Rotate any lost, shared, or
+uncertain key and verify clients one at a time.
 
-Apply accepts the reviewed fingerprint and optional force flag:
+Site management authentication can include an authorization token, access and
+refresh token pair, or cookie depending on the adapter. These values remain
+encrypted at rest. Their presence does not reintroduce OAuth management as a
+product area.
 
-```json
-{
-  "planFingerprint": "sha256:<64 hexadecimal characters>",
-  "force": false
-}
-```
+## Cutover verification
 
-A missing fingerprint is rejected with HTTP `400`. If any migration input
-changes after Preview, Apply returns HTTP `409` with error code
-`legacy_migration_plan_changed` and a new `preview`. Review that replacement
-Preview and submit its fingerprint; `force` never bypasses this check.
+Before moving all clients, test at least one published model with two ordered
+targets when available:
 
-## Apply behavior
+1. Confirm the downstream key lists only the effective published models.
+2. Call the model through its native protocol surface.
+3. Confirm the first healthy target is selected.
+4. Create a controlled retryable failure and confirm the same request advances
+   to the second target.
+5. Confirm one independent failure marks the first target suspect but does not
+   cool it under the default policy.
+6. Confirm the second independent failure inside five minutes opens a
+   five-minute cooldown.
+7. Confirm the target returns through a half-open trial after cooldown.
+8. Confirm the request log records effective and source routing profiles,
+   ordered attempts, timings, switch reason, token usage, and price snapshot.
+9. Confirm monitoring covers only selected models and a manual model probe
+   checks all configured targets.
+10. Confirm downstream quota changes by official USD pricing only.
+11. Confirm upstream balance and raw usage remain separate informational data.
 
-Apply runs as one database transaction and records mappings in
-`legacy_upstream_site_mappings` and `legacy_route_published_mappings`. Repeating
-Apply after an interruption must be idempotent: mapped rows are verified or
-resumed, not duplicated.
+Perform smoke tests for each protocol actually used by clients:
 
-The apply operation must preserve legacy tables and logs. It creates V3 Sites,
-Endpoints, API Keys, Site Models, Published Models, eligible route targets, and
-unambiguous Site Account history; it does not delete or rewrite the legacy
-source rows. Legacy failure thresholds below two are raised to two so one
-isolated failure cannot immediately cool a Site.
+- OpenAI `/v1/chat/completions` and `/v1/responses`;
+- Anthropic `/v1/messages`;
+- Gemini `/v1beta/models/{model}:generateContent` or
+  `:streamGenerateContent`.
 
-Apply rebuilds and fingerprints the plan inside the same database transaction
-that performs the migration. It compares that current fingerprint before any
-write, so it cannot apply a reviewed plan to a different consistent snapshot.
+## Rollback during legacy cutover
 
-Keep public V3 models disabled until the verification checks are complete when
-the migration workflow offers that option. This prevents partially reviewed
-routes from receiving downstream traffic.
+Keep the old instance and its data read-only but available until acceptance.
+If VNext verification fails:
 
-## Verification
+1. Stop sending new clients to VNext.
+2. Restore the previous client endpoint or DNS record.
+3. Leave the VNext database intact for diagnosis; do not manually delete
+   selected rows to simulate rollback.
+4. Correct configuration or restore the fresh VNext backup, then repeat the
+   full verification checklist.
 
-After Apply, compare the applied report with Preview and verify the product
-behavior:
-
-1. Every expected website appears once as a Site.
-2. Endpoint URLs, protocols, and compatibility profiles are correct.
-3. API Key counts and order match the preview; secrets remain masked.
-4. Each Published Model has the expected official price SKU and exact Site
-   order.
-5. Run model discovery for one representative Site and review per-key coverage.
-6. Enable monitoring for one model and run its all-sites manual probe.
-7. Create or use a test downstream key and make one small request.
-8. Confirm its V3 request log contains Site, Endpoint, API Key, switch reason,
-   token categories, and price snapshot.
-9. Confirm historical records still identify themselves as legacy rather than
-   being relabeled as V3.
-10. Refresh each migrated Site Account manually and confirm that balance,
-    currency, subscription, and source usage retain the upstream's units.
-
-Do not remove the pre-migration backup until these checks pass and the new
-deployment has run through a normal traffic period.
-
-## Rollback
-
-If Apply or verification fails:
-
-1. Stop JieShan to prevent new writes.
-2. Preserve the failed post-migration volume for diagnosis.
-3. Restore the complete pre-migration volume into a clean volume.
-4. Restore the same `JIESHAN_SECRET_KEY` and pinned pre-migration image.
-5. Start the service and verify `/healthz`, administrator login, and one legacy
-   request.
-
-Do not attempt rollback by manually deleting selected V3 rows. Foreign-key and
-mapping relationships make a full volume restore safer and easier to verify.
-
-## After migration
-
-Keep legacy reads available only for the planned compatibility period. New
-configuration changes should be made through V3 Sites and Published Models.
-Once backups, monitoring, routing, account display, billing, and request logs
-have all been verified, legacy UI paths can be retired without deleting the
-historical records needed for audit and troubleshooting.
+Retire the old instance only after routes, monitoring, downstream quotas,
+request logs, and every client protocol in use have been verified. Archive the
+old database and its matching secret according to the required retention
+period; do not copy its obsolete runtime packages back into VNext.

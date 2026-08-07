@@ -9,36 +9,57 @@ services:
     environment:
       JIESHAN_LISTEN_ADDR: ":4000"
       JIESHAN_DATA_DIR: /data
-      JIESHAN_DB_PATH: /data/jieshan.db
+      JIESHAN_DB_PATH: /data/jieshan.sqlite
       JIESHAN_WEB_DIR: /app/web
-      JIESHAN_ADMIN_PASSWORD: ${JIESHAN_ADMIN_PASSWORD:?set JIESHAN_ADMIN_PASSWORD in .env}
-      JIESHAN_SECRET_KEY: ${JIESHAN_SECRET_KEY:?set JIESHAN_SECRET_KEY in .env}
+      JIESHAN_ADMIN_PASSWORD: ${JIESHAN_ADMIN_PASSWORD:-}
+      JIESHAN_SECRET_KEY: ${JIESHAN_SECRET_KEY:-}
       JIESHAN_LOG_LEVEL: ${JIESHAN_LOG_LEVEL:-info}
       JIESHAN_TRUST_PROXY: ${JIESHAN_TRUST_PROXY:-true}
+      JIESHAN_SECURE_COOKIES: ${JIESHAN_SECURE_COOKIES:-}
+      JIESHAN_ALLOWED_ORIGINS: ${JIESHAN_ALLOWED_ORIGINS:-}
       JIESHAN_ALLOW_PRIVATE_UPSTREAMS: ${JIESHAN_ALLOW_PRIVATE_UPSTREAMS:-false}
       JIESHAN_SESSION_TTL: ${JIESHAN_SESSION_TTL:-24h}
+      JIESHAN_UPSTREAM_DIAL_TIMEOUT: ${JIESHAN_UPSTREAM_DIAL_TIMEOUT:-10s}
       JIESHAN_UPSTREAM_TIMEOUT: ${JIESHAN_UPSTREAM_TIMEOUT:-60s}
-      GOMEMLIMIT: ${JIESHAN_GO_MEMORY_LIMIT:-480MiB}
+      JIESHAN_UPSTREAM_MAX_CONNS_PER_HOST: ${JIESHAN_UPSTREAM_MAX_CONNS_PER_HOST:-12}
+      JIESHAN_DB_MAX_OPEN_CONNS: ${JIESHAN_DB_MAX_OPEN_CONNS:-4}
+      JIESHAN_DB_MAX_IDLE_CONNS: ${JIESHAN_DB_MAX_IDLE_CONNS:-2}
+      JIESHAN_FAILURE_THRESHOLD: ${JIESHAN_FAILURE_THRESHOLD:-2}
+      JIESHAN_FAILURE_WINDOW: ${JIESHAN_FAILURE_WINDOW:-5m}
+      JIESHAN_COOLDOWN: ${JIESHAN_COOLDOWN:-5m}
+      JIESHAN_HALF_OPEN_LEASE: ${JIESHAN_HALF_OPEN_LEASE:-30s}
+      JIESHAN_CREDENTIAL_COOLDOWN: ${JIESHAN_CREDENTIAL_COOLDOWN:-5m}
+      JIESHAN_FIRST_OUTPUT_TIMEOUT: ${JIESHAN_FIRST_OUTPUT_TIMEOUT:-15s}
+      JIESHAN_STREAM_IDLE_TIMEOUT: ${JIESHAN_STREAM_IDLE_TIMEOUT:-60s}
+      JIESHAN_REQUEST_TIMEOUT: ${JIESHAN_REQUEST_TIMEOUT:-5m}
+      JIESHAN_MAX_ATTEMPTS: ${JIESHAN_MAX_ATTEMPTS:-4}
+      JIESHAN_PROBE_TIMEOUT: ${JIESHAN_PROBE_TIMEOUT:-30s}
+      JIESHAN_PROBE_MAX_CONCURRENT_MODELS: ${JIESHAN_PROBE_MAX_CONCURRENT_MODELS:-1}
+      JIESHAN_PROBE_MAX_CONCURRENT_TARGETS: ${JIESHAN_PROBE_MAX_CONCURRENT_TARGETS:-2}
+      GOMEMLIMIT: ${JIESHAN_GO_MEMORY_LIMIT:-560MiB}
+      GOMAXPROCS: ${JIESHAN_GO_MAX_PROCS:-2}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - jieshan-data:/data
     read_only: true
     tmpfs:
-      - /tmp:size=64m,mode=1777
+      - /tmp:size=32m,mode=1777
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     pids_limit: 128
-    mem_limit: ${JIESHAN_MEMORY_LIMIT:-640m}
-    memswap_limit: ${JIESHAN_MEMORY_SWAP_LIMIT:-768m}
-    mem_reservation: 256m
+    mem_limit: ${JIESHAN_MEMORY_LIMIT:-768m}
+    memswap_limit: ${JIESHAN_MEMORY_SWAP_LIMIT:-896m}
+    mem_reservation: 320m
     cpus: ${JIESHAN_CPU_LIMIT:-1.5}
     ulimits:
       nofile:
         soft: 4096
         hard: 8192
-    stop_grace_period: 20s
+    # App shutdown allows 15s for HTTP draining and another 15s for bounded
+    # background-service teardown before SQLite closes.
+    stop_grace_period: 40s
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4000/healthz"]
       interval: 30s
@@ -48,7 +69,7 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: 10m
+        max-size: 8m
         max-file: "3"
 
 volumes:

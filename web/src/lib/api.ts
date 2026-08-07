@@ -1,607 +1,936 @@
-import { demo } from './demo';
 import type {
-  AccountAdapter,
-  AccountUsageRange,
-  ConfigureUpstreamAccountInput,
-  CreateKeyInput,
+  AuthScheme,
+  CatalogState,
+  CreateDownstreamKeyInput,
   CreateRouteInput,
-  CreateUpstreamInput,
-  CreateV2PublishedModelInput,
-  CreateV2RouteTargetInput,
-  CreateV2CredentialInput,
-  CreateV2EndpointInput,
-  CreateV2SiteInput,
-  DashboardSummary,
+  CreateRoutingProfileInput,
+  CreateSiteInput,
+  DiscoveredModel,
   DownstreamKey,
+  EndpointInput,
+  GatewayLog,
+  GatewayLogAttempt,
+  GatewayRouteCandidate,
+  GatewayMeteringStatus,
+  GatewayLogPage,
+  GatewayQuotaLedgerEvent,
+  GatewayLogSummary,
   GatewaySettings,
-  ModelDiscovery,
-  MonitorMatrix,
-  RequestLog,
-  RequestLogDetail,
-  RequestLogCursor,
-  RequestLogFilter,
-  RequestLogListItem,
-  RequestLogPage,
-  RequestLogSummary,
-  Route,
+  InferenceSurface,
+  IssuedDownstreamKey,
+  ModelRoute,
+  ModelTarget,
+  MonitorSetting,
+  MonitorSnapshot,
+  MonitorTargetHistory,
+  PriceCatalog,
+  PriceCatalogImportResult,
+  PriceCatalogList,
+  PriceCatalogPreview,
+  ProviderModel,
   RoutingProfile,
-  RoutingProfileModelRoute,
-  Upstream,
-  UpstreamAccount,
-  UpstreamUsagePage,
-  UpdateKeyInput,
+  Site,
+  SiteAccountConnection,
+  SiteCredential,
+  SiteEndpoint,
+  SiteUsagePage,
+  UpdateDownstreamKeyInput,
   UpdateRouteInput,
-  UpdateUpstreamInput,
-  UpdateV2CredentialInput,
-  UpdateV2EndpointInput,
-  UpdateV2PublishedModelInput,
-  UpdateV2RouteTargetInput,
-  UpdateV2SiteInput,
+  UpdateSiteInput,
   User,
-  V2Credential,
-  V2DiscoveryStrategy,
-  V2Endpoint,
-  V2ModelDiscovery,
-  V2MonitorMatrix,
-  V2PublishedModel,
-  V2ProbeAttempt,
-  V2ProbeRun,
-  V2RouteSiteTarget,
-  V2Site,
-  V2SiteDetail,
-  V2SiteModel,
-  V2SiteSummary,
+  WireProtocol,
+  CredentialBinding,
+  SiteBalance,
 } from './types';
 
-const API_PREFIX = import.meta.env.VITE_API_PREFIX || '/api/v1';
-const API_V2_PREFIX = import.meta.env.VITE_API_V2_PREFIX || '/api/v2';
-const DEMO_KEY = 'jieshan.demo.enabled';
+const SESSION_PREFIX = import.meta.env.VITE_SESSION_API_PREFIX || '/api/vnext/auth';
+const INVENTORY_PREFIX = '/api/vnext/inventory';
+const KEYS_PREFIX = '/api/vnext/downstream-keys';
+const ROUTING_PREFIX = '/api/vnext/routing-profiles';
+const SITE_ACCOUNTS_PREFIX = '/api/vnext/site-accounts';
+const PRICING_PREFIX = '/api/vnext/pricing';
+const MONITOR_PREFIX = import.meta.env.VITE_JIESHAN_MONITOR_PREFIX || '/api/vnext/monitor';
+const LOGS_PREFIX = import.meta.env.VITE_JIESHAN_LOGS_PREFIX || '/api/vnext/request-logs';
+const SETTINGS_PREFIX = '/api/vnext/settings';
+const CSRF_COOKIE_NAME = 'jieshan_admin_csrf';
+const CSRF_HEADER_NAME = 'X-CSRF-Token';
+
 export const AUTH_EXPIRED_EVENT = 'jieshan:auth-expired';
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number, readonly body?: unknown) {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string,
+    readonly body?: unknown,
+  ) {
     super(message);
+    this.name = 'ApiError';
   }
 }
 
-export function isDemoMode(): boolean {
-  return localStorage.getItem(DEMO_KEY) === '1';
+export class ApiUnavailableError extends ApiError {
+  constructor(message: string, status: number, code: string, body?: unknown) {
+    super(message, status, code, body);
+    this.name = 'ApiUnavailableError';
+  }
 }
 
-export function canUseDemoMode(): boolean {
-  return import.meta.env.DEV || import.meta.env.VITE_ENABLE_DEMO === 'true';
+interface ErrorEnvelope {
+  error?: string | { code?: string; message?: string };
+  code?: string;
+  message?: string;
 }
 
-export function enableDemoMode(): void {
-  if (!canUseDemoMode()) throw new Error('当前环境未启用预览模式');
-  localStorage.setItem(DEMO_KEY, '1');
+function errorDetail(body: unknown, status: number): { code: string; message: string } {
+  const fallback = `请求失败 (${status})`;
+  if (!body || typeof body !== 'object') return { code: 'request_failed', message: fallback };
+  const envelope = body as ErrorEnvelope;
+  if (typeof envelope.error === 'object' && envelope.error) {
+    return {
+      code: envelope.error.code || envelope.code || 'request_failed',
+      message: envelope.error.message || envelope.message || fallback,
+    };
+  }
+  return {
+    code: envelope.code || 'request_failed',
+    message: envelope.message || (typeof envelope.error === 'string' ? envelope.error : fallback),
+  };
 }
 
-export function disableDemoMode(): void {
-  localStorage.removeItem(DEMO_KEY);
-}
-
-async function requestFrom<T>(prefix: string, path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${prefix}${path}`, {
+async function requestJSON<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const method = (init.method || 'GET').toUpperCase();
+  const headers = new Headers(init.headers);
+  headers.set('Accept', 'application/json');
+  if (init.body) headers.set('Content-Type', 'application/json');
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    const csrf = document.cookie
+      .split(';')
+      .map((item) => item.trim())
+      .find((item) => item.startsWith(`${CSRF_COOKIE_NAME}=`))
+      ?.slice(CSRF_COOKIE_NAME.length + 1);
+    if (csrf) headers.set(CSRF_HEADER_NAME, decodeURIComponent(csrf));
+  }
+  const response = await fetch(path, {
     ...init,
+    method,
     credentials: 'include',
-    headers: {
-      Accept: 'application/json',
-      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
-      ...init?.headers,
-    },
+    headers,
   });
 
   if (!response.ok) {
-    let message = `请求失败 (${response.status})`;
     let body: unknown;
     try {
       body = await response.json();
-      if (body && typeof body === 'object') {
-        const detail = body as { message?: string; error?: string };
-        message = detail.message || detail.error || message;
-      }
     } catch {
-      // Keep the status-based message when the server did not return JSON.
+      body = undefined;
     }
-    if (response.status === 401 && !isDemoMode()) {
+    const detail = errorDetail(body, response.status);
+    if (response.status === 401 && detail.code === 'unauthenticated') {
       window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
     }
-    throw new ApiError(message, response.status, body);
+    const Unavailable = [404, 501, 503].includes(response.status) ? ApiUnavailableError : ApiError;
+    throw new Unavailable(detail.message, response.status, detail.code, body);
   }
 
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
-function request<T>(path: string, init?: RequestInit): Promise<T> {
-  return requestFrom<T>(API_PREFIX, path, init);
-}
-
-function requestV2<T>(path: string, init?: RequestInit): Promise<T> {
-  return requestFrom<T>(API_V2_PREFIX, path, init);
-}
-
-function appendRequestLogFilters(query: URLSearchParams, filters: RequestLogFilter): void {
-  if (filters.status) query.set('status', filters.status);
-  if (filters.model) query.set('model', filters.model);
-  if (filters.siteId) query.set('siteId', String(filters.siteId));
-  if (filters.upstreamId) query.set('upstream', String(filters.upstreamId));
-  if (filters.downstreamKeyId) query.set('downstreamKey', String(filters.downstreamKeyId));
-  if (filters.stream !== undefined) query.set('stream', String(filters.stream));
-  if (filters.switched !== undefined) query.set('switched', String(filters.switched));
-}
-
-function demoLogMatches(log: RequestLog, filters: RequestLogFilter): boolean {
-  const model = filters.model?.trim().toLowerCase();
-  if (filters.status && log.status !== filters.status) return false;
-  if (model && log.requestedModel.toLowerCase() !== model && log.actualModel.toLowerCase() !== model) return false;
-  if (filters.downstreamKeyId && log.downstreamKeyId !== filters.downstreamKeyId) return false;
-  if (filters.stream !== undefined && Boolean(log.stream) !== filters.stream) return false;
-  if (filters.switched !== undefined && (log.switchCount > 0) !== filters.switched) return false;
-  if (filters.siteId && !log.attempts?.some((attempt) => attempt.siteId === filters.siteId)) return false;
-  if (filters.upstreamId && !log.attempts?.some((attempt) => attempt.upstreamId === filters.upstreamId)) return false;
-  return true;
-}
-
-function demoLogListItem(log: RequestLog): RequestLogListItem {
-  const selectedAttempt = [...(log.attempts ?? [])].sort((left, right) => {
-    const leftRank = left.state === 'success' ? 0 : 1;
-    const rightRank = right.state === 'success' ? 0 : 1;
-    return leftRank - rightRank || right.sequence - left.sequence;
-  })[0];
+function jsonInit(method: string, value: unknown, revision?: number): RequestInit {
   return {
-    id: log.id,
-    routingGeneration: 'legacy',
-    surface: 'chat_completions',
-    downstreamKeyId: log.downstreamKeyId,
-    keyName: log.keyName,
-    routeId: log.routeId,
-    routeRevision: log.routeRevision,
-    routingProfileName: '默认路由',
-    actualUpstreamId: selectedAttempt?.upstreamId,
-    actualUpstreamName: selectedAttempt?.upstreamName,
-    actualSiteId: selectedAttempt?.siteId,
-    actualSiteName: selectedAttempt?.siteName,
-    actualEndpointId: selectedAttempt?.endpointId,
-    actualEndpointName: selectedAttempt?.endpointName,
-    actualCredentialId: selectedAttempt?.credentialId,
-    actualCredentialName: selectedAttempt?.credentialName,
-    requestedModel: log.requestedModel,
-    actualModel: log.actualModel,
-    reasoningEffort: log.reasoningEffort,
-    thinkingBudget: log.thinkingBudget,
-    status: log.status,
-    httpStatus: log.httpStatus,
-    stream: Boolean(log.stream),
-    firstTokenMs: log.ttftMs,
-    durationMs: log.durationMs,
-    inputTokens: log.inputTokens,
-    cacheReadTokens: log.cacheTokens,
-    outputTokens: log.outputTokens,
-    reasoningTokens: log.reasoningTokens,
-    costMicroUsd: Math.round(log.costUsd * 1_000_000),
-    priceSnapshot: log.priceSnapshot ?? undefined,
-    switchCount: log.switchCount,
-    errorMessage: log.errorMessage ?? undefined,
-    startedAt: new Date(log.startedAt).getTime(),
-    finishedAt: log.finishedAt
-      ? new Date(log.finishedAt).getTime()
-      : log.durationMs == null ? undefined : new Date(log.startedAt).getTime() + log.durationMs,
+    method,
+    body: JSON.stringify(value),
+    headers: revision === undefined ? undefined : { 'If-Match': `"${revision}"` },
   };
 }
 
-function demoLogDetail(log: RequestLog): RequestLogDetail {
+function revisionInit(method: string, revision: number): RequestInit {
+  return { method, headers: { 'If-Match': `"${revision}"` } };
+}
+
+function createInit(value: unknown): RequestInit {
   return {
-    ...demoLogListItem(log),
-    attempts: (log.attempts ?? []).map((attempt) => ({
-      id: attempt.id,
-      requestId: log.id,
-      attemptIndex: Math.max(0, attempt.sequence - 1),
-      routingGeneration: attempt.routingGeneration ?? 'legacy',
-      targetId: attempt.targetId,
-      routeSiteTargetId: attempt.routeSiteTargetId,
-      upstreamId: attempt.upstreamId,
-      upstreamName: attempt.upstreamName,
-      siteId: attempt.siteId,
-      siteName: attempt.siteName,
-      endpointId: attempt.endpointId,
-      endpointName: attempt.endpointName,
-      inferenceCredentialId: attempt.credentialId,
-      credentialName: attempt.credentialName,
-      siteModelId: attempt.siteModelId,
-      upstreamModel: attempt.model,
-      status: attempt.state,
-      httpStatus: attempt.statusCode,
-      switchReason: attempt.switchReason,
-      errorClass: attempt.errorClass,
-      errorMessage: attempt.error,
-      latencyMs: attempt.durationMs,
-      firstTokenMs: attempt.ttftMs,
-      createdAt: new Date(attempt.startedAt).getTime(),
-    })),
+    method: 'POST',
+    body: JSON.stringify(value),
+    headers: { 'If-Match': '*' },
   };
 }
 
-function demoFilteredLogs(filters: RequestLogFilter): RequestLogListItem[] {
-  return demo.logs()
-    .filter((log) => demoLogMatches(log, filters))
-    .map(demoLogListItem)
-    .sort((left, right) => right.startedAt - left.startedAt || right.id.localeCompare(left.id));
+function inventory(path: string): string {
+  return `${INVENTORY_PREFIX}${path}`;
 }
 
-function nearestRank(values: number[], percentile: number): number | null {
-  if (values.length === 0) return null;
-  const ordered = [...values].sort((left, right) => left - right);
-  return ordered[Math.ceil(ordered.length * percentile) - 1] ?? null;
+function keyPath(path = ''): string {
+  return `${KEYS_PREFIX}${path}`;
+}
+
+export interface ModelTargetFilter {
+  query?: string;
+  protocol?: WireProtocol | '';
+  surface?: InferenceSurface | '';
+  siteId?: number;
+  enabled?: boolean;
+}
+
+export interface SiteUsageFilter {
+  cursor?: string;
+  from?: number;
+  to?: number;
+  limit?: number;
+  model?: string;
+  status?: string;
+  apiKey?: string;
+  requestId?: string;
+  search?: string;
+}
+
+export interface AccountSecretInput {
+  authorization?: string;
+  accessToken?: string;
+  refreshToken?: string;
+  cookie?: string;
+  expiresAt?: number;
+}
+
+export interface AccountConnectionInput {
+  adapterKind: string;
+  origin: string;
+  enabled?: boolean;
+  secrets: AccountSecretInput;
+}
+
+export interface ModelDiscoveryPreviewInput {
+  baseUrl: string;
+  wireProtocol: WireProtocol;
+  surface: InferenceSurface;
+  authScheme: AuthScheme;
+  apiKey: string;
+}
+
+export interface ModelDiscoveryPreviewResult {
+  models: string[];
+  complete: boolean;
+}
+
+export interface GatewayLogFilter {
+  cursor?: string;
+  limit?: number;
+  query?: string;
+  status?: string;
+  model?: string;
+  keyId?: number;
+  surface?: InferenceSurface;
+  siteId?: number;
+  from?: number;
+  to?: number;
+}
+
+type GatewayLogSummaryFilter = Omit<GatewayLogFilter, 'cursor' | 'limit'>;
+
+interface AuthStatusResponse {
+  authenticated: boolean;
+  username?: string;
+  expires_at?: number;
+}
+
+interface RequestLogResponse {
+  id: string;
+  downstreamKeyId: number;
+  downstreamKeyName: string;
+  publishedModelId: number;
+  publishedModelRevision: number;
+  effectiveRoutingProfileId: number;
+  effectiveRoutingProfileName: string;
+  sourceRoutingProfileId: number;
+  sourceRoutingProfileName: string;
+  routeRevision: number;
+  publicModel: string;
+  apiSurface: InferenceSurface;
+  reasoningEffort: string;
+  thinkingBudgetTokens: number | null;
+  stream: boolean;
+  priceCatalogVersion: string;
+  priceSku: string;
+  reservationNanoUsd: number;
+  billingMultiplierBPS: number;
+  status: string;
+  meteringStatus: GatewayMeteringStatus;
+  meteringErrorCode: string;
+  finalAttemptIndex: number | null;
+  httpStatus: number | null;
+  firstOutputMs: number | null;
+  totalDurationMs: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  cacheWrite5mTokens: number | null;
+  cacheWrite1hTokens: number | null;
+  reasoningTokens: number | null;
+  officialCostNanoUsd: number;
+  chargedNanoUsd: number;
+  quotaCapped: boolean;
+  errorCode: string;
+  startedAt: number;
+  finishedAt: number | null;
+  finalAttempt: RequestAttemptResponse | null;
+}
+
+type DownstreamKeyResponse = Omit<DownstreamKey, 'billingMultiplier'> & {
+  billingMultiplierBPS: number;
+};
+
+type DownstreamKeyRequest = Omit<CreateDownstreamKeyInput, 'billingMultiplier'> & {
+  billingMultiplierBPS?: number;
+};
+
+type DownstreamKeyUpdateRequest = Omit<UpdateDownstreamKeyInput, 'billingMultiplier'> & {
+  billingMultiplierBPS?: number;
+};
+
+interface IssuedDownstreamKeyResponse {
+  item: DownstreamKeyResponse;
+  secret: string;
+}
+
+function billingMultiplierFromBPS(value: number): number {
+  return value / 10_000;
+}
+
+function billingMultiplierToBPS(value: number | undefined): number | undefined {
+  return value === undefined ? undefined : Math.round(value * 10_000);
+}
+
+function downstreamKey(item: DownstreamKeyResponse): DownstreamKey {
+  const { billingMultiplierBPS, ...rest } = item;
+  return { ...rest, billingMultiplier: billingMultiplierFromBPS(billingMultiplierBPS) };
+}
+
+function downstreamKeyRequest(input: CreateDownstreamKeyInput): DownstreamKeyRequest {
+  const { billingMultiplier, ...rest } = input;
+  return { ...rest, billingMultiplierBPS: billingMultiplierToBPS(billingMultiplier) };
+}
+
+function downstreamKeyUpdateRequest(input: UpdateDownstreamKeyInput): DownstreamKeyUpdateRequest {
+  const { billingMultiplier, ...rest } = input;
+  return { ...rest, billingMultiplierBPS: billingMultiplierToBPS(billingMultiplier) };
+}
+
+interface RequestAttemptResponse {
+  id: number;
+  attemptIndex: number;
+  publishedModelTargetId: number;
+  publishedModelTargetRevision: number;
+  providerModelTargetId: number;
+  providerModelTargetRevision: number;
+  siteId: number;
+  siteName: string;
+  endpointId: number;
+  endpointName: string;
+  credentialId: number;
+  credentialName: string;
+  sourceModel: string;
+  responseModel: string;
+  wireProtocol: WireProtocol;
+  apiSurface: InferenceSurface;
+  status: string;
+  httpStatus: number | null;
+  failureKind: string;
+  errorCode: string;
+  switchReason: string;
+  firstOutputMs: number | null;
+  durationMs: number;
+  startedAt: number;
+  finishedAt: number;
+}
+
+interface RouteCredentialResponse {
+  id: number;
+  name: string;
+  position: number;
+  runtimeState: string;
+  coolingUntil: number | null;
+}
+
+interface RouteCandidateResponse {
+  position: number;
+  publishedModelTargetId: number;
+  publishedModelTargetRevision: number;
+  providerModelTargetId: number;
+  providerModelTargetRevision: number;
+  siteId: number;
+  siteName: string;
+  endpointId: number;
+  endpointName: string;
+  sourceModel: string;
+  wireProtocol: WireProtocol;
+  apiSurface: InferenceSurface;
+  credentials: RouteCredentialResponse[];
+  initialEligibility: string;
+  initialReason: string;
+  disposition: string;
+  dispositionReason: string;
+  attemptCount: number;
+  firstAttemptIndex: number | null;
+  lastAttemptIndex: number | null;
+}
+
+interface QuotaLedgerResponse {
+  id: number;
+  eventType: string;
+  reservedDeltaNanoUsd: number;
+  usedDeltaNanoUsd: number;
+  priceCatalogVersion: string;
+  priceSku: string;
+  createdAt: number;
+}
+
+function authUser(response: AuthStatusResponse): User {
+  if (!response.authenticated || !response.username) {
+    throw new ApiError('管理员会话尚未登录', 401, 'unauthenticated', response);
+  }
+  return { username: response.username, expiresAt: response.expires_at };
+}
+
+function gatewayAttempt(item: RequestAttemptResponse): GatewayLogAttempt {
+  return {
+    id: item.id,
+    attemptIndex: item.attemptIndex,
+    publishedModelTargetId: item.publishedModelTargetId,
+    publishedModelTargetRevision: item.publishedModelTargetRevision,
+    providerModelTargetId: item.providerModelTargetId,
+    providerModelTargetRevision: item.providerModelTargetRevision,
+    siteId: item.siteId,
+    siteName: item.siteName,
+    endpointId: item.endpointId,
+    endpointName: item.endpointName,
+    credentialId: item.credentialId,
+    credentialName: item.credentialName,
+    sourceModel: item.sourceModel,
+    responseModel: item.responseModel,
+    wireProtocol: item.wireProtocol,
+    apiSurface: item.apiSurface,
+    status: item.status,
+    httpStatus: item.httpStatus,
+    failureKind: item.failureKind,
+    errorCode: item.errorCode,
+    switchReason: item.switchReason,
+    durationMs: item.durationMs,
+    firstOutputMs: item.firstOutputMs,
+    startedAt: item.startedAt,
+    finishedAt: item.finishedAt,
+  };
+}
+
+function gatewayRouteCandidate(item: RouteCandidateResponse): GatewayRouteCandidate {
+  return {
+    position: item.position,
+    publishedModelTargetId: item.publishedModelTargetId,
+    publishedModelTargetRevision: item.publishedModelTargetRevision,
+    providerModelTargetId: item.providerModelTargetId,
+    providerModelTargetRevision: item.providerModelTargetRevision,
+    siteId: item.siteId,
+    siteName: item.siteName,
+    endpointId: item.endpointId,
+    endpointName: item.endpointName,
+    sourceModel: item.sourceModel,
+    wireProtocol: item.wireProtocol,
+    apiSurface: item.apiSurface,
+    credentials: [...item.credentials].sort((left, right) => left.position - right.position),
+    initialEligibility: item.initialEligibility,
+    initialReason: item.initialReason,
+    disposition: item.disposition,
+    dispositionReason: item.dispositionReason,
+    attemptCount: item.attemptCount,
+    firstAttemptIndex: item.firstAttemptIndex,
+    lastAttemptIndex: item.lastAttemptIndex,
+  };
+}
+
+function quotaLedgerEvent(item: QuotaLedgerResponse): GatewayQuotaLedgerEvent {
+  return {
+    id: item.id,
+    eventType: item.eventType,
+    reservedDeltaNanoUSD: item.reservedDeltaNanoUsd,
+    usedDeltaNanoUSD: item.usedDeltaNanoUsd,
+    priceCatalogVersion: item.priceCatalogVersion,
+    priceSKU: item.priceSku,
+    createdAt: item.createdAt,
+  };
+}
+
+function gatewayLog(
+  item: RequestLogResponse,
+  attempts: GatewayLogAttempt[] = [],
+  ledger: GatewayQuotaLedgerEvent[] = [],
+  routeCandidates: GatewayRouteCandidate[] = [],
+): GatewayLog {
+  const orderedAttempts = [...attempts].sort((left, right) => left.attemptIndex - right.attemptIndex);
+  const listedFinal = item.finalAttempt ? gatewayAttempt(item.finalAttempt) : null;
+  const final = orderedAttempts[orderedAttempts.length - 1] || listedFinal;
+  return {
+    id: item.id,
+    downstreamKeyId: item.downstreamKeyId,
+    startedAt: item.startedAt,
+    finishedAt: item.finishedAt,
+    keyName: item.downstreamKeyName,
+    publishedModelId: item.publishedModelId,
+    publishedModelRevision: item.publishedModelRevision,
+    effectiveRoutingProfileId: item.effectiveRoutingProfileId,
+    effectiveRoutingProfileName: item.effectiveRoutingProfileName,
+    sourceRoutingProfileId: item.sourceRoutingProfileId,
+    sourceRoutingProfileName: item.sourceRoutingProfileName,
+    routeRevision: item.routeRevision,
+    publicModel: item.publicModel,
+    actualModel: final?.responseModel || '',
+    surface: item.apiSurface,
+    reasoningEffort: item.reasoningEffort,
+    thinkingBudgetTokens: item.thinkingBudgetTokens,
+    status: item.status,
+    meteringStatus: item.meteringStatus,
+    meteringErrorCode: item.meteringErrorCode,
+    httpStatus: item.httpStatus,
+    stream: item.stream,
+    firstOutputMs: item.firstOutputMs,
+    durationMs: item.totalDurationMs,
+    inputTokens: item.inputTokens,
+    outputTokens: item.outputTokens,
+    cacheReadTokens: item.cacheReadTokens,
+    cacheWriteTokens: item.cacheWriteTokens,
+    cacheWrite5mTokens: item.cacheWrite5mTokens,
+    cacheWrite1hTokens: item.cacheWrite1hTokens,
+    reasoningTokens: item.reasoningTokens,
+    priceCatalogVersion: item.priceCatalogVersion,
+    priceSKU: item.priceSku,
+    reservationNanoUSD: item.reservationNanoUsd,
+    billingMultiplier: billingMultiplierFromBPS(item.billingMultiplierBPS),
+    officialCostNanoUSD: item.officialCostNanoUsd,
+    chargedNanoUSD: item.chargedNanoUsd,
+    quotaCapped: item.quotaCapped,
+    errorCode: item.errorCode,
+    switchCount: Math.max(0, orderedAttempts.length ? orderedAttempts.length - 1 : (item.finalAttemptIndex || 0)),
+    finalAttempt: final || null,
+    routeCandidates: [...routeCandidates].sort((left, right) => left.position - right.position),
+    attempts: orderedAttempts,
+    ledger,
+  };
+}
+
+function gatewayLogQuery(filter: GatewayLogFilter, includePagination: boolean): string {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filter)) {
+    if (!includePagination && (key === 'cursor' || key === 'limit')) continue;
+    if (value !== undefined && value !== null && String(value).trim() !== '') query.set(key, String(value));
+  }
+  if (filter.query?.trim()) {
+    query.delete('query');
+    query.set('search', filter.query.trim());
+  }
+  if (filter.keyId) {
+    query.delete('keyId');
+    query.set('downstreamKeyId', String(filter.keyId));
+  }
+  return query.size ? `?${query.toString()}` : '';
 }
 
 export const api = {
   async me(): Promise<User> {
-    if (isDemoMode()) return demo.user();
-    const result = await request<{ user: User } | User>('/me');
-    return 'user' in result ? result.user : result;
+    return authUser(await requestJSON<AuthStatusResponse>(`${SESSION_PREFIX}/status`));
   },
+
   async login(password: string): Promise<User> {
-    if (isDemoMode()) return demo.user();
-    const result = await request<{ user: User }>('/auth/login', { method: 'POST', body: JSON.stringify({ password }) });
-    return result.user;
+    return authUser(await requestJSON<AuthStatusResponse>(
+      `${SESSION_PREFIX}/login`,
+      jsonInit('POST', { username: 'admin', password }),
+    ));
   },
-  async logout(): Promise<void> {
-    if (isDemoMode()) {
-      disableDemoMode();
-      return;
-    }
-    await request<void>('/auth/logout', { method: 'POST' });
+
+  logout(): Promise<void> {
+    return requestJSON<void>(`${SESSION_PREFIX}/logout`, { method: 'POST' });
   },
-  async dashboard(): Promise<DashboardSummary> {
-    if (isDemoMode()) return demo.dashboard();
-    return request<DashboardSummary>('/dashboard');
+
+  async listSites(): Promise<Site[]> {
+    return (await requestJSON<{ items: Site[] }>(inventory('/sites'))).items;
   },
-  async monitor(): Promise<MonitorMatrix> {
-    if (isDemoMode()) return demo.monitor();
-    return request<MonitorMatrix>('/monitor/matrix');
+
+  async getSite(siteId: number): Promise<Site> {
+    return (await requestJSON<{ item: Site }>(inventory(`/sites/${siteId}`))).item;
   },
-  async upstreams(): Promise<Upstream[]> {
-    if (isDemoMode()) return demo.upstreams();
-    const result = await request<{ items: Upstream[] }>('/upstreams');
-    return result.items;
+
+  async createSite(input: CreateSiteInput): Promise<Site> {
+    return (await requestJSON<{ item: Site }>(inventory('/sites'), jsonInit('POST', input))).item;
   },
-  async upstreamInventorySource(): Promise<unknown[]> {
-    if (isDemoMode()) return demo.upstreams();
-    const result = await request<{ items?: unknown[]; sites?: unknown[] }>('/upstreams');
-    return result.sites ?? result.items ?? [];
+
+  async updateSite(siteId: number, revision: number, input: UpdateSiteInput): Promise<Site> {
+    return (await requestJSON<{ item: Site }>(inventory(`/sites/${siteId}`), jsonInit('PATCH', input, revision))).item;
   },
-  async v2Sites(): Promise<V2SiteSummary[]> {
-    if (isDemoMode()) return [];
-    const result = await requestV2<{ items: V2SiteSummary[] }>('/sites');
-    return result.items ?? [];
+
+  async listEndpoints(siteId: number): Promise<SiteEndpoint[]> {
+    return (await requestJSON<{ items: SiteEndpoint[] }>(inventory(`/sites/${siteId}/endpoints`))).items;
   },
-  async v2Site(id: number): Promise<V2SiteDetail> {
-    const result = await requestV2<{ item: V2SiteDetail }>(`/sites/${id}`);
-    return result.item;
+
+  async createEndpoint(siteId: number, input: EndpointInput): Promise<SiteEndpoint> {
+    return (await requestJSON<{ item: SiteEndpoint }>(inventory(`/sites/${siteId}/endpoints`), jsonInit('POST', input))).item;
   },
-  async createV2Site(input: CreateV2SiteInput): Promise<V2Site> {
-    const result = await requestV2<{ item: V2Site }>('/sites', { method: 'POST', body: JSON.stringify(input) });
-    return result.item;
+
+  async updateEndpoint(siteId: number, endpointId: number, revision: number, input: Partial<EndpointInput>): Promise<SiteEndpoint> {
+    return (await requestJSON<{ item: SiteEndpoint }>(
+      inventory(`/sites/${siteId}/endpoints/${endpointId}`),
+      jsonInit('PATCH', input, revision),
+    )).item;
   },
-  async updateV2Site(id: number, patch: UpdateV2SiteInput): Promise<V2Site> {
-    const result = await requestV2<{ item: V2Site }>(`/sites/${id}`, { method: 'PATCH', body: JSON.stringify(patch) });
-    return result.item;
+
+  async listCredentials(siteId: number): Promise<SiteCredential[]> {
+    return (await requestJSON<{ items: SiteCredential[] }>(inventory(`/sites/${siteId}/credentials`))).items;
   },
-  async deleteV2Site(id: number, revision?: number): Promise<void> {
-    const query = revision ? `?revision=${revision}` : '';
-    await requestV2<void>(`/sites/${id}${query}`, { method: 'DELETE' });
+
+  async createCredential(siteId: number, input: { name: string; secret: string; enabled?: boolean }): Promise<SiteCredential> {
+    return (await requestJSON<{ item: SiteCredential }>(
+      inventory(`/sites/${siteId}/credentials`),
+      jsonInit('POST', input),
+    )).item;
   },
-  async siteAccount(id: number): Promise<UpstreamAccount> {
-    const result = await requestV2<{ account: UpstreamAccount }>(`/sites/${id}/account`);
-    return result.account;
+
+  async updateCredential(
+    siteId: number,
+    credentialId: number,
+    revision: number,
+    input: { name?: string; enabled?: boolean },
+  ): Promise<SiteCredential> {
+    return (await requestJSON<{ item: SiteCredential }>(
+      inventory(`/sites/${siteId}/credentials/${credentialId}`),
+      jsonInit('PATCH', input, revision),
+    )).item;
   },
-  async configureSiteAccount(id: number, input: ConfigureUpstreamAccountInput): Promise<UpstreamAccount> {
-    const result = await requestV2<{ account: UpstreamAccount }>(`/sites/${id}/account`, { method: 'PUT', body: JSON.stringify(input) });
-    return result.account;
+
+  async replaceCredentialSecret(siteId: number, credentialId: number, revision: number, secret: string): Promise<SiteCredential> {
+    return (await requestJSON<{ item: SiteCredential }>(
+      inventory(`/sites/${siteId}/credentials/${credentialId}/secret`),
+      jsonInit('PUT', { secret }, revision),
+    )).item;
   },
-  async deleteSiteAccount(id: number): Promise<void> {
-    await requestV2<void>(`/sites/${id}/account`, { method: 'DELETE' });
+
+  async listEndpointCredentialBindings(siteId: number, endpointId: number): Promise<CredentialBinding[]> {
+    return (await requestJSON<{ items: CredentialBinding[] }>(inventory(`/sites/${siteId}/endpoints/${endpointId}/credentials`))).items;
   },
-  async refreshSiteAccount(id: number): Promise<UpstreamAccount> {
-    const result = await requestV2<{ account: UpstreamAccount }>(`/sites/${id}/account/refresh`, { method: 'POST' });
-    return result.account;
+
+  async replaceEndpointCredentialBindings(
+    siteId: number,
+    endpointId: number,
+    revision: number,
+    credentialIds: number[],
+  ): Promise<{ endpoint: SiteEndpoint; items: CredentialBinding[] }> {
+    return requestJSON(inventory(`/sites/${siteId}/endpoints/${endpointId}/credentials`), jsonInit('PUT', { credentialIds }, revision));
   },
-  async siteAccountUsage(id: number, range: AccountUsageRange, limit = 50, beforeId?: string): Promise<UpstreamUsagePage> {
-    const query = new URLSearchParams({ range, limit: String(limit) });
-    if (beforeId) query.set('beforeId', beforeId);
-    return requestV2<UpstreamUsagePage>(`/sites/${id}/account/usage?${query.toString()}`);
+
+  async listProviderModels(siteId: number, endpointId: number): Promise<ProviderModel[]> {
+    return (await requestJSON<{ items: ProviderModel[] }>(inventory(`/sites/${siteId}/endpoints/${endpointId}/models`))).items;
   },
-  async v2Endpoints(siteId: number): Promise<V2Endpoint[]> {
-    const result = await requestV2<{ items: V2Endpoint[] }>(`/sites/${siteId}/endpoints`);
-    return result.items ?? [];
+
+  previewModels(input: ModelDiscoveryPreviewInput): Promise<ModelDiscoveryPreviewResult> {
+    return requestJSON<ModelDiscoveryPreviewResult>(
+      inventory('/model-discovery/preview'),
+      jsonInit('POST', input),
+    );
   },
-  async createV2Endpoint(siteId: number, input: CreateV2EndpointInput): Promise<V2Endpoint> {
-    const result = await requestV2<{ item: V2Endpoint }>(`/sites/${siteId}/endpoints`, { method: 'POST', body: JSON.stringify(input) });
-    return result.item;
+
+  async discoverModels(siteId: number, endpointId: number, credentialId: number): Promise<DiscoveredModel[]> {
+    return (await requestJSON<{ items: DiscoveredModel[] }>(
+      inventory(`/sites/${siteId}/endpoints/${endpointId}/models/discover`),
+      jsonInit('POST', { credentialId }),
+    )).items;
   },
-  async updateV2Endpoint(id: number, patch: UpdateV2EndpointInput): Promise<V2Endpoint> {
-    const result = await requestV2<{ item: V2Endpoint }>(`/endpoints/${id}`, { method: 'PATCH', body: JSON.stringify(patch) });
-    return result.item;
+
+  async importModels(siteId: number, endpointId: number, credentialId: number, models: string[]): Promise<ProviderModel[]> {
+    return (await requestJSON<{ items: ProviderModel[] }>(
+      inventory(`/sites/${siteId}/endpoints/${endpointId}/models/import`),
+      jsonInit('POST', { credentialId, models }),
+    )).items;
   },
-  async deleteV2Endpoint(id: number, revision?: number): Promise<void> {
-    const query = revision ? `?revision=${revision}` : '';
-    await requestV2<void>(`/endpoints/${id}${query}`, { method: 'DELETE' });
-  },
-  async v2Credentials(siteId: number): Promise<V2Credential[]> {
-    const result = await requestV2<{ items: V2Credential[] }>(`/sites/${siteId}/credentials`);
-    return result.items ?? [];
-  },
-  async createV2Credential(siteId: number, input: CreateV2CredentialInput): Promise<V2Credential> {
-    const result = await requestV2<{ item: V2Credential }>(`/sites/${siteId}/credentials`, { method: 'POST', body: JSON.stringify(input) });
-    return result.item;
-  },
-  async updateV2Credential(id: number, patch: UpdateV2CredentialInput): Promise<V2Credential> {
-    const result = await requestV2<{ item: V2Credential }>(`/credentials/${id}`, { method: 'PATCH', body: JSON.stringify(patch) });
-    return result.item;
-  },
-  async deleteV2Credential(id: number, revision?: number): Promise<void> {
-    const query = revision ? `?revision=${revision}` : '';
-    await requestV2<void>(`/credentials/${id}${query}`, { method: 'DELETE' });
-  },
-  async v2SiteModels(siteId: number): Promise<V2SiteModel[]> {
-    const result = await requestV2<{ items: V2SiteModel[] }>(`/sites/${siteId}/models`);
-    return result.items ?? [];
-  },
-  async discoverV2Models(siteId: number, input: { endpointId: number; credentialId?: number; strategy: V2DiscoveryStrategy }): Promise<V2ModelDiscovery> {
-    return requestV2<V2ModelDiscovery>(`/sites/${siteId}/model-discoveries`, { method: 'POST', body: JSON.stringify(input) });
-  },
-  async v2PublishedModels(): Promise<V2PublishedModel[]> {
-    if (isDemoMode()) return [];
-    const result = await requestV2<{ items: V2PublishedModel[] }>('/published-models');
-    return result.items ?? [];
-  },
-  async v2PublishedModel(id: number): Promise<V2PublishedModel> {
-    const result = await requestV2<{ item: V2PublishedModel }>(`/published-models/${id}`);
-    return result.item;
-  },
-  async createV2PublishedModel(input: CreateV2PublishedModelInput): Promise<V2PublishedModel> {
-    const result = await requestV2<{ item: V2PublishedModel }>('/published-models', { method: 'POST', body: JSON.stringify(input) });
-    return result.item;
-  },
-  async updateV2PublishedModel(id: number, patch: UpdateV2PublishedModelInput): Promise<V2PublishedModel> {
-    const result = await requestV2<{ item: V2PublishedModel }>(`/published-models/${id}`, { method: 'PATCH', body: JSON.stringify(patch) });
-    return result.item;
-  },
-  async deleteV2PublishedModel(id: number, revision?: number): Promise<void> {
-    const query = revision ? `?revision=${revision}` : '';
-    await requestV2<void>(`/published-models/${id}${query}`, { method: 'DELETE' });
-  },
-  async createV2RouteTarget(publishedModelId: number, input: CreateV2RouteTargetInput): Promise<V2RouteSiteTarget> {
-    const result = await requestV2<{ item: V2RouteSiteTarget }>(`/published-models/${publishedModelId}/targets`, { method: 'POST', body: JSON.stringify(input) });
-    return result.item;
-  },
-  async updateV2RouteTarget(id: number, patch: UpdateV2RouteTargetInput): Promise<V2RouteSiteTarget> {
-    const result = await requestV2<{ item: V2RouteSiteTarget }>(`/route-targets/${id}`, { method: 'PATCH', body: JSON.stringify(patch) });
-    return result.item;
-  },
-  async deleteV2RouteTarget(id: number, targetRevision?: number, publishedRevision?: number): Promise<void> {
+
+  async listModelTargets(filter: ModelTargetFilter = {}): Promise<ModelTarget[]> {
     const query = new URLSearchParams();
-    if (targetRevision) query.set('targetRevision', String(targetRevision));
-    if (publishedRevision) query.set('publishedRevision', String(publishedRevision));
+    if (filter.query?.trim()) query.set('q', filter.query.trim());
+    if (filter.protocol) query.set('protocol', filter.protocol);
+    if (filter.surface) query.set('surface', filter.surface);
+    if (filter.siteId) query.set('siteId', String(filter.siteId));
+    if (filter.enabled !== undefined) query.set('enabled', String(filter.enabled));
     const suffix = query.size ? `?${query.toString()}` : '';
-    await requestV2<void>(`/route-targets/${id}${suffix}`, { method: 'DELETE' });
+    return (await requestJSON<{ items: ModelTarget[] }>(inventory(`/model-targets${suffix}`))).items;
   },
-  async reorderV2RouteTargets(publishedModelId: number, ids: number[], revision?: number): Promise<V2PublishedModel> {
-    const result = await requestV2<{ item: V2PublishedModel }>(`/published-models/${publishedModelId}/targets/order`, { method: 'PUT', body: JSON.stringify({ ids, revision }) });
-    return result.item;
+
+  async listDownstreamKeys(): Promise<DownstreamKey[]> {
+    return (await requestJSON<{ items: DownstreamKeyResponse[] }>(keyPath())).items.map(downstreamKey);
   },
-  async routingProfiles(): Promise<RoutingProfile[]> {
-    if (isDemoMode()) return [];
-    const result = await requestV2<{ items: RoutingProfile[] }>('/routing-profiles');
-    return result.items ?? [];
+
+  async getDownstreamKey(keyId: number): Promise<DownstreamKey> {
+    return downstreamKey((await requestJSON<{ item: DownstreamKeyResponse }>(keyPath(`/${keyId}`))).item);
   },
-  async createRoutingProfile(name: string): Promise<RoutingProfile> {
-    const result = await requestV2<{ item: RoutingProfile }>('/routing-profiles', { method: 'POST', body: JSON.stringify({ name }) });
-    return result.item;
+
+  async createDownstreamKey(input: CreateDownstreamKeyInput): Promise<IssuedDownstreamKey> {
+    const issued = await requestJSON<IssuedDownstreamKeyResponse>(keyPath(), jsonInit('POST', downstreamKeyRequest(input)));
+    return { item: downstreamKey(issued.item), secret: issued.secret };
   },
-  async updateRoutingProfile(id: number, name: string, revision: number): Promise<RoutingProfile> {
-    const result = await requestV2<{ item: RoutingProfile }>(`/routing-profiles/${id}`, { method: 'PATCH', body: JSON.stringify({ name, revision }) });
-    return result.item;
+
+  async revealDownstreamKey(keyId: number): Promise<string> {
+    return (await requestJSON<{ secret: string }>(keyPath(`/${keyId}/reveal`), { method: 'POST' })).secret;
   },
-  async deleteRoutingProfile(id: number, revision: number): Promise<void> {
-    await requestV2<void>(`/routing-profiles/${id}?revision=${revision}`, { method: 'DELETE' });
+
+  async rotateDownstreamKey(keyId: number, revision: number): Promise<IssuedDownstreamKey> {
+    const issued = await requestJSON<IssuedDownstreamKeyResponse>(keyPath(`/${keyId}/rotate`), revisionInit('POST', revision));
+    return { item: downstreamKey(issued.item), secret: issued.secret };
   },
-  async routingProfileModel(profileId: number, publishedModelId: number): Promise<RoutingProfileModelRoute> {
-    const result = await requestV2<{ item: RoutingProfileModelRoute }>(`/routing-profiles/${profileId}/models/${publishedModelId}`);
-    return result.item;
+
+  async updateDownstreamKey(keyId: number, revision: number, input: UpdateDownstreamKeyInput): Promise<DownstreamKey> {
+    return downstreamKey((await requestJSON<{ item: DownstreamKeyResponse }>(
+      keyPath(`/${keyId}`),
+      jsonInit('PATCH', downstreamKeyUpdateRequest(input), revision),
+    )).item);
   },
-  async setRoutingProfileModel(profileId: number, publishedModelId: number, targetIds: number[], revision: number): Promise<RoutingProfileModelRoute> {
-    const result = await requestV2<{ item: RoutingProfileModelRoute }>(`/routing-profiles/${profileId}/models/${publishedModelId}`, { method: 'PUT', body: JSON.stringify({ targetIds, revision }) });
-    return result.item;
+
+  async listDownstreamKeyModels(keyId: number): Promise<string[]> {
+    const response = await requestJSON<{ items: Array<string | { id: string }> }>(keyPath(`/${keyId}/models`));
+    return response.items.map((item) => typeof item === 'string' ? item : item.id);
   },
-  async clearRoutingProfileModel(profileId: number, publishedModelId: number, revision: number): Promise<RoutingProfileModelRoute> {
-    const result = await requestV2<{ item: RoutingProfileModelRoute }>(`/routing-profiles/${profileId}/models/${publishedModelId}?revision=${revision}`, { method: 'DELETE' });
-    return result.item;
+
+  async listRoutingProfiles(): Promise<RoutingProfile[]> {
+    return (await requestJSON<{ items: RoutingProfile[] }>(ROUTING_PREFIX)).items;
   },
-  async probeV2PublishedModel(publishedModelId: number, targetId?: number): Promise<{ run: V2ProbeRun; attempts: V2ProbeAttempt[] }> {
-    return requestV2<{ run: V2ProbeRun; attempts: V2ProbeAttempt[] }>(`/published-models/${publishedModelId}/probe`, { method: 'POST', body: JSON.stringify(targetId ? { targetId } : {}) });
+
+  async createRoutingProfile(input: CreateRoutingProfileInput): Promise<RoutingProfile> {
+    return (await requestJSON<{ item: RoutingProfile }>(ROUTING_PREFIX, createInit(input))).item;
   },
-  async v2ProbeRuns(publishedModelId: number, limit = 50): Promise<V2ProbeRun[]> {
-    const result = await requestV2<{ items: V2ProbeRun[] }>(`/published-models/${publishedModelId}/probe-runs?limit=${limit}`);
-    return result.items ?? [];
+
+  async updateRoutingProfile(profileId: number, revision: number, input: Partial<CreateRoutingProfileInput>): Promise<RoutingProfile> {
+    return (await requestJSON<{ item: RoutingProfile }>(`${ROUTING_PREFIX}/${profileId}`, jsonInit('PATCH', input, revision))).item;
   },
-  async v2ProbeRun(id: string): Promise<V2ProbeRun> {
-    const result = await requestV2<{ item: V2ProbeRun }>(`/probe-runs/${encodeURIComponent(id)}`);
-    return result.item;
+
+  deleteRoutingProfile(profileId: number, revision: number): Promise<void> {
+    return requestJSON<void>(`${ROUTING_PREFIX}/${profileId}`, revisionInit('DELETE', revision));
   },
-  async v2ProbeAttempts(id: string): Promise<V2ProbeAttempt[]> {
-    const result = await requestV2<{ items: V2ProbeAttempt[] }>(`/probe-runs/${encodeURIComponent(id)}/attempts`);
-    return result.items ?? [];
+
+  async listProfileRoutes(profileId: number): Promise<ModelRoute[]> {
+    return (await requestJSON<{ items: ModelRoute[] }>(`${ROUTING_PREFIX}/${profileId}/routes`)).items;
   },
-  async v2MonitorMatrix(): Promise<V2MonitorMatrix> {
-    if (isDemoMode()) return { generatedAt: Date.now(), models: [] };
-    return requestV2<V2MonitorMatrix>('/monitor/matrix');
+
+  async createProfileRoute(profileId: number, profileRevision: number, input: CreateRouteInput): Promise<ModelRoute> {
+    return (await requestJSON<{ item: ModelRoute }>(
+      `${ROUTING_PREFIX}/${profileId}/routes`,
+      jsonInit('POST', input, profileRevision),
+    )).item;
   },
-  async accountAdapters(): Promise<AccountAdapter[]> {
-    if (isDemoMode()) return demo.accountAdapters();
-    const result = await request<{ items: AccountAdapter[] }>('/account-adapters');
-    return result.items;
+
+  async updateProfileRoute(profileId: number, publishedModelId: number, revision: number, input: UpdateRouteInput): Promise<ModelRoute> {
+    return (await requestJSON<{ item: ModelRoute }>(
+      `${ROUTING_PREFIX}/${profileId}/routes/${publishedModelId}`,
+      jsonInit('PATCH', input, revision),
+    )).item;
   },
-  async upstreamAccount(id: number): Promise<UpstreamAccount> {
-    if (isDemoMode()) return demo.upstreamAccount(id);
-    const result = await request<{ account: UpstreamAccount }>(`/upstreams/${id}/account`);
-    return result.account;
+
+  async replaceProfileRouteTargets(profileId: number, publishedModelId: number, revision: number, providerTargetIds: number[]): Promise<ModelRoute> {
+    return (await requestJSON<{ item: ModelRoute }>(
+      `${ROUTING_PREFIX}/${profileId}/routes/${publishedModelId}/targets`,
+      jsonInit('PUT', { providerTargetIds }, revision),
+    )).item;
   },
-  async configureUpstreamAccount(id: number, input: ConfigureUpstreamAccountInput): Promise<UpstreamAccount> {
-    if (isDemoMode()) return demo.configureUpstreamAccount(id, input);
-    const result = await request<{ account: UpstreamAccount }>(`/upstreams/${id}/account`, { method: 'PUT', body: JSON.stringify(input) });
-    return result.account;
+
+  deleteProfileRoute(profileId: number, publishedModelId: number, revision: number): Promise<void> {
+    return requestJSON<void>(
+      `${ROUTING_PREFIX}/${profileId}/routes/${publishedModelId}`,
+      revisionInit('DELETE', revision),
+    );
   },
-  async deleteUpstreamAccount(id: number): Promise<void> {
-    if (isDemoMode()) return demo.deleteUpstreamAccount(id);
-    await request<void>(`/upstreams/${id}/account`, { method: 'DELETE' });
-  },
-  async refreshUpstreamAccount(id: number): Promise<UpstreamAccount> {
-    if (isDemoMode()) return demo.refreshUpstreamAccount(id);
-    const result = await request<{ account: UpstreamAccount }>(`/upstreams/${id}/account/refresh`, { method: 'POST' });
-    return result.account;
-  },
-  async upstreamAccountUsage(id: number, range: AccountUsageRange, limit = 50, beforeId?: string): Promise<UpstreamUsagePage> {
-    if (isDemoMode()) return demo.upstreamAccountUsage(id, range, limit);
-    const query = new URLSearchParams({ range, limit: String(limit) });
-    if (beforeId) query.set('beforeId', beforeId);
-    return request<UpstreamUsagePage>(`/upstreams/${id}/account/usage?${query.toString()}`);
-  },
-  async createUpstream(input: CreateUpstreamInput): Promise<Upstream> {
-    if (isDemoMode()) return demo.createUpstream(input);
-    const result = await request<{ item: Upstream }>('/upstreams', { method: 'POST', body: JSON.stringify(input) });
-    return result.item;
-  },
-  async updateUpstream(id: number, patch: UpdateUpstreamInput): Promise<Upstream> {
-    if (isDemoMode()) return demo.updateUpstream(id, patch);
-    const result = await request<{ item: Upstream }>(`/upstreams/${id}`, { method: 'PATCH', body: JSON.stringify(patch) });
-    return result.item;
-  },
-  async deleteUpstream(id: number): Promise<void> {
-    if (isDemoMode()) return demo.deleteUpstream(id);
-    await request<void>(`/upstreams/${id}`, { method: 'DELETE' });
-  },
-  async testUpstream(id: number): Promise<Upstream> {
-    if (isDemoMode()) return demo.testUpstream(id);
-    const result = await request<{ item: Upstream }>(`/upstreams/${id}/test`, { method: 'POST' });
-    return result.item;
-  },
-  async discoverModels(id: number): Promise<ModelDiscovery> {
-    if (isDemoMode()) return demo.discoverModels(id);
-    return request<ModelDiscovery>(`/upstreams/${id}/models/discover`, { method: 'POST' });
-  },
-  async applyModels(id: number, discovery: ModelDiscovery): Promise<Upstream> {
-    if (isDemoMode()) return demo.applyModels(id, discovery);
-    const result = await request<{ item: Upstream }>(`/upstreams/${id}/models/apply`, { method: 'POST', body: JSON.stringify({ discovery }) });
-    return result.item;
-  },
-  async routes(): Promise<Route[]> {
-    if (isDemoMode()) return demo.routes();
-    const result = await request<{ items: Route[] }>('/routes');
-    return result.items;
-  },
-  async createRoute(input: CreateRouteInput): Promise<Route> {
-    if (isDemoMode()) return demo.createRoute(input);
-    const result = await request<{ item: Route }>('/routes', { method: 'POST', body: JSON.stringify(input) });
-    return result.item;
-  },
-  async updateRoute(id: number, patch: UpdateRouteInput): Promise<Route> {
-    if (isDemoMode()) return demo.updateRoute(id, patch);
-    const result = await request<{ item: Route }>(`/routes/${id}`, { method: 'PATCH', body: JSON.stringify(patch) });
-    return result.item;
-  },
-  async deleteRoute(id: number): Promise<void> {
-    if (isDemoMode()) return demo.deleteRoute(id);
-    await request<void>(`/routes/${id}`, { method: 'DELETE' });
-  },
-  async reorderRoute(id: number, targetIds: number[]): Promise<Route> {
-    if (isDemoMode()) return demo.reorderRoute(id, targetIds);
-    const result = await request<{ item: Route }>(`/routes/${id}/targets/order`, { method: 'PUT', body: JSON.stringify({ targetIds }) });
-    return result.item;
-  },
-  async probeRoute(id: number, targetId?: number): Promise<Route> {
-    if (isDemoMode()) return demo.probeRoute(id, targetId);
-    const result = await request<{ item: Route }>(`/routes/${id}/probe`, { method: 'POST', body: JSON.stringify({ targetId }) });
-    return result.item;
-  },
-  async keys(): Promise<DownstreamKey[]> {
-    if (isDemoMode()) return demo.keys();
-    const result = await request<{ items: DownstreamKey[] }>('/keys');
-    return result.items;
-  },
-  async createKey(input: CreateKeyInput): Promise<{ item: DownstreamKey; secret: string }> {
-    if (isDemoMode()) return demo.createKey(input);
-    return request<{ item: DownstreamKey; secret: string }>('/keys', { method: 'POST', body: JSON.stringify(input) });
-  },
-  async updateKey(id: number, patch: UpdateKeyInput): Promise<DownstreamKey> {
-    if (isDemoMode()) return demo.updateKey(id, patch);
-    const result = await request<{ item: DownstreamKey }>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(patch) });
-    return result.item;
-  },
-  async deleteKey(id: number): Promise<void> {
-    if (isDemoMode()) return demo.deleteKey(id);
-    await request<void>(`/keys/${id}`, { method: 'DELETE' });
-  },
-  async logs(): Promise<RequestLog[]> {
-    if (isDemoMode()) return demo.logs();
-    const result = await request<{ items: RequestLog[] }>('/logs/requests');
-    return result.items;
-  },
-  async requestLogs(filters: RequestLogFilter = {}, cursor: RequestLogCursor | null = null, limit = 50): Promise<RequestLogPage> {
-    if (isDemoMode()) {
-      let items = demoFilteredLogs(filters);
-      if (cursor) {
-        items = items.filter((item) => item.startedAt < cursor.beforeTime || (item.startedAt === cursor.beforeTime && item.id < cursor.beforeId));
-      }
-      const hasMore = items.length > limit;
-      const pageItems = items.slice(0, limit);
-      const last = pageItems.at(-1);
-      return {
-        items: pageItems,
-        hasMore,
-        nextCursor: hasMore && last ? { beforeTime: last.startedAt, beforeId: last.id } : null,
-      };
+
+  async getSiteAccount(siteId: number): Promise<SiteAccountConnection | null> {
+    try {
+      return await requestJSON<SiteAccountConnection>(`${SITE_ACCOUNTS_PREFIX}/sites/${siteId}`);
+    } catch (error) {
+      if (error instanceof ApiUnavailableError && error.status === 404) return null;
+      throw error;
     }
+  },
+
+  configureSiteAccount(siteId: number, input: AccountConnectionInput): Promise<SiteAccountConnection> {
+    return requestJSON(`${SITE_ACCOUNTS_PREFIX}/sites/${siteId}`, jsonInit('PUT', input));
+  },
+
+  updateSiteAccount(
+    siteId: number,
+    revision: number,
+    input: { adapterKind?: string; origin?: string; enabled?: boolean },
+  ): Promise<SiteAccountConnection> {
+    return requestJSON(`${SITE_ACCOUNTS_PREFIX}/sites/${siteId}`, jsonInit('PATCH', input, revision));
+  },
+
+  deleteSiteAccount(siteId: number, revision: number): Promise<void> {
+    return requestJSON(`${SITE_ACCOUNTS_PREFIX}/sites/${siteId}`, revisionInit('DELETE', revision));
+  },
+
+  replaceSiteAccountSecret(siteId: number, revision: number, secrets: AccountSecretInput): Promise<SiteAccountConnection> {
+    return requestJSON(`${SITE_ACCOUNTS_PREFIX}/sites/${siteId}/secret`, jsonInit('PUT', secrets, revision));
+  },
+
+  async refreshSiteBalance(siteId: number): Promise<SiteBalance> {
+    return (await requestJSON<{ balance: SiteBalance }>(`${SITE_ACCOUNTS_PREFIX}/sites/${siteId}/balance/refresh`, { method: 'POST' })).balance;
+  },
+
+  async listSiteUsage(siteId: number, filter: SiteUsageFilter = {}): Promise<SiteUsagePage> {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(filter)) {
+      if (value !== undefined && value !== null && String(value).trim() !== '') query.set(key, String(value));
+    }
+    const suffix = query.size ? `?${query.toString()}` : '';
+    return requestJSON(`${SITE_ACCOUNTS_PREFIX}/sites/${siteId}/usage${suffix}`);
+  },
+
+  async syncSiteUsage(siteId: number, filter: Omit<SiteUsageFilter, 'search'> = {}): Promise<void> {
+    await requestJSON(`${SITE_ACCOUNTS_PREFIX}/sites/${siteId}/usage/sync`, jsonInit('POST', filter));
+  },
+
+  async pricingState(): Promise<CatalogState> {
+    return (await requestJSON<{ state: CatalogState }>(`${PRICING_PREFIX}/state`)).state;
+  },
+
+  listPriceCatalogs(): Promise<PriceCatalogList> {
+    return requestJSON<PriceCatalogList>(`${PRICING_PREFIX}/catalogs`);
+  },
+
+  async getPriceCatalog(version: string): Promise<PriceCatalog> {
+    return (await requestJSON<{ catalog: PriceCatalog }>(
+      `${PRICING_PREFIX}/catalogs/${encodeURIComponent(version)}`,
+    )).catalog;
+  },
+
+  previewPriceCatalog(catalog: PriceCatalog): Promise<PriceCatalogPreview> {
+    return requestJSON<PriceCatalogPreview>(
+      `${PRICING_PREFIX}/catalogs/preview`,
+      jsonInit('POST', { catalog }),
+    );
+  },
+
+  importPriceCatalog(catalog: PriceCatalog, expectedDigest: string): Promise<PriceCatalogImportResult> {
+    return requestJSON<PriceCatalogImportResult>(
+      `${PRICING_PREFIX}/catalogs`,
+      jsonInit('POST', { catalog, expected_digest: expectedDigest }),
+    );
+  },
+
+  async activatePriceCatalog(version: string, revision: number): Promise<CatalogState> {
+    return (await requestJSON<{ state: CatalogState }>(
+      `${PRICING_PREFIX}/catalogs/${encodeURIComponent(version)}/activate`,
+      revisionInit('POST', revision),
+    )).state;
+  },
+
+  monitorSnapshot(): Promise<MonitorSnapshot> {
+    return requestJSON<MonitorSnapshot>(MONITOR_PREFIX);
+  },
+
+  async createMonitorModel(
+    publishedModelId: number,
+    input: { enabled: boolean; historyLimit?: number },
+  ): Promise<MonitorSetting> {
+    return (await requestJSON<{ item: MonitorSetting }>(
+      `${MONITOR_PREFIX}/models/${publishedModelId}`,
+      jsonInit('POST', input),
+    )).item;
+  },
+
+  async updateMonitorModel(
+    publishedModelId: number,
+    revision: number,
+    input: { enabled?: boolean; historyLimit?: number },
+  ): Promise<MonitorSetting> {
+    return (await requestJSON<{ item: MonitorSetting }>(
+      `${MONITOR_PREFIX}/models/${publishedModelId}`,
+      jsonInit('PATCH', input, revision),
+    )).item;
+  },
+
+  async probeModel(publishedModelId: number): Promise<void> {
+    await requestJSON<unknown>(`${MONITOR_PREFIX}/models/${publishedModelId}/probe`, { method: 'POST' });
+  },
+
+  monitorTargetHistory(publishedModelId: number, providerModelTargetId: number, limit = 200): Promise<MonitorTargetHistory> {
     const query = new URLSearchParams({ limit: String(limit) });
-    appendRequestLogFilters(query, filters);
-    if (cursor) {
-      query.set('beforeTime', String(cursor.beforeTime));
-      query.set('beforeId', cursor.beforeId);
-    }
-    return requestV2<RequestLogPage>(`/request-logs?${query.toString()}`);
+    return requestJSON<MonitorTargetHistory>(
+      `${MONITOR_PREFIX}/models/${publishedModelId}/targets/${providerModelTargetId}/history?${query.toString()}`,
+    );
   },
-  async requestLogSummary(filters: RequestLogFilter = {}): Promise<RequestLogSummary> {
-    if (isDemoMode()) {
-      const items = demoFilteredLogs(filters);
-      const successCount = items.filter((item) => item.status === 'success').length;
-      const switchedCount = items.filter((item) => item.switchCount > 0).length;
-      const ttft = items.flatMap((item) => item.firstTokenMs == null ? [] : [item.firstTokenMs]);
-      return {
-        count: items.length,
-        successRate: items.length ? successCount / items.length * 100 : 0,
-        costMicroUsd: items.reduce((total, item) => total + item.costMicroUsd, 0),
-        switchRate: items.length ? switchedCount / items.length * 100 : 0,
-        p50TtftMs: nearestRank(ttft, 0.5),
-        p95TtftMs: nearestRank(ttft, 0.95),
-      };
-    }
-    const query = new URLSearchParams();
-    appendRequestLogFilters(query, filters);
-    const suffix = query.size ? `?${query.toString()}` : '';
-    return requestV2<RequestLogSummary>(`/request-logs/summary${suffix}`);
+
+  gatewayLogs(filter: GatewayLogFilter = {}): Promise<GatewayLogPage> {
+    const suffix = gatewayLogQuery(filter, true);
+    return requestJSON<{ items: RequestLogResponse[]; hasMore: boolean; nextCursor: string }>(`${LOGS_PREFIX}${suffix}`)
+      .then((page) => ({ ...page, items: page.items.map((item) => gatewayLog(item)) }));
   },
-  async log(id: string): Promise<RequestLogDetail> {
-    if (isDemoMode()) return demoLogDetail(demo.log(id));
-    return requestV2<RequestLogDetail>(`/request-logs/${encodeURIComponent(id)}`);
+
+  gatewayLogSummary(filter: GatewayLogSummaryFilter = {}): Promise<GatewayLogSummary> {
+    return requestJSON<GatewayLogSummary>(`${LOGS_PREFIX}/summary${gatewayLogQuery(filter, false)}`);
   },
-  async settings(): Promise<GatewaySettings> {
-    if (isDemoMode()) return demo.settings();
-    return request<GatewaySettings>('/settings');
+
+  async gatewayLogDetail(requestId: string): Promise<GatewayLog> {
+    const detail = await requestJSON<{
+      request: RequestLogResponse;
+      routeCandidates: RouteCandidateResponse[];
+      attempts: RequestAttemptResponse[];
+      ledger: QuotaLedgerResponse[];
+    }>(`${LOGS_PREFIX}/${encodeURIComponent(requestId)}`);
+    return gatewayLog(
+      detail.request,
+      detail.attempts.map(gatewayAttempt),
+      detail.ledger.map(quotaLedgerEvent),
+      detail.routeCandidates.map(gatewayRouteCandidate),
+    );
   },
-  async updateSettings(patch: Partial<GatewaySettings>): Promise<GatewaySettings> {
-    if (isDemoMode()) return demo.updateSettings(patch);
-    return request<GatewaySettings>('/settings', { method: 'PATCH', body: JSON.stringify(patch) });
+
+  settings(): Promise<GatewaySettings> {
+    return requestJSON<GatewaySettings>(SETTINGS_PREFIX);
+  },
+
+  updateSettings(revision: number, input: Omit<GatewaySettings, 'revision'>): Promise<GatewaySettings> {
+    return requestJSON<GatewaySettings>(SETTINGS_PREFIX, jsonInit('PATCH', input, revision));
   },
 };
+
+export const endpointProfiles: Array<{
+  id: string;
+  label: string;
+  protocol: WireProtocol;
+  surface: InferenceSurface;
+  authScheme: AuthScheme;
+  baseUrlPlaceholder: string;
+}> = [
+  {
+    id: 'openai-chat',
+    label: 'OpenAI Chat Completions',
+    protocol: 'openai',
+    surface: 'openai.chat_completions',
+    authScheme: 'bearer',
+    baseUrlPlaceholder: 'https://relay.example.com/v1',
+  },
+  {
+    id: 'openai-responses',
+    label: 'OpenAI Responses',
+    protocol: 'openai',
+    surface: 'openai.responses',
+    authScheme: 'bearer',
+    baseUrlPlaceholder: 'https://relay.example.com/v1',
+  },
+  {
+    id: 'anthropic-messages',
+    label: 'Anthropic Messages',
+    protocol: 'anthropic',
+    surface: 'anthropic.messages',
+    authScheme: 'x-api-key',
+    baseUrlPlaceholder: 'https://relay.example.com',
+  },
+  {
+    id: 'gemini-generate-content',
+    label: 'Gemini GenerateContent',
+    protocol: 'gemini',
+    surface: 'gemini.generate_content',
+    authScheme: 'x-goog-api-key',
+    baseUrlPlaceholder: 'https://relay.example.com',
+  },
+];

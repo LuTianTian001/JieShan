@@ -1,186 +1,19 @@
-export type HealthState =
-  | 'healthy'
-  | 'suspect'
-  | 'cooldown'
-  | 'credential_error'
-  | 'probing'
-  | 'unknown'
-  | 'disabled';
+export type WireProtocol = 'openai' | 'anthropic' | 'gemini';
 
-export type Protocol = 'openai' | 'anthropic' | 'gemini' | 'compatible';
+export type InferenceSurface =
+  | 'openai.chat_completions'
+  | 'openai.responses'
+  | 'anthropic.messages'
+  | 'gemini.generate_content';
+
+export type AuthScheme = 'bearer' | 'x-api-key' | 'x-goog-api-key' | 'query-key';
 
 export interface User {
-  id: number;
   username: string;
+  expiresAt?: number;
 }
 
-export type AccountAdapterKey = 'ciii' | 'new_api' | 'one_api';
-export type AccountAuthKind = 'api_token' | 'access_refresh';
-export type AccountSyncState = 'unconfigured' | 'ready' | 'syncing' | 'stale' | 'error';
-export type AccountUsageRange = '24h' | '7d' | '30d';
-
-export interface AccountTarget {
-  kind: 'site' | 'legacy';
-  id: number;
-  name: string;
-  dashboardUrl: string;
-  baseUrl: string;
-}
-
-export interface SourceAmount {
-  value: string;
-  currency: string;
-  display?: string;
-  sourceLabel?: string;
-}
-
-export interface AccountAdapter {
-  key: AccountAdapterKey;
-  label: string;
-  authKinds: AccountAuthKind[];
-  capabilities: {
-    balance: boolean;
-    subscription: boolean;
-    usage: boolean;
-    tokenRefresh: boolean;
-  };
-}
-
-export interface UpstreamAccount {
-  configured: boolean;
-  enabled: boolean;
-  dashboardUrl: string;
-  adapter?: Pick<AccountAdapter, 'key' | 'label'>;
-  auth?: {
-    kind: AccountAuthKind;
-    hasApiToken: boolean;
-    hasAccessToken: boolean;
-    hasRefreshToken: boolean;
-    accessTokenExpiresAt: string | null;
-  };
-  capabilities: AccountAdapter['capabilities'];
-  sync: {
-    state: AccountSyncState;
-    lastAttemptAt: string | null;
-    lastSuccessAt: string | null;
-    nextAt: string | null;
-    stale: boolean;
-    error: { code: string; message: string } | null;
-  };
-  snapshot: {
-    capturedAt: string;
-    balance: SourceAmount | null;
-    subscription: {
-      planName: string;
-      status: string | null;
-      expiresAt: string | null;
-      renewsAt: string | null;
-      periodStart: string | null;
-      periodEnd: string | null;
-      remaining?: SourceAmount;
-      total?: SourceAmount;
-    } | null;
-  } | null;
-}
-
-export type UpstreamAccountAuthInput =
-  | { kind: 'api_token'; apiToken?: string }
-  | { kind: 'access_refresh'; accessToken?: string; refreshToken?: string };
-
-export interface ConfigureUpstreamAccountInput {
-  adapterKey: AccountAdapterKey;
-  dashboardUrl: string;
-  enabled: boolean;
-  auth: UpstreamAccountAuthInput;
-  refreshNow: boolean;
-}
-
-export interface UpstreamUsageItem {
-  id: string;
-  externalId?: string;
-  requestId?: string;
-  upstreamRequestId?: string;
-  occurredAt: string | null;
-  syncedAt?: string;
-  model: string | null;
-  upstreamModel?: string | null;
-  reasoningEffort?: string | null;
-  amount: SourceAmount | null;
-  originalCost?: string | null;
-  actualCost?: string | null;
-  quota?: string | null;
-  inputTokens: number | null;
-  cacheReadTokens?: number | null;
-  cacheCreationTokens?: number | null;
-  outputTokens: number | null;
-  reasoningTokens?: number | null;
-  totalTokens?: number | null;
-  httpStatus?: number | null;
-  status: string | null;
-  durationMs?: number | null;
-  firstTokenMs?: number | null;
-  stream?: boolean | null;
-  rateMultiplier?: string | null;
-  modelMultiplier?: string | null;
-  groupMultiplier?: string | null;
-  apiKeyId?: string;
-  apiKeyName?: string;
-  groupId?: string;
-  groupName?: string;
-  endpoint?: string;
-  requestType?: string;
-  billingType?: string;
-  billingMode?: string;
-  sourceText?: string;
-}
-
-export interface UpstreamUsagePage {
-  items: UpstreamUsageItem[];
-  range: AccountUsageRange;
-  lastSyncedAt: string | null;
-  hasMore?: boolean;
-  nextBeforeId?: string | null;
-}
-
-export interface UpstreamModel {
-  id: string;
-  name: string;
-  displayName?: string;
-  enabled: boolean;
-  discoveredAt: string;
-  endpointId?: number;
-  stale?: boolean;
-  credentialCount?: number;
-  supportedCredentialCount?: number;
-  unsupportedCredentialCount?: number;
-  unknownCredentialCount?: number;
-}
-
-export interface Upstream {
-  id: number;
-  name: string;
-  baseUrl: string;
-  protocol: Protocol;
-  enabled: boolean;
-  state: HealthState;
-  latencyMs: number | null;
-  modelCount: number;
-  credentialCount: number;
-  lastSyncAt: string | null;
-  lastError?: string;
-  models?: UpstreamModel[];
-}
-
-export interface ModelDiscovery {
-  upstreamId: number;
-  discoveredAt: string;
-  added: string[];
-  removed: string[];
-  unchanged: string[];
-  complete: boolean;
-}
-
-export interface V2Site {
+export interface Site {
   id: number;
   name: string;
   dashboardUrl: string;
@@ -190,35 +23,29 @@ export interface V2Site {
   updatedAt: number;
 }
 
-export interface V2SiteSummary extends V2Site {
-  endpointCount: number;
-  enabledEndpointCount: number;
-  credentialCount: number;
-  enabledCredentialCount: number;
-  unavailableCredentialCount: number;
-  modelCount: number;
-  activeModelCount: number;
-  publishedModelCount: number;
-  lastModelSeenAt?: number | null;
+export interface CreateSiteInput {
+  name: string;
+  dashboardUrl?: string;
+  enabled?: boolean;
 }
 
-export interface V2EndpointCapabilities {
-  modelDiscovery: boolean;
-  chatCompletions: boolean;
-  responses: boolean;
-  routeEligible: boolean;
+export interface UpdateSiteInput {
+  name?: string;
+  dashboardUrl?: string | null;
+  enabled?: boolean;
 }
 
-export interface V2Endpoint {
+export interface SiteEndpoint {
   id: number;
   siteId: number;
   name: string;
   baseUrl: string;
-  wireProtocol: string;
-  compatibilityProfile: string;
-  authScheme: string;
-  customHeaders: Record<string, string> | null;
-  capabilities?: V2EndpointCapabilities;
+  wireProtocol: WireProtocol;
+  surface: InferenceSurface;
+  adapterKind: string;
+  authScheme: AuthScheme;
+  headers: Record<string, string>;
+  secretHeadersConfigured: boolean;
   position: number;
   enabled: boolean;
   revision: number;
@@ -226,553 +53,707 @@ export interface V2Endpoint {
   updatedAt: number;
 }
 
-export interface V2Credential {
+export interface EndpointInput {
+  name: string;
+  baseUrl: string;
+  wireProtocol: WireProtocol;
+  surface: InferenceSurface;
+  adapterKind?: string;
+  authScheme?: AuthScheme;
+  headers?: Record<string, string>;
+  enabled?: boolean;
+}
+
+export interface SiteCredential {
   id: number;
   siteId: number;
   name: string;
   secretConfigured: boolean;
-  position: number;
   enabled: boolean;
-  runtimeState: string;
-  cooldownUntil?: number | null;
-  lastTestAt?: number | null;
-  lastTestStatus?: string;
-  lastErrorMessage?: string;
   revision: number;
+  runtimeState: string;
+  coolingUntil: number | null;
+  lastHttpStatus: number | null;
+  lastErrorCode: string;
+  runtimeRevision: number;
+  runtimeUpdatedAt: number;
   createdAt: number;
   updatedAt: number;
 }
 
-export interface V2SiteDetail {
-  site: V2Site;
-  endpoints: V2Endpoint[];
-  credentials: V2Credential[];
+export interface CredentialBinding {
+  credentialId: number;
+  credentialName: string;
+  position: number;
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
 }
 
-export interface V2SiteModel {
+export interface ProviderModel {
   id: number;
   siteId: number;
   endpointId: number;
-  modelName: string;
-  displayName?: string;
+  sourceModel: string;
+  displayName: string;
   enabled: boolean;
-  stale: boolean;
-  missingCount: number;
-  lastSeenAt?: number | null;
   revision: number;
+  lastSeenAt: number | null;
   createdAt: number;
   updatedAt: number;
-  credentialCount: number;
-  supportedCredentialCount: number;
-  unsupportedCredentialCount: number;
+}
+
+export interface DiscoveredModel {
+  sourceModel: string;
+  imported: boolean;
+  targetId: number | null;
+  enabled: boolean | null;
+  revision: number | null;
+}
+
+export interface ProtocolCapabilities {
+  discovery: boolean;
+  request: boolean;
+  response: boolean;
+  stream: boolean;
+  usage: boolean;
+  error: boolean;
+}
+
+export interface ModelTarget extends ProviderModel {
+  siteName: string;
+  siteEnabled: boolean;
+  endpointName: string;
+  endpointEnabled: boolean;
+  baseUrl: string;
+  wireProtocol: WireProtocol;
+  surface: InferenceSurface;
+  adapterKind: string;
+  authScheme: AuthScheme;
+  boundCredentialCount: number;
+  usableCredentialCount: number;
   unknownCredentialCount: number;
+  credentialIds?: number[];
+  credentialNames?: string[];
+  capabilities: ProtocolCapabilities;
+  routable: boolean;
 }
 
-export type V2DiscoveryStrategy = 'selected' | 'first_success' | 'all';
-
-export interface V2DiscoveryAttempt {
-  credentialId: number;
-  credentialName: string;
-  models: string[];
-  complete: boolean;
-  pagesFetched: number;
-  error?: string;
-}
-
-export interface V2ModelDiscovery {
-  siteId: number;
-  endpointId: number;
-  models: string[];
-  complete: boolean;
-  applied: boolean;
-  attempts: V2DiscoveryAttempt[];
-  discoveredAt: string;
-}
-
-export interface V2RouteSiteTarget {
+export interface RouteTarget {
   id: number;
   publishedModelId: number;
   siteId: number;
   siteName: string;
   endpointId: number;
   endpointName: string;
-  wireProtocol: string;
-  siteModelId: number;
+  providerModelTargetId: number;
   sourceModel: string;
+  wireProtocol: WireProtocol;
+  apiSurface: InferenceSurface;
   position: number;
-  enabled: boolean;
   revision: number;
   createdAt: number;
   updatedAt: number;
 }
 
-export interface V2PublishedModel {
-  id: number;
+export interface ModelRoute {
+  routingProfileId: number;
+  routingProfileName: string;
+  sourceProfileId: number;
+  sourceProfileName: string;
+  inherited: boolean;
+  targetsOverridden: boolean;
+  publishedModelId: number;
   publicName: string;
-  displayName?: string;
-  officialPriceSku?: string;
+  officialPriceSku: string;
   enabled: boolean;
-  monitorEnabled: boolean;
-  monitorIntervalSeconds: number;
-  cooldownSeconds: number;
-  failureThreshold: number;
-  failureWindowSeconds: number;
-  firstOutputTimeoutSeconds: number;
-  streamIdleTimeoutSeconds: number;
-  requestDeadlineSeconds: number;
-  maxAttempts: number;
+  publishedModelRevision: number;
   revision: number;
+  targets: RouteTarget[];
   createdAt: number;
   updatedAt: number;
-  targets: V2RouteSiteTarget[];
 }
 
 export interface RoutingProfile {
   id: number;
   name: string;
+  isDefault: boolean;
   revision: number;
-  modelOverrideCount: number;
+  modelCount: number;
+  localModelCount: number;
+  inheritedModelCount: number;
+  downstreamKeyCount: number;
   createdAt: number;
   updatedAt: number;
 }
 
-export interface RoutingProfileModelRoute {
-  routingProfileId: number;
-  publishedModelId: number;
-  profileRevision: number;
-  inheritsDefault: boolean;
-  targets: V2RouteSiteTarget[];
+export interface CreateRoutingProfileInput {
+  name: string;
 }
 
-export interface CreateV2PublishedModelInput {
+export interface CreateDefaultRouteInput {
   publicName: string;
-  displayName?: string;
+  officialPriceSku: string;
+  enabled: boolean;
+  providerTargetIds: number[];
+}
+
+export interface CreateCustomRouteInput {
+  publishedModelId: number;
+  enabled: boolean;
+  providerTargetIds?: number[];
+}
+
+export type CreateRouteInput = CreateDefaultRouteInput | CreateCustomRouteInput;
+
+export interface UpdateRouteInput {
+  publicName?: string;
   officialPriceSku?: string;
   enabled?: boolean;
-  monitorEnabled?: boolean;
-  monitorIntervalSeconds?: number;
-  cooldownSeconds?: number;
-  failureThreshold?: number;
-  failureWindowSeconds?: number;
-  firstOutputTimeoutSeconds?: number;
-  streamIdleTimeoutSeconds?: number;
-  requestDeadlineSeconds?: number;
-  maxAttempts?: number;
-}
-
-export interface UpdateV2PublishedModelInput extends Partial<CreateV2PublishedModelInput> {
-  revision?: number;
-}
-
-export interface CreateV2RouteTargetInput {
-  siteId: number;
-  endpointId: number;
-  siteModelId: number;
-  enabled?: boolean;
-  publishedRevision?: number;
-}
-
-export interface UpdateV2RouteTargetInput extends CreateV2RouteTargetInput {
-  revision?: number;
-}
-
-export interface V2RouteTargetHealth {
-  targetId: number;
-  circuitPhase: 'closed' | 'open' | 'half_open';
-  consecutiveFailures: number;
-  lastFailureAt?: number | null;
-  lastSuccessAt?: number | null;
-  cooldownUntil?: number | null;
-  halfOpenLeaseUntil?: number | null;
-  capabilityState: 'unknown' | 'supported' | 'unsupported';
-  lastErrorClass?: string;
-  lastErrorMessage?: string;
-  lastIncidentId?: string;
-  updatedAt: number;
-}
-
-export interface V2ProbeAttempt {
-  id: number;
-  probeRunId: string;
-  attemptIndex: number;
-  routeSiteTargetId?: number | null;
-  siteId?: number | null;
-  endpointId?: number | null;
-  inferenceCredentialId?: number | null;
-  siteModelId?: number | null;
-  siteName: string;
-  endpointName: string;
-  credentialName?: string;
-  sourceModel: string;
-  status: 'success' | 'failed' | 'skipped';
-  httpStatus?: number | null;
-  latencyMs?: number | null;
-  firstOutputMs?: number | null;
-  errorClass?: string;
-  errorMessage?: string;
-  startedAt: number;
-  finishedAt: number;
-}
-
-export interface V2ProbeRun {
-  id: string;
-  publishedModelId: number;
-  publicModel?: string;
-  publishedModelRevision: number;
-  triggerKind: 'scheduled' | 'manual' | 'recovery';
-  status: 'running' | 'success' | 'partial' | 'failed' | 'cancelled';
-  targetCount: number;
-  successCount: number;
-  failureCount: number;
-  skippedCount: number;
-  errorMessage?: string;
-  startedAt: number;
-  finishedAt?: number | null;
-  attempts?: V2ProbeAttempt[];
-  health?: V2RouteTargetHealth[];
-}
-
-export interface V2MonitorTarget extends V2RouteSiteTarget {
-  health: V2RouteTargetHealth;
-  lastProbe?: V2ProbeAttempt | null;
-}
-
-export interface V2MonitorModel extends Omit<V2PublishedModel, 'targets'> {
-  targets: V2MonitorTarget[];
-}
-
-export interface V2MonitorMatrix {
-  generatedAt: number;
-  models: V2MonitorModel[];
-}
-
-export interface CreateV2SiteInput {
-  name: string;
-  dashboardUrl?: string;
-  enabled?: boolean;
-}
-
-export interface CreateV2EndpointInput {
-  name: string;
-  baseUrl: string;
-  wireProtocol: string;
-  compatibilityProfile?: string;
-  authScheme?: string;
-  customHeaders?: Record<string, string>;
-  enabled?: boolean;
-  revision?: number;
-}
-
-export interface CreateV2CredentialInput {
-  name: string;
-  apiKey: string;
-  enabled?: boolean;
-  revision?: number;
-}
-
-export interface UpdateV2SiteInput {
-  name?: string;
-  dashboardUrl?: string;
-  enabled?: boolean;
-  revision?: number;
-}
-
-export interface UpdateV2EndpointInput {
-  name?: string;
-  baseUrl?: string;
-  wireProtocol?: string;
-  compatibilityProfile?: string;
-  authScheme?: string;
-  customHeaders?: Record<string, string>;
-  enabled?: boolean;
-  revision?: number;
-}
-
-export interface UpdateV2CredentialInput {
-  name?: string;
-  apiKey?: string;
-  enabled?: boolean;
-  revision?: number;
-}
-
-export interface RouteTarget {
-  id: number;
-  upstreamId: number;
-  upstreamName: string;
-  credentialName: string;
-  sourceModel: string;
-  state: HealthState;
-  latencyMs: number | null;
-  cooldownUntil: string | null;
-  lastFailure?: string;
-}
-
-export interface Route {
-  id: number;
-  model: string;
-  displayName?: string;
-  enabled: boolean;
-  monitored: boolean;
-  revision: number;
-  targets: RouteTarget[];
-}
-
-export interface MonitorMatrix {
-  generatedAt: string;
-  probeIntervalSeconds: number;
-  routes: Route[];
 }
 
 export interface DownstreamKey {
   id: number;
   name: string;
-  prefix: string;
+  keyPrefix: string;
   enabled: boolean;
-  quotaUsd: number | null;
-  spentUsd: number;
-  allowedModels: string[];
-  routingProfileId: number | null;
+  revealable: boolean;
+  quotaNanoUSD: number | null;
+  usedNanoUSD: number;
+  reservedNanoUSD: number;
+  hourlyQuotaNanoUSD: number | null;
+  usedThisHourNanoUSD: number;
+  reservedThisHourNanoUSD: number;
+  hourlyWindowStartedAt: number;
+  billingMultiplier: number;
+  expires: number | null;
+  lastUsedAt: number | null;
+  revision: number;
+  routingProfileId: number;
   routingProfileName: string;
-  usesDefaultRouting: boolean;
-  rpmLimit: number | null;
-  expiresAt: string | null;
-  lastUsedAt: string | null;
-  createdAt: string;
+  usesDefaultRoutingProfile: boolean;
+  models: string[];
+  createdAt: number;
+  updatedAt: number;
 }
 
-export interface RequestAttempt {
-  id: number;
-  sequence: number;
-  routingGeneration?: 'legacy' | 'v3' | string;
-  targetId?: number | null;
-  routeSiteTargetId?: number | null;
-  upstreamId?: number | null;
-  upstreamName?: string;
-  siteId?: number | null;
-  siteName?: string;
-  endpointId?: number | null;
-  endpointName?: string;
-  credentialId?: number | null;
-  credentialName?: string;
-  siteModelId?: number | null;
-  model: string;
-  state: 'success' | 'failed' | 'cancelled';
-  startedAt: string;
-  durationMs: number | null;
-  ttftMs: number | null;
-  statusCode: number | null;
-  switchReason?: string;
-  errorClass?: string;
-  error?: string;
-}
-
-export interface RequestLogFilter {
-  status?: string;
-  model?: string;
-  siteId?: number;
-  upstreamId?: number;
-  downstreamKeyId?: number;
-  stream?: boolean;
-  switched?: boolean;
-}
-
-export interface RequestLogCursor {
-  beforeTime: number;
-  beforeId: string;
-}
-
-export interface RequestLogListItem {
-  id: string;
-  routingGeneration: 'legacy' | 'v3' | string;
-  surface: 'chat_completions' | 'responses' | string;
-  downstreamKeyId?: number | null;
-  keyName: string;
-  routeId?: number | null;
-  routeRevision?: number | null;
-  publishedModelId?: number | null;
-  publishedModelRevision?: number | null;
+export interface CreateDownstreamKeyInput {
+  name: string;
+  quotaNanoUSD?: number | null;
+  hourlyQuotaNanoUSD?: number | null;
+  billingMultiplier?: number;
+  expires?: number | null;
   routingProfileId?: number | null;
-  routingProfileName: string;
-  actualUpstreamId?: number | null;
-  actualUpstreamName?: string;
-  actualSiteId?: number | null;
-  actualSiteName?: string;
-  actualEndpointId?: number | null;
-  actualEndpointName?: string;
-  actualCredentialId?: number | null;
-  actualCredentialName?: string;
-  requestedModel: string;
-  actualModel?: string;
-  reasoningEffort?: string;
-  thinkingBudget?: number | null;
-  status: string;
-  httpStatus?: number | null;
-  stream: boolean;
-  firstTokenMs?: number | null;
-  durationMs?: number | null;
-  inputTokens?: number | null;
-  cacheReadTokens?: number | null;
-  cacheWriteTokens?: number | null;
-  cacheWrite1hTokens?: number | null;
-  outputTokens?: number | null;
-  reasoningTokens?: number | null;
-  costMicroUsd: number;
-  priceSnapshot?: string;
-  switchCount: number;
-  errorMessage?: string;
-  startedAt: number;
-  finishedAt?: number | null;
+  enabled?: boolean;
 }
 
-export interface RequestLogAttemptDetail {
+export interface UpdateDownstreamKeyInput {
+  name?: string;
+  quotaNanoUSD?: number | null;
+  hourlyQuotaNanoUSD?: number | null;
+  billingMultiplier?: number;
+  expires?: number | null;
+  routingProfileId?: number | null;
+  enabled?: boolean;
+}
+
+export interface IssuedDownstreamKey {
+  item: DownstreamKey;
+  secret: string;
+}
+
+export interface SiteAccountCapabilities {
+  sessionRefresh: boolean;
+  balance: boolean;
+  usage: boolean;
+}
+
+export interface SiteBalance {
   id: number;
+  accountRemoteId: string;
+  accountName: string;
+  availableValue: string;
+  availableUnit: string;
+  usedValue: string | null;
+  usedUnit: string | null;
+  capturedAt: number;
+}
+
+export interface SiteAccountConnection {
+  id: number;
+  siteId: number;
+  siteName: string;
+  adapterKind: string;
+  origin: string;
+  secretConfigured: boolean;
+  enabled: boolean;
+  capabilities: SiteAccountCapabilities;
+  adapterAvailable: boolean;
+  lastSessionRefreshAt: number | null;
+  lastBalanceRefreshAt: number | null;
+  lastUsageRefreshAt: number | null;
+  lastErrorOperation: string;
+  lastErrorCode: string;
+  lastErrorAt: number | null;
+  latestBalance: SiteBalance | null;
+  revision: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface SiteUsageRecord {
+  id: number;
+  remoteId: string;
   requestId: string;
-  attemptIndex: number;
-  routingGeneration: 'legacy' | 'v3' | string;
-  targetId?: number | null;
-  upstreamId?: number | null;
-  upstreamName?: string;
-  routeSiteTargetId?: number | null;
-  siteId?: number | null;
-  siteName?: string;
-  endpointId?: number | null;
-  endpointName?: string;
-  inferenceCredentialId?: number | null;
-  credentialName?: string;
-  siteModelId?: number | null;
-  upstreamModel?: string;
+  upstreamRequestId: string;
+  occurredAt: number;
+  model: string;
+  upstreamModel: string;
   status: string;
-  httpStatus?: number | null;
-  switchReason?: string;
-  errorClass?: string;
-  errorMessage?: string;
-  latencyMs?: number | null;
-  firstTokenMs?: number | null;
+  httpStatus: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  reasoningTokens: number | null;
+  totalTokens: number | null;
+  chargeValue: string | null;
+  chargeUnit: string | null;
+  durationMs: number | null;
+  firstOutputMs?: number | null;
+  apiKeyName: string;
+  reasoningEffort?: string;
+  requestPath?: string;
+  requestType?: string;
+  billingMode?: string;
+  requestIp?: string;
+  region?: string;
+  group?: string;
+  sourceFetchedAt: number;
+}
+
+export interface SiteUsagePage {
+  items: SiteUsageRecord[];
+  hasMore: boolean;
+  nextCursor: string;
+}
+
+export interface CatalogState {
+  active_version?: string;
+  revision: number;
+  updated_at: string;
+}
+
+export type PriceTokenClass =
+  | 'input'
+  | 'output'
+  | 'cache_read'
+  | 'cache_write'
+  | 'cache_write_5m'
+  | 'cache_write_1h'
+  | 'reasoning';
+
+export interface PriceRate {
+  class: PriceTokenClass;
+  native_price_per_million?: string;
+  nano_usd_per_million: number;
+}
+
+export interface PriceLongContextTier {
+  threshold_tokens: number;
+  rates: PriceRate[];
+}
+
+export interface PriceCatalogEntry {
+  sku: string;
+  provider: string;
+  model_pattern: string;
+  pricing_basis?: string;
+  verification_status?: string;
+  source_url?: string;
+  source_digest?: string;
+  verified_at?: string;
+  native_currency?: string;
+  usd_per_native_unit?: string;
+  rates: PriceRate[];
+  long_context?: PriceLongContextTier;
+}
+
+export interface PriceCatalog {
+  schema_version?: number;
+  version: string;
+  digest?: string;
+  settlement_currency?: string;
+  source: string;
+  source_digest: string;
+  fx_version?: string;
+  fx_source_url?: string;
+  fx_source_digest?: string;
+  fx_verified_at?: string;
+  fetched_at: string;
+  verified_at?: string;
+  effective_at: string;
+  imported_at?: string;
+  entries: PriceCatalogEntry[];
+}
+
+export interface PriceCatalogSummary {
+  version: string;
+  digest: string;
+  settlement_currency: string;
+  source: string;
+  source_digest: string;
+  entry_count: number;
+  effective_at: string;
+  verified_at: string;
+  imported_at: string;
+  active: boolean;
+}
+
+export interface PriceCatalogList {
+  items: PriceCatalogSummary[];
+  state: CatalogState;
+}
+
+export interface PriceDiffSummary {
+  added_entries: number;
+  removed_entries: number;
+  changed_entries: number;
+  unchanged_entries: number;
+}
+
+export interface PriceRateDiff {
+  class: PriceTokenClass;
+  kind: 'added' | 'removed' | 'changed';
+  before?: PriceRate;
+  after?: PriceRate;
+}
+
+export interface PriceLongContextDiff {
+  kind: 'added' | 'removed' | 'changed';
+  before_threshold_tokens?: number;
+  after_threshold_tokens?: number;
+  rates?: PriceRateDiff[];
+}
+
+export interface PriceEntryDiff {
+  sku: string;
+  kind: 'added' | 'removed' | 'changed';
+  metadata_changed?: boolean;
+  rates?: PriceRateDiff[];
+  long_context?: PriceLongContextDiff;
+}
+
+export interface PriceCatalogDiff {
+  active_version?: string;
+  active_digest?: string;
+  candidate_version: string;
+  candidate_digest: string;
+  summary: PriceDiffSummary;
+  entries: PriceEntryDiff[];
+}
+
+export interface PriceCatalogPreview {
+  candidate: PriceCatalog;
+  state: CatalogState;
+  diff: PriceCatalogDiff;
+  can_activate: boolean;
+}
+
+export interface PriceCatalogImportResult {
+  catalog: PriceCatalog;
+  imported: boolean;
+  state: CatalogState;
+}
+
+export type MonitorHealth =
+  | 'healthy'
+  | 'degraded'
+  | 'unavailable'
+  | 'unprobed'
+  | 'suspect'
+  | 'cooling'
+  | 'recovering'
+  | 'disabled'
+  | 'model_disabled'
+  | 'no_credentials'
+  | 'unsupported'
+  | 'skipped';
+
+export interface MonitorSetting {
+  enabled: boolean;
+  intervalMs: number;
+  historyLimit: number;
+  nextProbeAt: number;
+  lastProbeStartedAt: number | null;
+  lastProbeFinishedAt: number | null;
+  busy: boolean;
+  revision: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface RoutingHealth {
+  phase: string;
+  capability: string;
+  consecutiveFailures: number;
+  failureWindowStartedAt: number | null;
+  lastFailureAt: number | null;
+  lastSuccessAt: number | null;
+  cooldownUntil: number | null;
+  halfOpenLeaseUntil: number | null;
+  lastEventAt: number | null;
+  lastFailureKind: string;
+  providerTargetRevision: number;
+  stateVersion: number;
+  updatedAt: number;
+}
+
+export interface MonitorProbePoint {
+  id?: number;
+  runId: string;
+  providerModelTargetRevision: number;
+  outcome: 'success' | 'failure' | 'skipped';
+  permitMode: string;
+  permitReason: string;
+  httpStatus: number | null;
+  failureKind: string;
+  errorCode: string;
+  totalLatencyMs: number;
+  firstOutputMs: number | null;
+  startedAt: number;
+  finishedAt: number;
+  healthApplied: boolean;
+  healthApplyReason: string;
+  healthErrorCode: string;
+}
+
+export interface MonitorTarget {
+  publishedModelTargetId: number;
+  publishedModelTargetRevision: number;
+  providerModelTargetId: number;
+  providerModelTargetRevision: number;
+  position: number;
+  siteId: number;
+  siteName: string;
+  endpointId: number;
+  endpointName: string;
+  sourceModel: string;
+  wireProtocol: WireProtocol;
+  apiSurface: InferenceSurface;
+  enabled: boolean;
+  usableCredentialCount: number;
+  credentialId?: number;
+  credentialName?: string;
+  status: MonitorHealth;
+  successes: number;
+  failures: number;
+  skipped: number;
+  successBasisPoints: number;
+  latest: MonitorProbePoint | null;
+  statusBar: MonitorProbePoint[];
+  health: RoutingHealth | null;
+}
+
+export interface MonitorModel {
+  publishedModelId: number;
+  publicModel: string;
+  officialPriceSku: string;
+  publishedModelEnabled: boolean;
+  publishedModelRevision: number;
+  status: MonitorHealth;
+  monitor: MonitorSetting;
+  targets: MonitorTarget[];
+  successes: number;
+  failures: number;
+  skipped: number;
+  successBasisPoints: number;
+}
+
+export interface MonitorSnapshot {
+  items: MonitorModel[];
+}
+
+export interface MonitorTargetIdentity {
+  publishedModelTargetId: number;
+  providerModelTargetId: number;
+  position: number;
+  siteId: number;
+  siteName: string;
+  endpointId: number;
+  endpointName: string;
+  sourceModel: string;
+  wireProtocol: WireProtocol;
+  apiSurface: InferenceSurface;
+}
+
+export interface MonitorTargetHistory {
+  publishedModelId: number;
+  publicModel: string;
+  target: MonitorTargetIdentity;
+  status: MonitorHealth;
+  successes: number;
+  failures: number;
+  skipped: number;
+  total: number;
+  attempted: number;
+  successBasisPoints: number;
+  health: RoutingHealth | null;
+  order: 'oldest_first';
+  items: MonitorProbePoint[];
+}
+
+export interface GatewayLogAttempt {
+  id: number;
+  attemptIndex: number;
+  publishedModelTargetId: number;
+  publishedModelTargetRevision: number;
+  providerModelTargetId: number;
+  providerModelTargetRevision: number;
+  siteId: number;
+  siteName: string;
+  endpointId: number;
+  endpointName: string;
+  credentialId: number;
+  credentialName: string;
+  sourceModel: string;
+  responseModel: string;
+  wireProtocol: WireProtocol;
+  apiSurface: InferenceSurface;
+  status: string;
+  httpStatus: number | null;
+  failureKind: string;
+  errorCode: string;
+  switchReason: string;
+  durationMs: number | null;
+  firstOutputMs: number | null;
+  startedAt: number;
+  finishedAt: number;
+}
+
+export interface GatewayRouteCredentialSnapshot {
+  id: number;
+  name: string;
+  position: number;
+  runtimeState: string;
+  coolingUntil: number | null;
+}
+
+export interface GatewayRouteCandidate {
+  position: number;
+  publishedModelTargetId: number;
+  publishedModelTargetRevision: number;
+  providerModelTargetId: number;
+  providerModelTargetRevision: number;
+  siteId: number;
+  siteName: string;
+  endpointId: number;
+  endpointName: string;
+  sourceModel: string;
+  wireProtocol: WireProtocol;
+  apiSurface: InferenceSurface;
+  credentials: GatewayRouteCredentialSnapshot[];
+  initialEligibility: string;
+  initialReason: string;
+  disposition: string;
+  dispositionReason: string;
+  attemptCount: number;
+  firstAttemptIndex: number | null;
+  lastAttemptIndex: number | null;
+}
+
+export type GatewayMeteringStatus = 'pending' | 'metered' | 'unavailable' | 'not_applicable';
+
+export interface GatewayQuotaLedgerEvent {
+  id: number;
+  eventType: string;
+  reservedDeltaNanoUSD: number;
+  usedDeltaNanoUSD: number;
+  priceCatalogVersion: string;
+  priceSKU: string;
   createdAt: number;
 }
 
-export interface RequestLogDetail extends RequestLogListItem {
-  attempts: RequestLogAttemptDetail[];
-}
-
-export interface RequestLogPage {
-  items: RequestLogListItem[];
-  nextCursor: RequestLogCursor | null;
-  hasMore: boolean;
-}
-
-export interface RequestLogSummary {
-  count: number;
-  successRate: number;
-  costMicroUsd: number;
-  switchRate: number;
-  p50TtftMs: number | null;
-  p95TtftMs: number | null;
-}
-
-export interface RequestLog {
+export interface GatewayLog {
   id: string;
-  startedAt: string;
-  finishedAt?: string | null;
-  downstreamKeyId?: number | null;
+  downstreamKeyId: number;
+  startedAt: number;
+  finishedAt: number | null;
   keyName: string;
-  routeId?: number | null;
-  routeRevision?: number | null;
-  requestedModel: string;
+  publishedModelId: number;
+  publishedModelRevision: number;
+  effectiveRoutingProfileId: number;
+  effectiveRoutingProfileName: string;
+  sourceRoutingProfileId: number;
+  sourceRoutingProfileName: string;
+  routeRevision: number;
+  publicModel: string;
   actualModel: string;
-  status: 'running' | 'success' | 'failed';
-  httpStatus?: number | null;
-  stream?: boolean;
+  surface: InferenceSurface;
+  reasoningEffort: string;
+  thinkingBudgetTokens: number | null;
+  status: string;
+  meteringStatus: GatewayMeteringStatus;
+  meteringErrorCode: string;
+  httpStatus: number | null;
+  stream: boolean;
+  firstOutputMs: number | null;
   durationMs: number | null;
-  ttftMs: number | null;
   inputTokens: number | null;
-  cacheTokens: number | null;
   outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  cacheWrite5mTokens: number | null;
+  cacheWrite1hTokens: number | null;
   reasoningTokens: number | null;
-  costUsd: number;
+  priceCatalogVersion: string;
+  priceSKU: string;
+  reservationNanoUSD: number;
+  billingMultiplier: number;
+  officialCostNanoUSD: number;
+  chargedNanoUSD: number;
+  quotaCapped: boolean;
+  errorCode: string;
   switchCount: number;
-  reasoningEffort?: string;
-  thinkingBudget?: number | null;
-  errorMessage?: string | null;
-  priceSnapshot?: string | null;
-  attempts?: RequestAttempt[];
+  finalAttempt: GatewayLogAttempt | null;
+  routeCandidates: GatewayRouteCandidate[];
+  attempts: GatewayLogAttempt[];
+  ledger: GatewayQuotaLedgerEvent[];
+}
+
+export interface GatewayLogPage {
+  items: GatewayLog[];
+  hasMore: boolean;
+  nextCursor: string;
+}
+
+export interface GatewayLogSummary {
+  requests: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+  running: number;
+  successBasisPoints: number;
+  totalChargedNanoUsd: number;
+  totalOfficialNanoUsd: number;
+  totalAttempts: number;
+  requestsWithSwitches: number;
+  averageDurationMs: number | null;
+  p50DurationMs: number | null;
+  p95DurationMs: number | null;
+  p50FirstOutputMs: number | null;
+  p95FirstOutputMs: number | null;
 }
 
 export interface GatewaySettings {
-  probeIntervalSeconds: number;
   failureThreshold: number;
-  failureWindowSeconds: number;
-  cooldownSeconds: number;
-  firstOutputTimeoutSeconds: number;
-  streamIdleTimeoutSeconds: number;
-  requestTimeoutSeconds: number;
+  failureWindowMs: number;
+  cooldownMs: number;
+  probeIntervalMs: number;
+  firstOutputTimeoutMs: number;
+  streamIdleTimeoutMs: number;
+  requestTimeoutMs: number;
   maxAttempts: number;
   logRetentionDays: number;
-  priceCatalogVersion: string;
-  priceCatalogUpdatedAt: string;
-  priceCatalogSource: string;
-  lastBackupAt: string | null;
-}
-
-export interface DashboardSummary {
-  monitoredModels: number;
-  healthyModels: number;
-  attentionTargets: number;
-  coolingTargets: number;
-  successRate24h: number;
-  requests24h: number;
-}
-
-export interface CreateUpstreamInput {
-  name: string;
-  baseUrl: string;
-  protocol: Protocol;
-  apiKey: string;
-}
-
-export interface UpdateUpstreamInput {
-  name: string;
-  baseUrl: string;
-  protocol: Protocol;
-  enabled: boolean;
-  apiKey?: string;
-}
-
-export interface CreateKeyInput {
-  name: string;
-  quotaUsd: number | null;
-  allowedModels: string[];
-  routingProfileId: number | null;
-  rpmLimit: number | null;
-  expiresAt: string | null;
-}
-
-export interface CreateRouteInput {
-  model: string;
-  displayName?: string;
-  monitored: boolean;
-  targets: Array<{
-    upstreamId: number;
-    sourceModel: string;
-  }>;
-}
-
-export interface UpdateRouteInput {
-  model?: string;
-  displayName?: string;
-  enabled?: boolean;
-  monitored?: boolean;
-  targetModelIds?: number[];
-}
-
-export interface UpdateKeyInput {
-  name?: string;
-  enabled?: boolean;
-  quotaUsd?: number;
-  clearQuota?: boolean;
-  rpmLimit?: number;
-  allowedModels?: string[];
-  routingProfileId?: number;
-  clearRoutingProfile?: boolean;
-  expiresAt?: string;
+  revision: number;
 }

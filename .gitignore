@@ -40,4 +40,5 @@ Desktop.ini
 
 # Temporary files
 tmp/
+docs/plans/
 *.log
