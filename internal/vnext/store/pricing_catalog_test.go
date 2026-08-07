@@ -163,7 +163,7 @@ func TestTieredOfficialPriceCatalogIsImmutableAndRestartSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	catalog := storeOfficialCatalog("tiered-prices", "2", now)
-	catalog.Entries[0].LongContext = &pricing.LongContextTier{ThresholdTokens: 272_000, Rates: []pricing.Rate{
+	catalog.Entries[0].LongContext = &pricing.LongContextTier{ThresholdTokens: 272_000, ThresholdInclusive: true, Rates: []pricing.Rate{
 		{Class: pricing.TokenInput, NativePricePerMillion: "4"},
 		{Class: pricing.TokenOutput, NativePricePerMillion: "12"},
 	}}
@@ -182,6 +182,7 @@ func TestTieredOfficialPriceCatalogIsImmutableAndRestartSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	if loaded.Entries[0].LongContext == nil || loaded.Entries[0].LongContext.ThresholdTokens != 272_000 ||
+		!loaded.Entries[0].LongContext.ThresholdInclusive ||
 		len(loaded.Entries[0].LongContext.Rates) != 2 ||
 		loaded.Entries[0].LongContext.Rates[0].NanoUSDPerMillion != 4_000_000_000 {
 		t.Fatalf("loaded tiered catalog = %+v", loaded)
@@ -208,15 +209,15 @@ INSERT INTO price_catalog_long_context_rates(
 	if err != nil {
 		t.Fatal(err)
 	}
-	short, err := book.Charge(catalog.Version, "model-a", pricing.Usage{pricing.TokenInput: 272_000})
+	short, err := book.Charge(catalog.Version, "model-a", pricing.Usage{pricing.TokenInput: 271_999})
 	if err != nil {
 		t.Fatal(err)
 	}
-	long, err := book.Charge(catalog.Version, "model-a", pricing.Usage{pricing.TokenInput: 272_001})
+	long, err := book.Charge(catalog.Version, "model-a", pricing.Usage{pricing.TokenInput: 272_000})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if short.NanoUSD != 544_000_000 || long.NanoUSD != 1_088_004_000 {
+	if short.NanoUSD != 543_998_000 || long.NanoUSD != 1_088_000_000 {
 		t.Fatalf("restart tiered charges = %d/%d", short.NanoUSD, long.NanoUSD)
 	}
 }
@@ -243,7 +244,7 @@ applied_at INTEGER NOT NULL
 			t.Fatal(err)
 		}
 	}
-	now := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
 	flat, err := pricing.PrepareOfficialCatalog(storeOfficialCatalog("historical-flat", "2", now))
 	if err != nil {
 		t.Fatal(err)
@@ -306,7 +307,7 @@ INSERT INTO price_catalog_rates(
 		t.Fatalf("historical digest after migration = %q, %v", prepared.Digest, err)
 	}
 	var version int
-	if err := upgraded.DB.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 16 {
+	if err := upgraded.DB.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 17 {
 		t.Fatalf("upgraded migration version = %d, %v", version, err)
 	}
 }
@@ -314,7 +315,7 @@ INSERT INTO price_catalog_rates(
 func TestRuntimePriceServiceAppliesActivationWithoutRestart(t *testing.T) {
 	ctx := context.Background()
 	storage := openTestStoreAt(t, filepath.Join(t.TempDir(), "runtime-pricing.db"))
-	now := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
 	setup, err := pricing.NewService(storage, pricing.WithClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
@@ -379,7 +380,7 @@ func TestRuntimePriceServiceAppliesActivationWithoutRestart(t *testing.T) {
 func TestRuntimePriceServiceBootstrapsBuiltinCatalogExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "builtin-pricing.db")
-	now := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
 	storage := openTestStoreAt(t, path)
 	service, err := pricing.NewRuntimeService(ctx, storage, pricing.WithClock(func() time.Time { return now }))
 	if err != nil {
@@ -419,7 +420,7 @@ func TestRuntimePriceServiceBootstrapsBuiltinCatalogExactlyOnce(t *testing.T) {
 func TestRuntimePriceServiceRecoversBuiltinImportBeforeActivation(t *testing.T) {
 	ctx := context.Background()
 	storage := openTestStoreAt(t, filepath.Join(t.TempDir(), "builtin-recovery.db"))
-	now := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
 	setup, err := pricing.NewService(storage, pricing.WithClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)

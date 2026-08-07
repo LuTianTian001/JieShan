@@ -8,17 +8,19 @@ import (
 )
 
 const (
-	BuiltinOfficialCatalogVersion = "official-usd-2026-08-06-v3"
+	BuiltinOfficialCatalogVersion = "official-usd-2026-08-07-v4"
 	builtinOfficialCatalogSource  = "JieShan bundled official API pricing snapshot"
 	openAILongContextThreshold    = int64(272_000)
+	xAILongContextThreshold       = int64(200_000)
 
 	openAIOfficialPricingURL    = "https://developers.openai.com/api/docs/pricing"
 	anthropicOfficialPricingURL = "https://platform.claude.com/docs/en/about-claude/pricing"
 	geminiOfficialPricingURL    = "https://ai.google.dev/gemini-api/docs/pricing"
 	deepSeekOfficialPricingURL  = "https://api-docs.deepseek.com/quick_start/pricing/"
+	xAIOfficialPricingURL       = "https://docs.x.ai/developers/pricing"
 )
 
-var builtinOfficialVerifiedAt = time.Date(2026, time.August, 6, 0, 0, 0, 0, time.UTC)
+var builtinOfficialVerifiedAt = time.Date(2026, time.August, 7, 0, 0, 0, 0, time.UTC)
 
 // These canonical evidence records are intentionally stored beside the
 // catalog. Their SHA-256 digests prove exactly which official price facts were
@@ -83,6 +85,13 @@ deepseek-v4-flash=input_cache_miss:0.14,input_cache_hit:0.0028,output:0.28
 deepseek-v4-pro=input_cache_miss:0.435,input_cache_hit:0.003625,output:0.87
 notice=official page states that a future price increase is planned but not yet specified`
 
+const xAIPricingEvidence = `source=https://docs.x.ai/developers/pricing
+verified_at=2026-08-07
+currency=USD
+basis=API text-token prices per 1M tokens
+long_context_rule=prompt tokens >=200000 applies higher-context rates to the whole request
+grok-4.5=input:2.00,cached_input:0.30,output:6.00,reasoning:6.00;long=input:4.00,cached_input:0.60,output:12.00,reasoning:12.00`
+
 // BuiltinOfficialUSDCatalog returns a fresh copy of the immutable catalog
 // bundled with this binary. A new version must be created for every factual
 // price change; callers must never mutate an already-imported version.
@@ -91,6 +100,7 @@ func BuiltinOfficialUSDCatalog() Catalog {
 	anthropicDigest := evidenceDigest(anthropicPricingEvidence)
 	geminiDigest := evidenceDigest(geminiPricingEvidence)
 	deepSeekDigest := evidenceDigest(deepSeekPricingEvidence)
+	xAIDigest := evidenceDigest(xAIPricingEvidence)
 	entries := []Entry{
 		openAITieredEntry("gpt-5.6-sol", "5.00", "0.50", "6.25", "30.00", "10.00", "1.00", "12.50", "45.00", openAIDigest),
 		openAITieredEntry("gpt-5.6-terra", "2.00", "0.20", "2.50", "12.00", "4.00", "0.40", "5.00", "18.00", openAIDigest),
@@ -128,6 +138,7 @@ func BuiltinOfficialUSDCatalog() Catalog {
 		geminiEntry("gemini-3.5-flash-lite", "0.30", "0.03", "2.50", geminiDigest),
 		deepSeekEntry("deepseek-v4-flash", "0.14", "0.0028", "0.28", deepSeekDigest),
 		deepSeekEntry("deepseek-v4-pro", "0.435", "0.003625", "0.87", deepSeekDigest),
+		xAIEntry("grok-4.5", "2.00", "0.30", "6.00", "4.00", "0.60", "12.00", xAIDigest),
 	}
 	return Catalog{
 		SchemaVersion:      OfficialSchemaVersion,
@@ -135,7 +146,7 @@ func BuiltinOfficialUSDCatalog() Catalog {
 		SettlementCurrency: SettlementCurrencyUSD,
 		Source:             builtinOfficialCatalogSource,
 		SourceDigest: evidenceDigest(strings.Join([]string{
-			openAIPricingEvidence, anthropicPricingEvidence, geminiPricingEvidence, deepSeekPricingEvidence,
+			openAIPricingEvidence, anthropicPricingEvidence, geminiPricingEvidence, deepSeekPricingEvidence, xAIPricingEvidence,
 		}, "\n---\n")),
 		FetchedAt:   builtinOfficialVerifiedAt,
 		VerifiedAt:  builtinOfficialVerifiedAt,
@@ -199,6 +210,16 @@ func deepSeekEntry(sku, input, cacheRead, output, sourceDigest string) Entry {
 		builtinRate(TokenOutput, output),
 		builtinRate(TokenReasoning, output),
 	})
+}
+
+func xAIEntry(sku, input, cacheRead, output, longInput, longCacheRead, longOutput, sourceDigest string) Entry {
+	entry := builtinUSDEntry(sku, "xai", xAIOfficialPricingURL, sourceDigest, openAIRates(input, cacheRead, "", output, true))
+	entry.LongContext = &LongContextTier{
+		ThresholdTokens:    xAILongContextThreshold,
+		ThresholdInclusive: true,
+		Rates:              openAIRates(longInput, longCacheRead, "", longOutput, true),
+	}
+	return entry
 }
 
 func builtinUSDEntry(sku, provider, sourceURL, sourceDigest string, rates []Rate) Entry {

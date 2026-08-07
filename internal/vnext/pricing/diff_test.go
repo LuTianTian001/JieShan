@@ -31,6 +31,7 @@ func TestDiffCatalogsReportsLongContextTierChangesSeparately(t *testing.T) {
 	changed := candidate
 	changed.Entries = cloneCatalog(candidate).Entries
 	changed.Entries[0].LongContext.ThresholdTokens = 300_000
+	changed.Entries[0].LongContext.ThresholdInclusive = true
 	changed.Entries[0].LongContext.Rates[0].NanoUSDPerMillion = 5
 	diff = DiffCatalogs(&candidate, changed)
 	if diff.Summary.ChangedEntries != 1 || len(diff.Entries) != 1 || diff.Entries[0].LongContext == nil {
@@ -38,8 +39,19 @@ func TestDiffCatalogsReportsLongContextTierChangesSeparately(t *testing.T) {
 	}
 	longContext := diff.Entries[0].LongContext
 	if longContext.Kind != "changed" || longContext.BeforeThresholdTokens != 272_000 ||
-		longContext.AfterThresholdTokens != 300_000 || len(longContext.Rates) != 1 ||
+		longContext.AfterThresholdTokens != 300_000 || longContext.BeforeThresholdInclusive ||
+		!longContext.AfterThresholdInclusive || len(longContext.Rates) != 1 ||
 		longContext.Rates[0].Class != TokenInput || longContext.Rates[0].Kind != "changed" {
 		t.Fatalf("changed long-context details = %+v", longContext)
+	}
+
+	inclusiveOnly := candidate
+	inclusiveOnly.Entries = cloneCatalog(candidate).Entries
+	inclusiveOnly.Entries[0].LongContext.ThresholdInclusive = true
+	diff = DiffCatalogs(&candidate, inclusiveOnly)
+	if diff.Summary.ChangedEntries != 1 || len(diff.Entries) != 1 ||
+		diff.Entries[0].LongContext == nil || !diff.Entries[0].LongContext.AfterThresholdInclusive ||
+		len(diff.Entries[0].LongContext.Rates) != 0 {
+		t.Fatalf("inclusive-only long-context diff = %+v", diff)
 	}
 }

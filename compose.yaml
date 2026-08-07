@@ -1,7 +1,7 @@
 services:
   jieshan:
     image: ${JIESHAN_IMAGE:-ghcr.io/lutiantian001/jieshan:latest}
-    container_name: jieshan
+    container_name: ${JIESHAN_CONTAINER_NAME:-jieshan}
     restart: unless-stopped
     init: true
     ports:
@@ -74,4 +74,4 @@ services:
 
 volumes:
   jieshan-data:
-    name: jieshan-data
+    name: ${JIESHAN_DATA_VOLUME:-jieshan-data}

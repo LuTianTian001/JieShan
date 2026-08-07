@@ -81,7 +81,8 @@ FROM price_catalogs WHERE version=? AND sealed=1`, version).Scan(
 
 	rows, err := s.DB.QueryContext(ctx, `
 SELECT sku,provider,model_pattern,pricing_basis,verification_status,source_url,
-       source_digest,verified_at,native_currency,usd_per_native_unit,long_context_threshold_tokens
+       source_digest,verified_at,native_currency,usd_per_native_unit,
+       long_context_threshold_tokens,long_context_threshold_inclusive
 FROM price_catalog_entries WHERE catalog_version=? ORDER BY position,sku`, version)
 	if err != nil {
 		return pricing.Catalog{}, err
@@ -90,17 +91,22 @@ FROM price_catalog_entries WHERE catalog_version=? ORDER BY position,sku`, versi
 		var entry pricing.Entry
 		var entryVerifiedAt int64
 		var longContextThreshold sql.NullInt64
+		var longContextThresholdInclusive int
 		if err := rows.Scan(
 			&entry.SKU, &entry.Provider, &entry.ModelPattern, &entry.PricingBasis,
 			&entry.VerificationStatus, &entry.SourceURL, &entry.SourceDigest,
-			&entryVerifiedAt, &entry.NativeCurrency, &entry.USDPerNativeUnit, &longContextThreshold,
+			&entryVerifiedAt, &entry.NativeCurrency, &entry.USDPerNativeUnit,
+			&longContextThreshold, &longContextThresholdInclusive,
 		); err != nil {
 			_ = rows.Close()
 			return pricing.Catalog{}, err
 		}
 		entry.VerifiedAt = timeFromMS(entryVerifiedAt)
 		if longContextThreshold.Valid {
-			entry.LongContext = &pricing.LongContextTier{ThresholdTokens: longContextThreshold.Int64}
+			entry.LongContext = &pricing.LongContextTier{
+				ThresholdTokens:    longContextThreshold.Int64,
+				ThresholdInclusive: longContextThresholdInclusive == 1,
+			}
 		}
 		catalog.Entries = append(catalog.Entries, entry)
 	}
@@ -235,11 +241,12 @@ INSERT INTO price_catalogs(
 INSERT INTO price_catalog_entries(
   catalog_version,sku,provider,model_pattern,pricing_basis,verification_status,
   source_url,source_digest,verified_at,native_currency,usd_per_native_unit,
-  long_context_threshold_tokens,position
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  long_context_threshold_tokens,long_context_threshold_inclusive,position
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			catalog.Version, entry.SKU, entry.Provider, entry.ModelPattern, entry.PricingBasis,
 			entry.VerificationStatus, entry.SourceURL, entry.SourceDigest, entry.VerifiedAt.UnixMilli(),
-			entry.NativeCurrency, entry.USDPerNativeUnit, longContextThreshold(entry.LongContext), entryPosition,
+			entry.NativeCurrency, entry.USDPerNativeUnit, longContextThreshold(entry.LongContext),
+			longContextThresholdInclusive(entry.LongContext), entryPosition,
 		)
 		if err != nil {
 			return pricing.RepositoryImportResult{}, fmt.Errorf("insert price entry %q: %w", entry.SKU, err)
@@ -343,6 +350,13 @@ func longContextThreshold(tier *pricing.LongContextTier) any {
 		return nil
 	}
 	return tier.ThresholdTokens
+}
+
+func longContextThresholdInclusive(tier *pricing.LongContextTier) int {
+	if tier != nil && tier.ThresholdInclusive {
+		return 1
+	}
+	return 0
 }
 
 func timeFromMS(value int64) time.Time {

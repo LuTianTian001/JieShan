@@ -30,10 +30,12 @@ type EntryDiff struct {
 }
 
 type LongContextDiff struct {
-	Kind                  string     `json:"kind"`
-	BeforeThresholdTokens int64      `json:"before_threshold_tokens,omitempty"`
-	AfterThresholdTokens  int64      `json:"after_threshold_tokens,omitempty"`
-	Rates                 []RateDiff `json:"rates,omitempty"`
+	Kind                     string     `json:"kind"`
+	BeforeThresholdTokens    int64      `json:"before_threshold_tokens,omitempty"`
+	AfterThresholdTokens     int64      `json:"after_threshold_tokens,omitempty"`
+	BeforeThresholdInclusive bool       `json:"before_threshold_inclusive,omitempty"`
+	AfterThresholdInclusive  bool       `json:"after_threshold_inclusive,omitempty"`
+	Rates                    []RateDiff `json:"rates,omitempty"`
 }
 
 type RateDiff struct {
@@ -116,21 +118,27 @@ func diffLongContext(before, after *LongContextTier) *LongContextDiff {
 	case before == nil:
 		return &LongContextDiff{
 			Kind: "added", AfterThresholdTokens: after.ThresholdTokens,
-			Rates: diffRates(nil, after.Rates),
+			AfterThresholdInclusive: after.ThresholdInclusive,
+			Rates:                   diffRates(nil, after.Rates),
 		}
 	case after == nil:
 		return &LongContextDiff{
 			Kind: "removed", BeforeThresholdTokens: before.ThresholdTokens,
-			Rates: diffRates(before.Rates, nil),
+			BeforeThresholdInclusive: before.ThresholdInclusive,
+			Rates:                    diffRates(before.Rates, nil),
 		}
 	default:
 		rates := diffRates(before.Rates, after.Rates)
-		if before.ThresholdTokens == after.ThresholdTokens && len(rates) == 0 {
+		if before.ThresholdTokens == after.ThresholdTokens &&
+			before.ThresholdInclusive == after.ThresholdInclusive && len(rates) == 0 {
 			return nil
 		}
 		return &LongContextDiff{
 			Kind: "changed", BeforeThresholdTokens: before.ThresholdTokens,
-			AfterThresholdTokens: after.ThresholdTokens, Rates: rates,
+			AfterThresholdTokens:     after.ThresholdTokens,
+			BeforeThresholdInclusive: before.ThresholdInclusive,
+			AfterThresholdInclusive:  after.ThresholdInclusive,
+			Rates:                    rates,
 		}
 	}
 }

@@ -27,7 +27,11 @@ ARG BUILD_DATE=unknown
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}" \
-    -o /out/jieshan ./cmd/jieshan
+    -o /out/jieshan ./cmd/jieshan \
+    && CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/jieshan-migrate ./cmd/jieshan-migrate
 
 FROM alpine:3.22 AS runtime
 
@@ -39,6 +43,7 @@ RUN apk add --no-cache ca-certificates tzdata \
 
 WORKDIR /app
 COPY --from=api-build --chown=jieshan:jieshan /out/jieshan /app/jieshan
+COPY --from=api-build --chown=jieshan:jieshan /out/jieshan-migrate /app/jieshan-migrate
 COPY --from=web-build --chown=jieshan:jieshan /src/web/dist /app/web
 
 ENV JIESHAN_LISTEN_ADDR=:4000 \

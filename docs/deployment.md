@@ -83,6 +83,19 @@ The image defaults to `ghcr.io/lutiantian001/jieshan:latest`. For controlled
 production upgrades, replace `latest` with a released version or immutable
 commit-SHA tag.
 
+`JIESHAN_CONTAINER_NAME` and `JIESHAN_DATA_VOLUME` default to `jieshan` and
+`jieshan-data`. Leave them unchanged for a normal single instance. Give both a
+unique value, together with a different `JIESHAN_PORT`, when an isolated VNext
+instance must run beside an older container during legacy acceptance testing:
+
+```dotenv
+JIESHAN_CONTAINER_NAME=jieshan-vnext
+JIESHAN_DATA_VOLUME=jieshan-vnext-data
+JIESHAN_PORT=4001
+```
+
+The two instances must never mount the same writable data volume.
+
 You can initialize a new data volume with explicit credentials:
 
 ```dotenv
@@ -171,10 +184,11 @@ Verify process health, logs, and resource use:
 ```bash
 curl --fail http://127.0.0.1:4000/healthz
 docker compose logs --tail=100 jieshan
-docker stats --no-stream jieshan
-docker inspect jieshan --format \
+CONTAINER_ID="$(docker compose ps -q jieshan)"
+docker stats --no-stream "$CONTAINER_ID"
+docker inspect "$CONTAINER_ID" --format \
   'memory={{.HostConfig.Memory}} memory_swap={{.HostConfig.MemorySwap}} nano_cpus={{.HostConfig.NanoCpus}} pids={{.HostConfig.PidsLimit}}'
-docker inspect jieshan --format '{{json .State.Health}}'
+docker inspect "$CONTAINER_ID" --format '{{json .State.Health}}'
 ```
 
 For the supplied profile, Docker reports approximately 805306368 bytes of
@@ -242,9 +256,12 @@ A short maintenance window is the simplest consistent volume backup:
 
 ```bash
 mkdir -p backups
+CONTAINER_ID="$(docker compose ps -q jieshan)"
+DATA_VOLUME="$(docker inspect "$CONTAINER_ID" --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}')"
+test -n "$DATA_VOLUME"
 docker compose stop jieshan
 docker run --rm \
-  -v jieshan-data:/data:ro \
+  -v "$DATA_VOLUME:/data:ro" \
   -v "$PWD/backups:/backup" \
   alpine:3.22 \
   sh -c 'tar czf /backup/jieshan-$(date +%Y%m%d-%H%M%S).tar.gz -C /data .'

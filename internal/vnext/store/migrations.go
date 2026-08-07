@@ -34,6 +34,9 @@ var firstOutputTimeoutDefaultMigrationSQL string
 //go:embed schema/0016_hourly_reservation_repair.sql
 var hourlyReservationRepairMigrationSQL string
 
+//go:embed schema/0017_price_threshold_inclusive.sql
+var priceThresholdInclusiveMigrationSQL string
+
 var migrations = []migration{
 	{
 		version: 1,
@@ -859,6 +862,11 @@ CREATE INDEX admin_sessions_user_seen_idx ON admin_sessions(admin_user_id, last_
 		version: 16,
 		name:    "vnext_hourly_reservation_repair_v1",
 		sql:     hourlyReservationRepairMigrationSQL,
+	},
+	{
+		version: 17,
+		name:    "vnext_price_threshold_inclusive_v1",
+		sql:     priceThresholdInclusiveMigrationSQL,
 	},
 }
 

@@ -268,6 +268,15 @@ func TestPrepareOfficialCatalogFreezesAndCanonicalizesLongContextRates(t *testin
 	if digest == prepared.Digest {
 		t.Fatal("long-context threshold was omitted from the canonical digest")
 	}
+	changedInclusive := cloneCatalog(prepared)
+	changedInclusive.Entries[0].LongContext.ThresholdInclusive = true
+	digest, err = CatalogDigest(changedInclusive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest == prepared.Digest {
+		t.Fatal("long-context threshold comparison was omitted from the canonical digest")
+	}
 }
 
 func TestSchemaV1FlatCatalogEncodingAndDigestRemainStable(t *testing.T) {

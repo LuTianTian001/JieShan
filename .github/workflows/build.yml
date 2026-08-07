@@ -71,7 +71,19 @@ jobs:
       - name: Compile backend
         env:
           CGO_ENABLED: "0"
-        run: go build -trimpath -o /tmp/jieshan ./cmd/jieshan
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go build -trimpath -o /tmp/jieshan ./cmd/jieshan
+          go build -trimpath -o /tmp/jieshan-migrate ./cmd/jieshan-migrate
+          tar -C /tmp -czf /tmp/jieshan-migrate-linux-amd64.tar.gz jieshan-migrate
+
+      - name: Upload Linux migration tool
+        uses: actions/upload-artifact@v4
+        with:
+          name: jieshan-migrate-linux-amd64
+          path: /tmp/jieshan-migrate-linux-amd64.tar.gz
+          if-no-files-found: error
 
   image:
     name: Build and smoke-test container image
@@ -143,7 +155,8 @@ jobs:
 
           for attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:4000/healthz >/dev/null \
-              && curl --fail --silent http://127.0.0.1:4000/ | grep --quiet --ignore-case '<!doctype html'; then
+              && curl --fail --silent http://127.0.0.1:4000/ | grep --quiet --ignore-case '<!doctype html' \
+              && docker exec jieshan-smoke test -x /app/jieshan-migrate; then
               exit 0
             fi
             sleep 1

@@ -84,17 +84,38 @@ stop old instance
 Never point both processes at the same SQLite file or mount one writable data
 volume into both containers.
 
-Build the migration binary on a machine with Go 1.25 or newer, then run it in a
-maintenance window. `--openai-surface` is mandatory because an older generic
-OpenAI endpoint does not prove whether it should become Chat Completions,
-Responses, or both. Models whose names are not exact built-in official pricing
-SKUs require one or more explicit `--price MODEL=SKU` mappings.
+Every production image contains `/app/jieshan-migrate`, and the CI validate job
+publishes the same tool in the `jieshan-migrate-linux-amd64` artifact as a
+permission-preserving tar archive. It can also be built from source on a machine
+with Go 1.25 or newer. Run the converter only in a maintenance window.
+`--openai-surface` is mandatory because an older generic OpenAI endpoint does
+not prove whether it should become Chat Completions, Responses, or both. Models
+whose names are not exact built-in official pricing SKUs require one or more
+explicit `--price MODEL=SKU` mappings.
 
 ```bash
 read -rsp 'Existing JIESHAN_SECRET_KEY: ' JIESHAN_SECRET_KEY
 echo
 export JIESHAN_SECRET_KEY
 ./jieshan-migrate \
+  --source /migration/legacy.db \
+  --destination /migration/jieshan.sqlite \
+  --openai-surface chat \
+  --price old-public-alias=gpt-4o
+```
+
+To run the copy bundled in the container image, mount a dedicated migration
+directory and override the normal entrypoint. Running with the current host
+user keeps the generated database owned by that user:
+
+```bash
+MIGRATION_IMAGE="$(docker compose config --images | head -n 1)"
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --entrypoint /app/jieshan-migrate \
+  -e JIESHAN_SECRET_KEY \
+  -v "$PWD/migration:/migration" \
+  "$MIGRATION_IMAGE" \
   --source /migration/legacy.db \
   --destination /migration/jieshan.sqlite \
   --openai-surface chat \

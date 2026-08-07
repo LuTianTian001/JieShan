@@ -19,12 +19,12 @@ func TestBuiltinOfficialCatalogIsDeterministicAndSourceBacked(t *testing.T) {
 	if first.Version != BuiltinOfficialCatalogVersion || first.Digest != second.Digest {
 		t.Fatalf("built-in catalog identity is not deterministic: %q/%q and %q/%q", first.Version, first.Digest, second.Version, second.Digest)
 	}
-	const expectedDigest = "sha256:8724268b46b824d17d6c33e0ddb441b9fe49a9eac766f1c2a1e3b2b2863d146f"
+	const expectedDigest = "sha256:25d9ca7aac8c9f56eb8c5c453d081a20bdb40b8b00170b11bb548bb052d5d32f"
 	if first.Digest != expectedDigest {
 		t.Fatalf("built-in catalog changed without a version bump: got %q, want %q", first.Digest, expectedDigest)
 	}
-	if len(first.Entries) != 36 {
-		t.Fatalf("built-in entry count = %d, want 36", len(first.Entries))
+	if len(first.Entries) != 37 {
+		t.Fatalf("built-in entry count = %d, want 37", len(first.Entries))
 	}
 	if first.SourceDigest != evidenceDigest(stringsJoinEvidence()) {
 		t.Fatalf("built-in source digest = %q", first.SourceDigest)
@@ -50,6 +50,10 @@ func TestBuiltinOfficialCatalogIsDeterministicAndSourceBacked(t *testing.T) {
 			if entry.SourceURL != deepSeekOfficialPricingURL {
 				t.Fatalf("DeepSeek source URL = %q", entry.SourceURL)
 			}
+		case "xai":
+			if entry.SourceURL != xAIOfficialPricingURL {
+				t.Fatalf("xAI source URL = %q", entry.SourceURL)
+			}
 		default:
 			t.Fatalf("unexpected built-in provider %q", entry.Provider)
 		}
@@ -74,6 +78,7 @@ func TestBuiltinOfficialCatalogChargesKnownModelsAndRejectsUnknown(t *testing.T)
 		{sku: "claude-sonnet-4-6", usage: Usage{TokenInput: 1_000_000, TokenCacheWrite5m: 1_000_000, TokenCacheRead: 1_000_000, TokenOutput: 1_000_000}, want: 22_050_000_000},
 		{sku: "gemini-3.6-flash", usage: Usage{TokenInput: 1_000_000, TokenCacheRead: 1_000_000, TokenReasoning: 1_000_000}, want: 9_150_000_000},
 		{sku: "deepseek-v4-flash", usage: Usage{TokenInput: 1_000_000, TokenCacheRead: 1_000_000, TokenOutput: 1_000_000}, want: 422_800_000},
+		{sku: "grok-4.5", usage: Usage{TokenInput: 200_000, TokenCacheRead: 200_000, TokenOutput: 1_000_000, TokenReasoning: 1_000_000}, want: 24_920_000_000},
 	}
 	for _, test := range tests {
 		charge, err := book.Charge(catalog.Version, test.sku, test.usage)
@@ -101,6 +106,58 @@ func TestBuiltinOfficialCatalogChargesKnownModelsAndRejectsUnknown(t *testing.T)
 	}
 	if _, err := book.Quote("unknown-model", Usage{TokenInput: 1}); !errors.Is(err, ErrPriceUnavailable) {
 		t.Fatalf("unknown model error = %v", err)
+	}
+}
+
+func TestBuiltinGrok45OfficialRatesAndInclusiveLongContextThreshold(t *testing.T) {
+	catalog, err := PrepareOfficialCatalog(BuiltinOfficialUSDCatalog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry Entry
+	for _, candidate := range catalog.Entries {
+		if candidate.SKU == "grok-4.5" {
+			entry = candidate
+			break
+		}
+	}
+	if entry.SKU == "" || entry.Provider != "xai" || entry.SourceURL != xAIOfficialPricingURL ||
+		entry.SourceDigest != evidenceDigest(xAIPricingEvidence) {
+		t.Fatalf("grok-4.5 evidence = %+v", entry)
+	}
+	if entry.LongContext == nil || entry.LongContext.ThresholdTokens != xAILongContextThreshold ||
+		!entry.LongContext.ThresholdInclusive {
+		t.Fatalf("grok-4.5 long-context tier = %+v", entry.LongContext)
+	}
+	assertNativeRates(t, "grok-4.5 short", entry.Rates, map[TokenClass]string{
+		TokenInput: "2.00", TokenCacheRead: "0.30", TokenOutput: "6.00", TokenReasoning: "6.00",
+	})
+	assertNativeRates(t, "grok-4.5 long", entry.LongContext.Rates, map[TokenClass]string{
+		TokenInput: "4.00", TokenCacheRead: "0.60", TokenOutput: "12.00", TokenReasoning: "12.00",
+	})
+
+	tests := []struct {
+		name  string
+		usage Usage
+		want  int64
+	}{
+		{name: "below threshold input", usage: Usage{TokenInput: 199_999}, want: 399_998_000},
+		{name: "at threshold input", usage: Usage{TokenInput: 200_000}, want: 800_000_000},
+		{name: "below threshold cached input", usage: Usage{TokenCacheRead: 199_999}, want: 59_999_700},
+		{name: "at threshold cached input", usage: Usage{TokenCacheRead: 200_000}, want: 120_000_000},
+		{name: "output does not trigger tier", usage: Usage{TokenOutput: 200_000}, want: 1_200_000_000},
+		{name: "reasoning does not trigger tier", usage: Usage{TokenReasoning: 200_000}, want: 1_200_000_000},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			charge, err := CalculateCharge(catalog.Version, entry, test.usage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if charge.NanoUSD != test.want {
+				t.Fatalf("charge = %d nano-USD, want %d", charge.NanoUSD, test.want)
+			}
+		})
 	}
 }
 
@@ -183,7 +240,7 @@ func assertNativeRates(t *testing.T, label string, rates []Rate, expected map[To
 func TestBuiltinBootstrapDoesNotClaimAConcurrentOperatorActivation(t *testing.T) {
 	repository := &operatorWinsRepository{}
 	service, err := NewService(repository, WithClock(func() time.Time {
-		return time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
+		return time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -198,7 +255,7 @@ func TestBuiltinBootstrapDoesNotClaimAConcurrentOperatorActivation(t *testing.T)
 }
 
 func TestBuiltinBootstrapUpgradesOnlyAnOlderBundledCatalog(t *testing.T) {
-	now := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
 	olderInput := BuiltinOfficialUSDCatalog()
 	olderInput.Version = "official-usd-2026-08-06-v2"
 	older, err := PrepareOfficialCatalog(olderInput)
@@ -245,7 +302,7 @@ func TestBuiltinBootstrapUpgradesOnlyAnOlderBundledCatalog(t *testing.T) {
 }
 
 func stringsJoinEvidence() string {
-	return openAIPricingEvidence + "\n---\n" + anthropicPricingEvidence + "\n---\n" + geminiPricingEvidence + "\n---\n" + deepSeekPricingEvidence
+	return openAIPricingEvidence + "\n---\n" + anthropicPricingEvidence + "\n---\n" + geminiPricingEvidence + "\n---\n" + deepSeekPricingEvidence + "\n---\n" + xAIPricingEvidence
 }
 
 type operatorWinsRepository struct {
@@ -307,7 +364,7 @@ func (repository *memoryCatalogRepository) ActivatePriceCatalog(_ context.Contex
 	}
 	repository.state.ActiveVersion = version
 	repository.state.Revision++
-	repository.state.UpdatedAt = time.Date(2026, time.August, 6, 12, 0, 1, 0, time.UTC)
+	repository.state.UpdatedAt = time.Date(2026, time.August, 7, 12, 0, 1, 0, time.UTC)
 	return repository.state, nil
 }
 
@@ -335,7 +392,7 @@ func (repository *operatorWinsRepository) ActivatePriceCatalog(context.Context, 
 	repository.state = CatalogState{
 		ActiveVersion: "operator-catalog",
 		Revision:      1,
-		UpdatedAt:     time.Date(2026, time.August, 6, 12, 0, 1, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, time.August, 7, 12, 0, 1, 0, time.UTC),
 	}
 	return CatalogState{}, ErrCatalogStateConflict
 }

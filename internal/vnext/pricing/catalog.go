@@ -54,12 +54,14 @@ type Rate struct {
 }
 
 // LongContextTier applies to the whole request when the sum of every
-// input-side token class is strictly greater than ThresholdTokens. Keeping the
-// tier optional preserves the canonical JSON and digest of historical flat
-// schema-v1 catalogs.
+// input-side token class crosses ThresholdTokens. ThresholdInclusive selects
+// greater-than-or-equal comparison; the zero value preserves the historical
+// strictly-greater-than behavior. Keeping the tier optional preserves the
+// canonical JSON and digest of historical flat schema-v1 catalogs.
 type LongContextTier struct {
-	ThresholdTokens int64  `json:"threshold_tokens"`
-	Rates           []Rate `json:"rates"`
+	ThresholdTokens    int64  `json:"threshold_tokens"`
+	ThresholdInclusive bool   `json:"threshold_inclusive,omitempty"`
+	Rates              []Rate `json:"rates"`
 }
 
 type Entry struct {
@@ -441,7 +443,11 @@ func exceedsLongContextThreshold(tier LongContextTier, usage Usage) bool {
 	} {
 		total.Add(total, big.NewInt(usage[class]))
 	}
-	return total.Cmp(big.NewInt(tier.ThresholdTokens)) > 0
+	comparison := total.Cmp(big.NewInt(tier.ThresholdTokens))
+	if tier.ThresholdInclusive {
+		return comparison >= 0
+	}
+	return comparison > 0
 }
 
 func ValidateUsage(usage Usage) error {

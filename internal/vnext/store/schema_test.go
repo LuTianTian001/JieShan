@@ -21,7 +21,7 @@ func TestFreshSchemaIsCanonicalAndHasNoLegacyRoutingSurface(t *testing.T) {
 	if err := s.DB.QueryRowContext(ctx, `SELECT version,name FROM schema_migrations ORDER BY version DESC LIMIT 1`).Scan(&version, &name); err != nil {
 		t.Fatal(err)
 	}
-	if version != 16 || name != "vnext_hourly_reservation_repair_v1" {
+	if version != 17 || name != "vnext_price_threshold_inclusive_v1" {
 		t.Fatalf("migration = %d/%q", version, name)
 	}
 	var prefixIndex string
@@ -60,6 +60,7 @@ func TestFreshSchemaIsCanonicalAndHasNoLegacyRoutingSurface(t *testing.T) {
 	for _, required := range []string{
 		"catalog_version", "sku", "pricing_basis", "verification_status", "source_url",
 		"source_digest", "verified_at", "native_currency", "usd_per_native_unit", "long_context_threshold_tokens",
+		"long_context_threshold_inclusive",
 	} {
 		if _, ok := priceEntryColumns[required]; !ok {
 			t.Fatalf("price_catalog_entries missing %s", required)
