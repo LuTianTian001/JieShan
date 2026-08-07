@@ -52,6 +52,110 @@ func TestServicePersistsAndReportsDeduplicatedUsage(t *testing.T) {
 	}
 }
 
+func TestServicePersistsScheduledUsageWindowProgress(t *testing.T) {
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	repository := &serviceRepositoryFake{connection: testStoredConnection(), usageSave: UsageSaveResult{Inserted: 1}}
+	adapter := &serviceAdapterFake{
+		capabilities: Capabilities{Usage: true},
+		usage: UsagePage{
+			FetchedAt: now, HasMore: true, NextCursor: "3",
+			Records: []UsageRecord{{RemoteID: "one", OccurredAt: now}},
+		},
+	}
+	service := mustService(t, repository, adapter)
+	window := UsageSyncWindow{ID: 41, From: now.Add(-time.Hour), To: now, Cursor: "2"}
+
+	if _, err := service.SyncUsageWindowPage(t.Context(), 7, window, 25); err != nil {
+		t.Fatal(err)
+	}
+	if repository.usageProgress == nil || repository.usageProgress.WindowID != 41 ||
+		repository.usageProgress.ExpectedCursor != "2" {
+		t.Fatalf("usage progress = %+v", repository.usageProgress)
+	}
+	if adapter.usageQuery.Cursor != "2" || adapter.usageQuery.Limit != 25 ||
+		!adapter.usageQuery.From.Equal(window.From) || !adapter.usageQuery.To.Equal(window.To) {
+		t.Fatalf("usage query = %+v", adapter.usageQuery)
+	}
+}
+
+func TestServiceRejectsScheduledUsageCursorThatDoesNotAdvance(t *testing.T) {
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	repository := &serviceRepositoryFake{connection: testStoredConnection()}
+	adapter := &serviceAdapterFake{
+		capabilities: Capabilities{Usage: true},
+		usage:        UsagePage{FetchedAt: now, HasMore: true, NextCursor: "2"},
+	}
+	service := mustService(t, repository, adapter)
+
+	_, err := service.SyncUsageWindowPage(t.Context(), 7, UsageSyncWindow{
+		ID: 41, From: now.Add(-time.Hour), To: now, Cursor: "2",
+	}, 25)
+	if !errors.Is(err, ErrSyncFailed) || repository.usageProgress != nil {
+		t.Fatalf("SyncUsageWindowPage() = %v, progress = %+v", err, repository.usageProgress)
+	}
+}
+
+func TestServiceRejectsSilentlyDroppedUsageRows(t *testing.T) {
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	repository := &serviceRepositoryFake{connection: testStoredConnection()}
+	adapter := &serviceAdapterFake{
+		capabilities: Capabilities{Usage: true},
+		usage:        UsagePage{FetchedAt: now, Records: []UsageRecord{{RemoteID: "one", OccurredAt: now}}},
+	}
+	service := mustService(t, repository, adapter)
+
+	if _, err := service.SyncUsagePage(t.Context(), 7, UsageQuery{Limit: 50}); !errors.Is(err, ErrSyncFailed) {
+		t.Fatalf("SyncUsagePage() error = %v", err)
+	}
+	if len(repository.operations) != 2 || repository.operations[0] != "usage" ||
+		repository.operations[1] != "failure:usage_sync:invalid_persistence_result" {
+		t.Fatalf("operations = %#v", repository.operations)
+	}
+}
+
+func TestServicePersistsRotatedSessionWhenBalanceReadFails(t *testing.T) {
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	repository := &serviceRepositoryFake{connection: testStoredConnection()}
+	adapter := &serviceAdapterFake{
+		capabilities: Capabilities{Balance: true},
+		update:       &SessionUpdate{Changed: true, RefreshedAt: now, Secrets: Secrets{AccessToken: "rotated"}},
+		balanceErr:   errors.New("read failed after refresh"),
+	}
+	service := mustService(t, repository, adapter)
+
+	if _, err := service.RefreshBalance(t.Context(), 7); !errors.Is(err, ErrSyncFailed) {
+		t.Fatalf("RefreshBalance() error = %v", err)
+	}
+	if len(repository.operations) != 2 || repository.operations[0] != "session" ||
+		repository.operations[1] != "failure:balance_refresh:upstream_failed" {
+		t.Fatalf("operations = %#v", repository.operations)
+	}
+}
+
+func TestServicePersistsRotatedSessionWithDetachedContextWhenUsageReadFails(t *testing.T) {
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	repository := &serviceRepositoryFake{connection: testStoredConnection()}
+	adapter := &serviceAdapterFake{
+		capabilities: Capabilities{Usage: true},
+		update:       &SessionUpdate{Changed: true, RefreshedAt: now, Secrets: Secrets{AccessToken: "rotated"}},
+		usageErr:     context.DeadlineExceeded,
+	}
+	service := mustService(t, repository, adapter)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := service.SyncUsagePage(ctx, 7, UsageQuery{Limit: 50}); !errors.Is(err, ErrSyncFailed) {
+		t.Fatalf("SyncUsagePage() error = %v", err)
+	}
+	if len(repository.operations) != 2 || repository.operations[0] != "session" ||
+		repository.operations[1] != "failure:usage_sync:upstream_failed" {
+		t.Fatalf("operations = %#v", repository.operations)
+	}
+	if repository.failureContextCanceled {
+		t.Fatal("usage failure was recorded with the cancelled operation context")
+	}
+}
+
 func TestServiceRejectsAdvertisedButUnavailableCapability(t *testing.T) {
 	repository := &serviceRepositoryFake{connection: testStoredConnection()}
 	adapter := &sessionOnlyAdapter{}
@@ -92,10 +196,12 @@ func TestServiceSerializesOperationsForOneSite(t *testing.T) {
 }
 
 type serviceRepositoryFake struct {
-	mu         sync.Mutex
-	connection StoredConnection
-	usageSave  UsageSaveResult
-	operations []string
+	mu                     sync.Mutex
+	connection             StoredConnection
+	usageSave              UsageSaveResult
+	usageProgress          *UsagePageProgress
+	operations             []string
+	failureContextCanceled bool
 }
 
 func (repository *serviceRepositoryFake) LoadConnection(context.Context, int64) (StoredConnection, error) {
@@ -116,14 +222,28 @@ func (repository *serviceRepositoryFake) SaveBalanceSnapshot(context.Context, in
 	return nil
 }
 
-func (repository *serviceRepositoryFake) SaveUsagePage(context.Context, int64, string, UsagePage) (UsageSaveResult, error) {
+func (repository *serviceRepositoryFake) SaveUsagePage(
+	_ context.Context,
+	_ int64,
+	_ string,
+	_ UsagePage,
+	progress *UsagePageProgress,
+) (UsageSaveResult, error) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	repository.operations = append(repository.operations, "usage")
+	if progress != nil {
+		copy := *progress
+		repository.usageProgress = &copy
+	}
 	return repository.usageSave, nil
 }
 
-func (repository *serviceRepositoryFake) RecordFailure(context.Context, int64, string, string, time.Time) error {
+func (repository *serviceRepositoryFake) RecordFailure(ctx context.Context, _ int64, operation, code string, _ time.Time) error {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	repository.failureContextCanceled = ctx.Err() != nil
+	repository.operations = append(repository.operations, "failure:"+operation+":"+code)
 	return nil
 }
 
@@ -131,7 +251,10 @@ type serviceAdapterFake struct {
 	capabilities  Capabilities
 	balance       BalanceSnapshot
 	usage         UsagePage
+	usageQuery    UsageQuery
 	update        *SessionUpdate
+	balanceErr    error
+	usageErr      error
 	block         chan struct{}
 	entered       chan struct{}
 	active        atomic.Int32
@@ -157,11 +280,12 @@ func (adapter *serviceAdapterFake) ReadBalance(context.Context, Connection) (Bal
 	if adapter.block != nil {
 		<-adapter.block
 	}
-	return adapter.balance, adapter.update, nil
+	return adapter.balance, adapter.update, adapter.balanceErr
 }
 
-func (adapter *serviceAdapterFake) ReadUsage(context.Context, Connection, UsageQuery) (UsagePage, *SessionUpdate, error) {
-	return adapter.usage, adapter.update, nil
+func (adapter *serviceAdapterFake) ReadUsage(_ context.Context, _ Connection, query UsageQuery) (UsagePage, *SessionUpdate, error) {
+	adapter.usageQuery = query
+	return adapter.usage, adapter.update, adapter.usageErr
 }
 
 type sessionOnlyAdapter struct{}

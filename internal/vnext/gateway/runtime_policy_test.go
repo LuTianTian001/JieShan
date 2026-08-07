@@ -8,7 +8,7 @@ import (
 func TestNormalizeRuntimePolicyKeepsRequestBoundariesCoherent(t *testing.T) {
 	defaults := normalizeRuntimePolicy(RuntimePolicy{})
 	if defaults.FirstOutputTimeout != 15*time.Second || defaults.HealthPolicy.FailureThreshold != 2 ||
-		defaults.HealthPolicy.Cooldown != 5*time.Minute {
+		defaults.HealthPolicy.Cooldown != 15*time.Minute {
 		t.Fatalf("gateway defaults = %+v", defaults)
 	}
 

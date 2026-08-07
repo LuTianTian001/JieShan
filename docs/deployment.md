@@ -138,8 +138,8 @@ come from `internal/vnext/store/runtime_settings.go`:
 | --- | ---: |
 | Failure threshold | 2 |
 | Failure window | 5 minutes |
-| Cooldown | 5 minutes |
-| Probe interval | 5 minutes |
+| Cooldown | 15 minutes |
+| Probe interval | 15 minutes |
 | First output timeout | 15 seconds |
 | Stream idle timeout | 60 seconds |
 | Total request timeout | 5 minutes |
@@ -203,7 +203,7 @@ Then verify the product path, not only the process:
 3. Discover or import provider models and publish one model.
 4. Put at least two compatible targets into strict route order when available.
 5. Select that model for monitoring and run its all-target manual probe.
-6. Create a downstream key with a small USD quota and RPM limit.
+6. Create a downstream key with a small USD quota.
 7. Call the appropriate native surface: OpenAI Chat or Responses, Anthropic
    Messages, or Gemini GenerateContent.
 8. Confirm the request log contains the route profile, site, endpoint, API key

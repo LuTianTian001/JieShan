@@ -205,6 +205,25 @@ type UsagePage struct {
 	FetchedAt  time.Time
 }
 
+// UsageSyncWindow freezes one upstream query range while its opaque adapter
+// cursor advances across scheduler cycles.
+type UsageSyncWindow struct {
+	ID     int64
+	From   time.Time
+	To     time.Time
+	Cursor string
+}
+
+func (w UsageSyncWindow) Validate() error {
+	if w.ID <= 0 {
+		return errors.New("usage sync window ID is required")
+	}
+	if w.From.IsZero() || w.To.IsZero() || w.To.Before(w.From) {
+		return errors.New("usage sync window requires a valid time range")
+	}
+	return nil
+}
+
 type SessionUpdate struct {
 	Secrets     Secrets
 	Changed     bool

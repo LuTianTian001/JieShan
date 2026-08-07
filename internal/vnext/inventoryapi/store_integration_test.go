@@ -69,6 +69,9 @@ func TestStoreHandlerSupportsInventoryDiscoveryAndImportWithoutSecretEcho(t *tes
 	}
 	decodeRecorder(t, siteResponseRecorder, &siteEnvelope)
 	siteID := siteEnvelope.Item.ID
+	if siteEnvelope.Item.MaxInFlight != vnextstore.DefaultSiteMaxInFlight {
+		t.Fatalf("default maxInFlight = %d", siteEnvelope.Item.MaxInFlight)
+	}
 
 	endpointRecorder := inventoryRequest(handler, http.MethodPost,
 		"/api/vnext/inventory/sites/"+strconv.FormatInt(siteID, 10)+"/endpoints", `{
@@ -189,6 +192,45 @@ WHERE a.credential_id=? AND p.endpoint_id=? AND p.source_model='model-b'`, crede
 	if string(plaintext) != upstreamSecret {
 		t.Fatalf("decrypted credential = %q", plaintext)
 	}
+}
+
+func TestStoreHandlerDeletesSiteWithRevisionPrecondition(t *testing.T) {
+	storage, err := vnextstore.Open(context.Background(), filepath.Join(t.TempDir(), "vnext.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	box, err := secretbox.New(bytes.Repeat([]byte{0x42}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewStoreHandler(storage, box, vnextprotocol.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	created := inventoryRequest(handler, http.MethodPost, "/api/vnext/inventory/sites", `{
+		"name":"Disposable","dashboardUrl":"https://disposable.example","enabled":true
+	}`, "")
+	requireStatus(t, created, http.StatusCreated)
+	var envelope struct {
+		Item siteResponse `json:"item"`
+	}
+	decodeRecorder(t, created, &envelope)
+	path := "/api/vnext/inventory/sites/" + strconv.FormatInt(envelope.Item.ID, 10)
+
+	missingPrecondition := inventoryRequest(handler, http.MethodDelete, path, "", "")
+	requireStatus(t, missingPrecondition, http.StatusPreconditionRequired)
+	stale := inventoryRequest(handler, http.MethodDelete, path, "", `"2"`)
+	requireStatus(t, stale, http.StatusConflict)
+	requireStatus(t, inventoryRequest(handler, http.MethodGet, path, "", ""), http.StatusOK)
+
+	deleted := inventoryRequest(handler, http.MethodDelete, path, "", created.Header().Get("ETag"))
+	requireStatus(t, deleted, http.StatusNoContent)
+	if deleted.Body.Len() != 0 {
+		t.Fatalf("delete response body = %q", deleted.Body.String())
+	}
+	requireStatus(t, inventoryRequest(handler, http.MethodGet, path, "", ""), http.StatusNotFound)
 }
 
 func inventoryRequest(handler http.Handler, method, path, body, ifMatch string) *httptest.ResponseRecorder {

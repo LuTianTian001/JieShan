@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // SiteUpdate is a complete mutable site snapshot protected by Revision.
@@ -14,6 +15,7 @@ type SiteUpdate struct {
 	Name             string
 	DashboardURL     string
 	Enabled          bool
+	MaxInFlight      int
 }
 
 // SiteEndpointUpdate intentionally excludes encrypted endpoint headers. Those
@@ -62,7 +64,7 @@ type ProviderModelTargetInventory struct {
 }
 
 func (s *Store) ListSites(ctx context.Context) ([]Site, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id,name,dashboard_url,enabled,revision,created_at,updated_at
+	rows, err := s.DB.QueryContext(ctx, `SELECT id,name,dashboard_url,enabled,max_in_flight,revision,created_at,updated_at
 FROM sites ORDER BY name COLLATE NOCASE,id`)
 	if err != nil {
 		return nil, err
@@ -91,21 +93,28 @@ func (s *Store) UpdateSite(ctx context.Context, id int64, input SiteUpdate) (Sit
 	if input.Name == "" {
 		return Site{}, errors.New("site name is required")
 	}
+	if input.MaxInFlight <= 0 {
+		return Site{}, errors.New("site maximum in-flight must be positive")
+	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return Site{}, err
 	}
 	defer tx.Rollback()
+	now := NowMS()
 	result, err := tx.ExecContext(ctx, `UPDATE sites SET
-name=?,dashboard_url=?,enabled=?,revision=revision+1,updated_at=?
-WHERE id=? AND revision=?`, input.Name, nullableString(input.DashboardURL), boolInt(input.Enabled), NowMS(), id, input.ExpectedRevision)
+name=?,dashboard_url=?,enabled=?,max_in_flight=?,revision=revision+1,updated_at=?
+WHERE id=? AND revision=?`, input.Name, nullableString(input.DashboardURL), boolInt(input.Enabled), input.MaxInFlight, now, id, input.ExpectedRevision)
 	if err != nil {
 		return Site{}, normalizeInventoryConflict(err)
 	}
 	if err := requireRevisionChange(ctx, tx, result, `SELECT 1 FROM sites WHERE id=?`, id); err != nil {
 		return Site{}, err
 	}
-	item, err := scanSite(tx.QueryRowContext(ctx, `SELECT id,name,dashboard_url,enabled,revision,created_at,updated_at FROM sites WHERE id=?`, id))
+	if _, err := s.EnqueueConfigRevisionTx(ctx, tx, "site_updated", time.UnixMilli(now)); err != nil {
+		return Site{}, err
+	}
+	item, err := scanSite(tx.QueryRowContext(ctx, `SELECT id,name,dashboard_url,enabled,max_in_flight,revision,created_at,updated_at FROM sites WHERE id=?`, id))
 	if err != nil {
 		return Site{}, err
 	}
@@ -113,6 +122,223 @@ WHERE id=? AND revision=?`, input.Name, nullableString(input.DashboardURL), bool
 		return Site{}, err
 	}
 	return item, nil
+}
+
+// DeleteSite removes one upstream and all of its operational inventory in one
+// transaction. Published models remain as downstream contracts; references to
+// targets owned by the site are removed, and models left without any targets
+// are paused so they cannot resolve to an empty route.
+func (s *Store) DeleteSite(ctx context.Context, id, expectedRevision int64) error {
+	if id <= 0 {
+		return sql.ErrNoRows
+	}
+	if expectedRevision <= 0 {
+		return errors.New("expected site revision is required")
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var currentRevision int64
+	if err := tx.QueryRowContext(ctx, `SELECT revision FROM sites WHERE id=?`, id).Scan(&currentRevision); err != nil {
+		return err
+	}
+	if currentRevision != expectedRevision {
+		return ErrRevisionConflict
+	}
+
+	type routeReference struct {
+		profileID        int64
+		publishedModelID int64
+	}
+	affectedModels := make(map[int64]struct{})
+	modelRows, err := tx.QueryContext(ctx, `SELECT DISTINCT t.published_model_id
+FROM published_model_targets t
+JOIN provider_model_targets p ON p.id=t.provider_model_target_id
+WHERE p.site_id=?`, id)
+	if err != nil {
+		return err
+	}
+	for modelRows.Next() {
+		var modelID int64
+		if err := modelRows.Scan(&modelID); err != nil {
+			modelRows.Close()
+			return err
+		}
+		affectedModels[modelID] = struct{}{}
+	}
+	if err := modelRows.Close(); err != nil {
+		return err
+	}
+	if err := modelRows.Err(); err != nil {
+		return err
+	}
+
+	affectedRoutes := make([]routeReference, 0)
+	affectedProfiles := make(map[int64]struct{})
+	routeRows, err := tx.QueryContext(ctx, `SELECT DISTINCT r.routing_profile_id,r.published_model_id
+FROM routing_profile_route_targets r
+JOIN published_model_targets t ON t.id=r.published_model_target_id
+JOIN provider_model_targets p ON p.id=t.provider_model_target_id
+WHERE p.site_id=?`, id)
+	if err != nil {
+		return err
+	}
+	for routeRows.Next() {
+		var reference routeReference
+		if err := routeRows.Scan(&reference.profileID, &reference.publishedModelID); err != nil {
+			routeRows.Close()
+			return err
+		}
+		affectedRoutes = append(affectedRoutes, reference)
+		affectedProfiles[reference.profileID] = struct{}{}
+	}
+	if err := routeRows.Close(); err != nil {
+		return err
+	}
+	if err := routeRows.Err(); err != nil {
+		return err
+	}
+
+	now := NowMS()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM routing_profile_route_targets
+WHERE published_model_target_id IN (
+  SELECT t.id FROM published_model_targets t
+  JOIN provider_model_targets p ON p.id=t.provider_model_target_id
+  WHERE p.site_id=?
+)`, id); err != nil {
+		return err
+	}
+	for _, reference := range affectedRoutes {
+		result, err := tx.ExecContext(ctx, `UPDATE routing_profile_model_routes SET
+	enabled=CASE WHEN EXISTS (
+	  SELECT 1 FROM routing_profile_route_targets
+	  WHERE routing_profile_id=routing_profile_model_routes.routing_profile_id
+	    AND published_model_id=routing_profile_model_routes.published_model_id
+	) THEN enabled ELSE 0 END,
+	revision=revision+1,updated_at=? WHERE routing_profile_id=? AND published_model_id=?`,
+			now, reference.profileID, reference.publishedModelID)
+		if err != nil {
+			return err
+		}
+		if err := requireRevisionChange(ctx, tx, result, `SELECT 1 FROM routing_profile_model_routes
+WHERE routing_profile_id=? AND published_model_id=?`, reference.profileID, reference.publishedModelID); err != nil {
+			return err
+		}
+		if err := compactRoutingProfileTargetPositionsTx(ctx, tx, reference.profileID, reference.publishedModelID, now); err != nil {
+			return err
+		}
+	}
+	for profileID := range affectedProfiles {
+		if err := bumpRoutingProfileRevisionTx(ctx, tx, profileID, 0, now); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM published_model_targets
+WHERE provider_model_target_id IN (SELECT id FROM provider_model_targets WHERE site_id=?)`, id); err != nil {
+		return err
+	}
+	for modelID := range affectedModels {
+		if err := compactPublishedModelTargetPositionsTx(ctx, tx, modelID, now); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE published_models SET
+enabled=CASE WHEN EXISTS (
+  SELECT 1 FROM published_model_targets WHERE published_model_id=published_models.id
+) THEN enabled ELSE 0 END,
+revision=revision+1,updated_at=? WHERE id=?`, now, modelID)
+		if err != nil {
+			return err
+		}
+		if err := requireRevisionChange(ctx, tx, result, `SELECT 1 FROM published_models WHERE id=?`, modelID); err != nil {
+			return err
+		}
+	}
+	if len(affectedModels) > 0 {
+		var defaultProfileID int64
+		if err := tx.QueryRowContext(ctx, `SELECT id FROM routing_profiles WHERE is_default=1`).Scan(&defaultProfileID); err != nil {
+			return err
+		}
+		if err := bumpRoutingProfileRevisionTx(ctx, tx, defaultProfileID, 0, now); err != nil {
+			return err
+		}
+	}
+
+	result, err := tx.ExecContext(ctx, `DELETE FROM sites WHERE id=? AND revision=?`, id, expectedRevision)
+	if err != nil {
+		return err
+	}
+	if err := requireRevisionChange(ctx, tx, result, `SELECT 1 FROM sites WHERE id=?`, id); err != nil {
+		return err
+	}
+	if _, err := s.EnqueueConfigRevisionTx(ctx, tx, "site_deleted", time.UnixMilli(now)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func compactPublishedModelTargetPositionsTx(ctx context.Context, tx *sql.Tx, modelID, now int64) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM published_model_targets
+WHERE published_model_id=? ORDER BY position,id`, modelID)
+	if err != nil {
+		return err
+	}
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for position, id := range ids {
+		if _, err := tx.ExecContext(ctx, `UPDATE published_model_targets SET
+position=?,revision=revision+1,updated_at=? WHERE id=? AND published_model_id=?`, position, now, id, modelID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func compactRoutingProfileTargetPositionsTx(ctx context.Context, tx *sql.Tx, profileID, modelID, now int64) error {
+	rows, err := tx.QueryContext(ctx, `SELECT published_model_target_id FROM routing_profile_route_targets
+WHERE routing_profile_id=? AND published_model_id=? ORDER BY position,published_model_target_id`, profileID, modelID)
+	if err != nil {
+		return err
+	}
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for position, id := range ids {
+		if _, err := tx.ExecContext(ctx, `UPDATE routing_profile_route_targets SET
+position=?,updated_at=? WHERE routing_profile_id=? AND published_model_id=? AND published_model_target_id=?`,
+			position, now, profileID, modelID, id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) ListSiteEndpoints(ctx context.Context, siteID int64) ([]SiteEndpoint, error) {
@@ -576,7 +802,7 @@ func scanSite(row scanner) (Site, error) {
 	var item Site
 	var dashboard sql.NullString
 	var enabled int
-	if err := row.Scan(&item.ID, &item.Name, &dashboard, &enabled, &item.Revision, &item.CreatedAt, &item.UpdatedAt); err != nil {
+	if err := row.Scan(&item.ID, &item.Name, &dashboard, &enabled, &item.MaxInFlight, &item.Revision, &item.CreatedAt, &item.UpdatedAt); err != nil {
 		return Site{}, err
 	}
 	item.DashboardURL = dashboard.String

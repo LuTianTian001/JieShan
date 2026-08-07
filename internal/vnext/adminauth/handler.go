@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const maxLoginBodyBytes = 64 << 10
+const maxAuthBodyBytes = 64 << 10
 
 type Handler struct {
 	service *Service
@@ -36,6 +36,8 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		handler.login(w, r)
 	case AuthAPIPrefix + "/logout":
 		handler.logout(w, r)
+	case AuthAPIPrefix + "/password":
+		handler.changePassword(w, r)
 	default:
 		writeAuthError(w, http.StatusNotFound, "not_found", "Authentication resource was not found.")
 	}
@@ -71,7 +73,7 @@ func (handler *Handler) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input loginRequest
-	if status, err := decodeLoginJSON(w, r, &input); err != nil {
+	if status, err := decodeAuthJSON(w, r, &input); err != nil {
 		writeAuthError(w, status, "invalid_request", err.Error())
 		return
 	}
@@ -105,6 +107,59 @@ func (handler *Handler) login(w http.ResponseWriter, r *http.Request) {
 		Initialized: true, Authenticated: true, Username: result.Principal.Username,
 		ExpiresAt: result.Principal.ExpiresAt,
 	})
+}
+
+func (handler *Handler) changePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		authMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	authenticated, err := handler.service.AuthenticateRequest(r)
+	if err != nil {
+		if errors.Is(err, ErrUnauthenticated) {
+			clearAuthCookies(w, r, handler.service)
+			writeAuthError(w, http.StatusUnauthorized, "unauthenticated", "Administrator session is not authenticated.")
+		} else {
+			writeAuthError(w, http.StatusInternalServerError, "auth_unavailable", "Administrator session could not be checked.")
+		}
+		return
+	}
+	if err := handler.service.VerifyOrigin(r); err != nil {
+		writeAuthError(w, http.StatusForbidden, "origin_rejected", "Password change origin was rejected.")
+		return
+	}
+	if err := handler.service.VerifyCSRF(r, authenticated.Session); err != nil {
+		writeAuthError(w, http.StatusForbidden, "csrf_rejected", "Password change CSRF validation failed.")
+		return
+	}
+	var input passwordChangeRequest
+	if status, err := decodeAuthJSON(w, r, &input); err != nil {
+		writeAuthError(w, status, "invalid_request", err.Error())
+		return
+	}
+	if err := handler.service.ChangePassword(
+		r.Context(), authenticated, input.CurrentPassword, input.NewPassword, input.ConfirmPassword,
+	); err != nil {
+		switch {
+		case errors.Is(err, ErrInvalidCredentials):
+			writeAuthError(w, http.StatusUnauthorized, "invalid_current_password", "Current administrator password is invalid.")
+		case errors.Is(err, ErrPasswordConfirmationMismatch):
+			writeAuthError(w, http.StatusBadRequest, "password_confirmation_mismatch", "New password confirmation does not match.")
+		case errors.Is(err, ErrPasswordUnchanged):
+			writeAuthError(w, http.StatusBadRequest, "password_unchanged", "New password must differ from the current password.")
+		case errors.Is(err, ErrPasswordTooShort):
+			writeAuthError(w, http.StatusBadRequest, "password_too_short", "New password must contain at least 12 characters.")
+		case errors.Is(err, ErrPasswordTooLong):
+			writeAuthError(w, http.StatusBadRequest, "password_too_long", "New password must not exceed 1024 bytes.")
+		case errors.Is(err, ErrAdminRevisionConflict):
+			writeAuthError(w, http.StatusConflict, "password_change_conflict", "Administrator password changed concurrently; retry with the current password.")
+		default:
+			writeAuthError(w, http.StatusInternalServerError, "auth_unavailable", "Administrator password could not be changed.")
+		}
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (handler *Handler) logout(w http.ResponseWriter, r *http.Request) {
@@ -177,6 +232,12 @@ type loginRequest struct {
 	Password string `json:"password"`
 }
 
+type passwordChangeRequest struct {
+	CurrentPassword string `json:"currentPassword"`
+	NewPassword     string `json:"newPassword"`
+	ConfirmPassword string `json:"confirmPassword"`
+}
+
 type authStatusResponse struct {
 	Initialized   bool   `json:"initialized"`
 	Authenticated bool   `json:"authenticated"`
@@ -191,17 +252,17 @@ type authErrorResponse struct {
 	} `json:"error"`
 }
 
-func decodeLoginJSON(w http.ResponseWriter, r *http.Request, target any) (int, error) {
+func decodeAuthJSON(w http.ResponseWriter, r *http.Request, target any) (int, error) {
 	contentType := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]))
 	if contentType != "application/json" {
 		return http.StatusUnsupportedMediaType, errors.New("Content-Type must be application/json")
 	}
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxLoginBodyBytes))
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAuthBodyBytes))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			return http.StatusRequestEntityTooLarge, errors.New("login request body is too large")
+			return http.StatusRequestEntityTooLarge, errors.New("authentication request body is too large")
 		}
 		return http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err)
 	}

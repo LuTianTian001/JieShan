@@ -6,6 +6,8 @@ import './styles/base.css';
 import './styles/pages.css';
 import './styles/overview-sites-polish.css';
 import './styles/routing-monitor-polish.css';
+import './styles/approved-operations.css';
+import './styles/system-logs.css';
 import './styles/core-polish.css';
 import './styles/desktop-final-fixes.css';
 

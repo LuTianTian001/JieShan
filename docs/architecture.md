@@ -18,7 +18,7 @@ keeping routing and accounting behavior explicit and auditable.
    connection, a provider model, and a published model are separate resources.
 3. A retryable target failure switches the current request immediately. The
    default circuit policy needs two independent target failures inside five
-   minutes before starting a five-minute cooldown.
+   minutes before starting a fifteen-minute cooldown.
 4. Credential-local failures rotate credentials inside the same target and do
    not penalize the whole site or model route.
 5. Only explicitly selected published models are probed. The scheduler does
@@ -138,8 +138,8 @@ order, health, quota, or downstream settlement.
 
 ## Live request flow
 
-1. Authenticate the downstream API key, apply its expiry and rolling RPM
-   limit, and resolve its default or selected routing profile.
+1. Authenticate the downstream API key, apply its expiry, and resolve its
+   default or selected routing profile.
 2. Resolve the requested published model for the incoming native API protocol
    and snapshot the effective ordered targets.
 3. Select the model's official-price SKU and reserve quota against the active
@@ -187,8 +187,8 @@ The authoritative defaults are defined in
 | --- | ---: |
 | Failure threshold | 2 independent failures |
 | Failure window | 5 minutes |
-| Cooldown | 5 minutes |
-| Probe interval | 5 minutes |
+| Cooldown | 15 minutes |
+| Probe interval | 15 minutes |
 | First semantic output timeout | 15 seconds |
 | Stream idle timeout | 60 seconds |
 | Total request timeout | 5 minutes |
@@ -208,7 +208,7 @@ scheduler implementation detail, not an independent per-model runtime policy.
 The first retryable target failure still switches the current request to the
 next candidate, but under the default policy it only marks the target suspect.
 A second independent failure inside the five-minute failure window opens the
-circuit for five minutes. Duplicate observations from the same incident do not
+circuit for fifteen minutes. Duplicate observations from the same incident do not
 inflate the count.
 
 After cooldown, one half-open trial is allowed. Success closes the circuit and
@@ -235,7 +235,7 @@ billable chat probe.
 
 Monitoring selection is per published model; routing policy is global. A model
 without an enabled monitor row is not scheduled. The default global interval
-is five minutes.
+is fifteen minutes.
 
 One scheduled or manual model probe checks every configured route target for
 that selected model. Target probes use bounded concurrency while credentials

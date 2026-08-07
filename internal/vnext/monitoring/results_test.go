@@ -10,7 +10,7 @@ func TestSummaryUsesOneRealPointPerRun(t *testing.T) {
 	start := time.Date(2026, time.August, 6, 0, 0, 0, 0, time.UTC)
 	results := make([]TargetResult, 0, 12)
 	for index := 0; index < 12; index++ {
-		finished := start.Add(time.Duration(index) * DefaultProbeInterval)
+		finished := start.Add(time.Duration(index) * 5 * time.Minute)
 		results = append(results, TargetResult{
 			RunID:      fmt.Sprintf("run-%02d", index),
 			TargetID:   7,

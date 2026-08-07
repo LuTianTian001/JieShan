@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/LuTianTian001/JieShan/internal/vnext/capacity"
 	"github.com/LuTianTian001/JieShan/internal/vnext/gateway"
 	"github.com/LuTianTian001/JieShan/internal/vnext/protocol"
 	"github.com/LuTianTian001/JieShan/internal/vnext/resolver"
@@ -353,6 +354,19 @@ func TestCommittedStreamFailureDoesNotAppendAJSONErrorEnvelope(t *testing.T) {
 	if response.Code != http.StatusOK || response.Body.String() != "data: partial\n\n" {
 		t.Fatalf("committed failure response = %d %q", response.Code, response.Body.String())
 	}
+}
+
+func TestCapacityBusyMapsToStableServiceUnavailableError(t *testing.T) {
+	handler := mustHandler(t, executorFunc(func(context.Context, gateway.Input, gateway.StreamSink) (gateway.Result, error) {
+		return gateway.Result{}, &capacity.BusyError{Reason: capacity.BusyQueueTimeout}
+	}), &fakeModels{})
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public"}`))
+	request.Header.Set("Authorization", "Bearer js_busy")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+	assertAPIError(t, response, http.StatusServiceUnavailable, capacity.UpstreamBusyCode)
 }
 
 func TestChatCompletionsRejectsAmbiguousOrMalformedRequests(t *testing.T) {

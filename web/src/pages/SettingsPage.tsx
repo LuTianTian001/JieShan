@@ -22,16 +22,14 @@ import {
   PageHeader,
   Panel,
   SectionHeader,
+  submitForm,
   UnavailableState,
 } from '../components/ui';
-import { api, ApiUnavailableError } from '../lib/api';
+import { api, ApiError, ApiUnavailableError } from '../lib/api';
 import { useResource } from '../lib/hooks';
-import {
-  loadProbePrototypePreferences,
-  saveProbePrototypePreferences,
-} from '../lib/probePreferences';
 import type { GatewaySettings } from '../lib/types';
 import { PricingCatalogPanel } from './settings/PricingCatalogPanel';
+import { SystemHealthPanel } from './settings/SystemHealthPanel';
 
 interface SettingsData {
   settings: GatewaySettings | null;
@@ -59,23 +57,18 @@ export function SettingsPage() {
   const toast = useToast();
   const resource = useResource(loadSettings, []);
   const [draft, setDraft] = useState<GatewaySettings | null>(null);
-  const [slowFirstOutputThresholdMs, setSlowFirstOutputThresholdMs] = useState(
-    () => loadProbePrototypePreferences().slowFirstOutputThresholdMs,
-  );
-  const [savedSlowFirstOutputThresholdMs, setSavedSlowFirstOutputThresholdMs] = useState(slowFirstOutputThresholdMs);
   const [saving, setSaving] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
   const [currentPassword, setCurrentPassword] = useState('');
   const [nextPassword, setNextPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [passwordSaving, setPasswordSaving] = useState(false);
 
   const settingsDirty = useMemo(() => Boolean(
     draft
     && resource.data?.settings
-    && (
-      JSON.stringify(draft) !== JSON.stringify(resource.data.settings)
-      || slowFirstOutputThresholdMs !== savedSlowFirstOutputThresholdMs
-    )
-  ), [draft, resource.data?.settings, savedSlowFirstOutputThresholdMs, slowFirstOutputThresholdMs]);
+    && JSON.stringify(draft) !== JSON.stringify(resource.data.settings)
+  ), [draft, resource.data?.settings]);
 
   useEffect(() => setDraft(resource.data?.settings || null), [resource.data?.settings]);
 
@@ -93,21 +86,14 @@ export function SettingsPage() {
       return;
     }
     if (draft.requestTimeoutMs < Math.max(draft.firstOutputTimeoutMs, draft.streamIdleTimeoutMs)) {
-      toast.show('请求总时限不能短于首字超时或流空闲超时。', 'error');
-      return;
-    }
-    if (slowFirstOutputThresholdMs >= draft.firstOutputTimeoutMs) {
-      toast.show('首字冷却阈值需要短于首字超时，才能在请求超时前生效。', 'error');
+      toast.show('请求总时限不能短于首 Token 超时或流空闲超时。', 'error');
       return;
     }
     setSaving(true);
     try {
       const { revision, ...input } = draft;
       const updated = await api.updateSettings(revision, input);
-      const savedPrototypePreferences = saveProbePrototypePreferences({ slowFirstOutputThresholdMs });
       setDraft(updated);
-      setSlowFirstOutputThresholdMs(savedPrototypePreferences.slowFirstOutputThresholdMs);
-      setSavedSlowFirstOutputThresholdMs(savedPrototypePreferences.slowFirstOutputThresholdMs);
       resource.setData((current) => current ? { ...current, settings: updated } : current);
       toast.show('网关设置已保存', 'success');
     } catch (reason) {
@@ -118,15 +104,53 @@ export function SettingsPage() {
     }
   };
 
-  const updatePassword = () => {
-    if (!currentPassword || nextPassword.length < 8) {
-      toast.show('请输入当前密码，并设置至少 8 位的新密码。', 'error');
-      return;
-    }
+  const closePasswordDialog = () => {
+    if (passwordSaving) return;
     setPasswordOpen(false);
     setCurrentPassword('');
     setNextPassword('');
-    toast.show('原型已模拟更新管理密码', 'success');
+    setConfirmPassword('');
+  };
+
+  const updatePassword = async () => {
+    if (!currentPassword) {
+      toast.show('请输入当前管理密码。', 'error');
+      return;
+    }
+    if (Array.from(nextPassword).length < 12) {
+      toast.show('新密码至少需要 12 位。', 'error');
+      return;
+    }
+    if (nextPassword !== confirmPassword) {
+      toast.show('两次输入的新密码不一致。', 'error');
+      return;
+    }
+    if (currentPassword === nextPassword) {
+      toast.show('新密码不能与当前密码相同。', 'error');
+      return;
+    }
+    setPasswordSaving(true);
+    try {
+      await api.changeAdminPassword(currentPassword, nextPassword, confirmPassword);
+      setPasswordOpen(false);
+      setCurrentPassword('');
+      setNextPassword('');
+      setConfirmPassword('');
+      toast.show('管理密码已更新，其他管理会话已退出。', 'success');
+    } catch (reason) {
+      const messages: Record<string, string> = {
+        invalid_current_password: '当前管理密码不正确。',
+        password_confirmation_mismatch: '两次输入的新密码不一致。',
+        password_unchanged: '新密码不能与当前密码相同。',
+        password_too_short: '新密码至少需要 12 位。',
+        password_too_long: '新密码过长，请缩短后重试。',
+        password_change_conflict: '管理密码刚刚发生变化，请使用当前密码重试。',
+      };
+      const message = reason instanceof ApiError ? messages[reason.code] || reason.message : '管理密码更新失败';
+      toast.show(message, 'error');
+    } finally {
+      setPasswordSaving(false);
+    }
   };
 
   if (resource.loading && !resource.data) return <div className="page"><LoadingState label="正在读取设置" /></div>;
@@ -177,23 +201,20 @@ export function SettingsPage() {
               <Field label="模型探针周期" hint="发起一次最小流式模型请求。">
                 <div className="unit-input"><input className="input" type="number" min={1} value={minutes(draft.probeIntervalMs)} onChange={(event) => setMinutes('probeIntervalMs', event.target.value)} /><span>分钟</span></div>
               </Field>
-              <Field label="首字冷却阈值" hint="真实请求或探针已响应但首字过慢时，单次即进入冷却。">
-                <div className="unit-input"><input className="input" type="number" min={1} max={120} value={seconds(slowFirstOutputThresholdMs)} onChange={(event) => setSlowFirstOutputThresholdMs(Math.max(1, Number(event.target.value)) * 1_000)} /><span>秒</span></div>
+              <Field label="首 Token 超时" hint="超过该时间仍无首 Token，立即切换并冷却当前上游。">
+                <div className="unit-input"><input className="input" type="number" min={1} max={120} value={seconds(draft.firstOutputTimeoutMs)} onChange={(event) => setSeconds('firstOutputTimeoutMs', event.target.value)} /><span>秒</span></div>
               </Field>
             </div>
             <div className="settings-policy-row">
               <span className="settings-policy-icon"><Radar size={18} /></span>
-              <div><strong>流式模型探针</strong><span>固定提示词：<code>Reply exactly OK</code> · 最多 4 Token（固定）</span></div>
-              <div><span>记录指标</span><strong>首字延迟 · 总耗时 · 慢首字冷却</strong></div>
+              <div><strong>流式模型探针</strong><span>固定提示词：<code>Reply exactly OK</code> · 通常只产生 1–2 个输出 Token</span></div>
+              <div><span>记录指标</span><strong>首 Token 延迟 · 慢首 Token 冷却</strong></div>
             </div>
           </Panel>
 
           <Panel>
-            <Disclosure summary={<span className="settings-disclosure-title"><TimerReset size={17} /><span><strong>请求超时边界</strong><small>无输出、流空闲和总时限</small></span></span>}>
+            <Disclosure summary={<span className="settings-disclosure-title"><TimerReset size={17} /><span><strong>请求超时边界</strong><small>流空闲和总时限</small></span></span>}>
               <div className="settings-grid timeout-settings-grid">
-                <Field label="首字超时" hint="在此时间内没有任何有效输出就切换下一家。">
-                  <div className="unit-input"><input className="input" type="number" min={1} value={seconds(draft.firstOutputTimeoutMs)} onChange={(event) => setSeconds('firstOutputTimeoutMs', event.target.value)} /><span>秒</span></div>
-                </Field>
                 <Field label="流空闲超时" hint="流式输出中断过久时终止当前上游。">
                   <div className="unit-input"><input className="input" type="number" min={1} value={seconds(draft.streamIdleTimeoutMs)} onChange={(event) => setSeconds('streamIdleTimeoutMs', event.target.value)} /><span>秒</span></div>
                 </Field>
@@ -214,6 +235,8 @@ export function SettingsPage() {
           </Panel>
 
           <PricingCatalogPanel />
+
+          <SystemHealthPanel />
 
           <Panel>
             <SectionHeader title="安全" description="管理端会话和上游凭据的本机保护状态。" />
@@ -243,14 +266,15 @@ export function SettingsPage() {
       <Dialog
         open={passwordOpen}
         title="更新管理密码"
-        description="这是高保真前端原型，提交后只模拟成功状态。"
-        onClose={() => setPasswordOpen(false)}
-        footer={<><Button onClick={() => setPasswordOpen(false)}>取消</Button><Button variant="primary" onClick={updatePassword}>确认更新</Button></>}
+        description="验证当前密码后更新；完成时会撤销其他管理会话。"
+        onClose={closePasswordDialog}
+        footer={<><Button disabled={passwordSaving} onClick={closePasswordDialog}>取消</Button><Button variant="primary" busy={passwordSaving} onClick={() => submitForm('admin-password-form')}>确认更新</Button></>}
       >
-        <div className="form-stack">
-          <Field label="当前密码"><input className="input" type="password" data-autofocus="true" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} /></Field>
-          <Field label="新密码" hint="至少 8 位。"><input className="input" type="password" value={nextPassword} onChange={(event) => setNextPassword(event.target.value)} /></Field>
-        </div>
+        <form id="admin-password-form" className="form-stack" onSubmit={(event) => { event.preventDefault(); void updatePassword(); }}>
+          <Field label="当前密码"><input className="input" type="password" autoComplete="current-password" data-autofocus="true" disabled={passwordSaving} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} /></Field>
+          <Field label="新密码" hint="至少 12 位；不要与当前密码相同。"><input className="input" type="password" autoComplete="new-password" disabled={passwordSaving} value={nextPassword} onChange={(event) => setNextPassword(event.target.value)} /></Field>
+          <Field label="确认新密码"><input className="input" type="password" autoComplete="new-password" disabled={passwordSaving} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} /></Field>
+        </form>
       </Dialog>
     </div>
   );

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"time"
 )
@@ -33,6 +34,94 @@ type MonitorTargetView struct {
 	Surface                      string
 	UsableCredentialCount        int
 	Health                       *TargetHealthSnapshot
+}
+
+type MonitorTrafficObservation struct {
+	ID                          int64
+	RequestID                   string
+	AttemptIndex                int
+	ProviderModelTargetID       int64
+	ProviderModelTargetRevision int64
+	Status                      string
+	HTTPStatus                  *int
+	FailureKind                 string
+	ErrorCode                   string
+	FirstOutputMS               *int64
+	StartedAt                   time.Time
+	FinishedAt                  time.Time
+}
+
+func (s *Store) LatestSuccessfulRequestAttempt(
+	ctx context.Context,
+	providerModelTargetID, providerModelTargetRevision int64,
+	since time.Time,
+) (time.Time, bool, error) {
+	if providerModelTargetID <= 0 || providerModelTargetRevision <= 0 || since.IsZero() {
+		return time.Time{}, false, errors.New("provider model target identity and evidence boundary are required")
+	}
+	var finishedAt sql.NullInt64
+	err := s.DB.QueryRowContext(ctx, `SELECT h.last_success_at FROM target_health h
+WHERE h.provider_model_target_id=? AND h.config_revision=? AND h.phase='closed' AND h.capability='supported'
+  AND h.last_success_at>=? AND (h.last_failure_at IS NULL OR h.last_success_at>=h.last_failure_at)
+  AND EXISTS (SELECT 1 FROM request_attempts a
+    WHERE a.provider_model_target_id=h.provider_model_target_id
+      AND a.provider_model_target_revision=h.config_revision
+      AND a.status='success' AND a.finished_at=h.last_success_at)`,
+		providerModelTargetID, providerModelTargetRevision, since.UTC().UnixMilli()).Scan(&finishedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if !finishedAt.Valid {
+		return time.Time{}, false, nil
+	}
+	return time.UnixMilli(finishedAt.Int64).UTC(), true, nil
+}
+
+func (s *Store) ListMonitorTrafficObservations(
+	ctx context.Context,
+	providerModelTargetID, providerModelTargetRevision int64,
+	from, to time.Time,
+	limit int,
+) ([]MonitorTrafficObservation, error) {
+	if providerModelTargetID <= 0 || providerModelTargetRevision <= 0 || from.IsZero() || to.IsZero() || to.Before(from) {
+		return nil, errors.New("provider model target identity and evidence window are invalid")
+	}
+	if limit < 1 || limit > 10_000 {
+		return nil, errors.New("monitor traffic observation limit must be between 1 and 10000")
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT id,request_id,attempt_index,
+provider_model_target_id,provider_model_target_revision,status,http_status,failure_kind,error_code,
+first_token_ms,started_at,finished_at FROM request_attempts
+WHERE provider_model_target_id=? AND provider_model_target_revision=? AND finished_at BETWEEN ? AND ?
+ORDER BY finished_at DESC,id DESC LIMIT ?`, providerModelTargetID, providerModelTargetRevision,
+		from.UTC().UnixMilli(), to.UTC().UnixMilli(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]MonitorTrafficObservation, 0)
+	for rows.Next() {
+		var item MonitorTrafficObservation
+		var httpStatus, firstOutput sql.NullInt64
+		var failureKind, errorCode sql.NullString
+		var startedAt, finishedAt int64
+		if err := rows.Scan(&item.ID, &item.RequestID, &item.AttemptIndex,
+			&item.ProviderModelTargetID, &item.ProviderModelTargetRevision, &item.Status,
+			&httpStatus, &failureKind, &errorCode, &firstOutput, &startedAt, &finishedAt); err != nil {
+			return nil, err
+		}
+		item.HTTPStatus = nullIntPointer(httpStatus)
+		item.FailureKind = failureKind.String
+		item.ErrorCode = errorCode.String
+		item.FirstOutputMS = nullInt64Pointer(firstOutput)
+		item.StartedAt = time.UnixMilli(startedAt).UTC()
+		item.FinishedAt = time.UnixMilli(finishedAt).UTC()
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 func (s *Store) CreateModelMonitorSetting(

@@ -18,6 +18,7 @@ export interface Site {
   name: string;
   dashboardUrl: string;
   enabled: boolean;
+  maxConcurrency: number;
   revision: number;
   createdAt: number;
   updatedAt: number;
@@ -27,12 +28,107 @@ export interface CreateSiteInput {
   name: string;
   dashboardUrl?: string;
   enabled?: boolean;
+  maxConcurrency?: number;
 }
 
 export interface UpdateSiteInput {
   name?: string;
   dashboardUrl?: string | null;
   enabled?: boolean;
+  maxConcurrency?: number;
+}
+
+export type PlatformDetectionConfidence = 'high' | 'medium' | 'low' | 'unknown';
+
+export interface PlatformDetectionCapabilities {
+  sessionRefresh: boolean;
+  balance: boolean;
+  usage: boolean;
+}
+
+export interface PlatformDetectionEvidence {
+  id: string;
+  source: 'well_known' | 'response_header' | 'html_marker' | 'api_shape' | 'manual';
+  signal: string;
+  observedValue: string;
+  matched: boolean;
+  weight: number;
+  observedAt: number;
+}
+
+export interface PlatformDetectionCandidate {
+  platform: string;
+  label: string;
+  confidence: PlatformDetectionConfidence;
+  score: number;
+  supported: boolean;
+  capabilities: PlatformDetectionCapabilities;
+  evidenceIds: string[];
+}
+
+export interface PlatformDetectionProbeError {
+  probeId: string;
+  path: string;
+  code: string;
+  status?: number;
+  message: string;
+  observedAt: number;
+}
+
+export interface SitePlatformDetection {
+  siteId: number;
+  state: 'detected' | 'ambiguous' | 'unknown' | 'manual';
+  verdict: 'trusted' | 'possible' | 'unknown';
+  selectedPlatform: string;
+  selectedPlatformLabel: string;
+  selectionLocked: boolean;
+  confidence: PlatformDetectionConfidence;
+  score: number;
+  capabilities: PlatformDetectionCapabilities;
+  checkedAt: number;
+  detectedAt: number | null;
+  candidates: PlatformDetectionCandidate[];
+  evidence: PlatformDetectionEvidence[];
+  errors: PlatformDetectionProbeError[];
+}
+
+export interface SiteRuntimeStatus {
+  siteId: number;
+  inflightRequests: number;
+  maxConcurrency: number;
+  queuedRequests: number;
+  updatedAt: number;
+  throttledUntil: string | null;
+}
+
+export interface TokenJsonAccountPreview {
+  index: number;
+  accountName: string;
+  credentialName: string;
+  platform: string;
+  endpoint: string;
+  tokenHint: string;
+  scopes: string[];
+  status: 'ready' | 'duplicate' | 'invalid';
+  warnings: string[];
+}
+
+export interface TokenJsonImportPreview {
+  previewId: string;
+  siteId: number;
+  detectedFormat: string;
+  items: TokenJsonAccountPreview[];
+  readyCount: number;
+  duplicateCount: number;
+  invalidCount: number;
+  expiresAt: number;
+}
+
+export interface TokenJsonImportResult {
+  importedCount: number;
+  skippedCount: number;
+  credentialIds: number[];
+  endpointIds: number[];
 }
 
 export interface SiteEndpoint {
@@ -466,6 +562,22 @@ export interface PriceCatalogImportResult {
   state: CatalogState;
 }
 
+export type BuiltinPriceCatalogOutcome =
+  | 'already_current'
+  | 'installed'
+  | 'upgraded'
+  | 'activated_existing'
+  | 'operator_catalog_preserved';
+
+export interface BuiltinPriceCatalogResult {
+  catalog_version: string;
+  catalog_digest: string;
+  outcome: BuiltinPriceCatalogOutcome;
+  imported: boolean;
+  activated: boolean;
+  state: CatalogState;
+}
+
 export type MonitorHealth =
   | 'healthy'
   | 'degraded'
@@ -553,6 +665,35 @@ export interface MonitorTarget {
   latest: MonitorProbePoint | null;
   statusBar: MonitorProbePoint[];
   health: RoutingHealth | null;
+  evidence: {
+    liveTraffic: MonitorEvidenceSummary;
+    probe: MonitorEvidenceSummary;
+  };
+}
+
+export interface MonitorEvidenceSummary {
+  source: 'live_traffic' | 'probe';
+  windowMs: number;
+  samples: number;
+  successes: number;
+  failures: number;
+  skipped: number;
+  successBasisPoints: number;
+  p50FirstOutputMs: number | null;
+  p95FirstOutputMs: number | null;
+  lastObservedAt: number | null;
+  lastFailureKind: string;
+}
+
+export interface CircuitTransitionEvent {
+  id: string;
+  fromPhase: string;
+  toPhase: string;
+  trigger: 'live_traffic' | 'probe' | 'timer' | 'manual';
+  reason: string;
+  failureKind: string;
+  requestId: string;
+  occurredAt: number;
 }
 
 export interface MonitorModel {
@@ -601,6 +742,7 @@ export interface MonitorTargetHistory {
   health: RoutingHealth | null;
   order: 'oldest_first';
   items: MonitorProbePoint[];
+  circuitTransitions: CircuitTransitionEvent[];
 }
 
 export interface GatewayLogAttempt {
@@ -756,4 +898,75 @@ export interface GatewaySettings {
   maxAttempts: number;
   logRetentionDays: number;
   revision: number;
+}
+
+export interface MeteringDegradationWarning {
+  code: string;
+  severity: 'warning' | 'critical';
+  title: string;
+  message: string;
+  affectedRequests: number;
+  since: number;
+  lastSeenAt: number;
+}
+
+export interface GatewayRuntimeSnapshot {
+  processStartedAt: number;
+  snapshotAt: number;
+  configRevision: number;
+  configLoadedAt: number;
+  activePriceCatalogVersion: string;
+  inflightRequests: number;
+  maxConcurrency: number;
+  queuedRequests: number;
+  meteringMode: 'normal' | 'degraded';
+}
+
+export interface BackgroundTaskHealth {
+  id: string;
+  label: string;
+  state: 'healthy' | 'running' | 'delayed' | 'failed' | 'disabled';
+  schedule: string;
+  lastStartedAt: number | null;
+  lastFinishedAt: number | null;
+  nextRunAt: number | null;
+  lastDurationMs: number | null;
+  lastErrorCode: string;
+}
+
+export interface ConfigHistoryEntry {
+  id: string;
+  revision: number;
+  actor: string;
+  summary: string;
+  changedFields: string[];
+  status: 'applied' | 'superseded' | 'failed';
+  createdAt: number;
+}
+
+export interface SystemHealthOverview {
+  runtime: GatewayRuntimeSnapshot;
+  meteringWarnings: MeteringDegradationWarning[];
+  backgroundTasks: BackgroundTaskHealth[];
+  configHistory: ConfigHistoryEntry[];
+}
+
+export type SystemLogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+export interface SystemLogEntry {
+  id: string;
+  timestamp: number;
+  level: SystemLogLevel | string;
+  module: string;
+  code: string;
+  message: string;
+  requestId?: string;
+  taskId?: string;
+  fields?: Record<string, unknown>;
+}
+
+export interface SystemLogPage {
+  items: SystemLogEntry[];
+  hasMore: boolean;
+  nextBefore: number;
 }

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"reflect"
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	"github.com/LuTianTian001/JieShan/internal/vnext/adminauth"
+	"github.com/LuTianTian001/JieShan/internal/vnext/capacity"
+	"github.com/LuTianTian001/JieShan/internal/vnext/capacityapi"
 	"github.com/LuTianTian001/JieShan/internal/vnext/controlapi"
 	"github.com/LuTianTian001/JieShan/internal/vnext/dataplane"
 	"github.com/LuTianTian001/JieShan/internal/vnext/downstreamkeys"
@@ -23,6 +26,7 @@ import (
 	"github.com/LuTianTian001/JieShan/internal/vnext/logsapi"
 	"github.com/LuTianTian001/JieShan/internal/vnext/monitorapi"
 	"github.com/LuTianTian001/JieShan/internal/vnext/outbound"
+	"github.com/LuTianTian001/JieShan/internal/vnext/platformdetect"
 	"github.com/LuTianTian001/JieShan/internal/vnext/pricing"
 	"github.com/LuTianTian001/JieShan/internal/vnext/pricingapi"
 	"github.com/LuTianTian001/JieShan/internal/vnext/protocol"
@@ -40,6 +44,8 @@ import (
 	"github.com/LuTianTian001/JieShan/internal/vnext/siteadmin"
 	"github.com/LuTianTian001/JieShan/internal/vnext/siteadminapi"
 	vnextstore "github.com/LuTianTian001/JieShan/internal/vnext/store"
+	"github.com/LuTianTian001/JieShan/internal/vnext/systemlog"
+	"github.com/LuTianTian001/JieShan/internal/vnext/systemlogapi"
 )
 
 const (
@@ -53,6 +59,8 @@ const (
 	RequestLogsAdminPrefix     = "/api/vnext/request-logs"
 	SettingsAdminPrefix        = settingsapi.APIPrefix
 	MonitorAdminPrefix         = monitorapi.APIPrefix
+	SystemLogsAdminPrefix      = systemlogapi.APIPrefix
+	CapacityAdminPrefix        = capacityapi.APIPrefix
 	AuthPrefix                 = adminauth.AuthAPIPrefix
 )
 
@@ -90,34 +98,50 @@ func (factory MonitorFactoryFunc) BuildMonitor(dependencies MonitorDependencies)
 }
 
 type Options struct {
-	DataDir            string
-	DatabasePath       string
-	Database           vnextstore.Options
-	WebDir             string
-	MasterKeyHex       string
-	AdminAuth          adminauth.Options
-	Outbound           outbound.Options
-	Gateway            gateway.Options
-	CredentialCooldown time.Duration
-	MonitorFactory     MonitorFactory
-	Retention          retention.Options
-	SiteAccountSync    siteadmin.SchedulerOptions
+	DataDir              string
+	DatabasePath         string
+	Database             vnextstore.Options
+	WebDir               string
+	MasterKeyHex         string
+	AdminAuth            adminauth.Options
+	Outbound             outbound.Options
+	Gateway              gateway.Options
+	Capacity             capacity.Config
+	CapacityPollInterval time.Duration
+	ProbeInterval        time.Duration
+	CredentialCooldown   time.Duration
+	MonitorFactory       MonitorFactory
+	Retention            retention.Options
+	SiteAccountSync      siteadmin.SchedulerOptions
+	Logger               *slog.Logger
+	SystemLog            systemlog.Options
+	BackgroundRestartMin time.Duration
+	BackgroundRestartMax time.Duration
 }
 
 type namedBackgroundService struct {
-	name    string
-	service BackgroundService
+	id       string
+	name     string
+	label    string
+	schedule string
+	service  BackgroundService
 }
 
 // Runtime owns one independent VNext database, its outbound transport, every
 // concrete protocol adapter, and the complete HTTP surface built on top of
 // those components.
 type Runtime struct {
-	handler    http.Handler
-	store      *vnextstore.Store
-	outbound   *outbound.Client
-	background []namedBackgroundService
-	auth       *adminauth.Service
+	handler              http.Handler
+	store                *vnextstore.Store
+	outbound             *outbound.Client
+	background           []namedBackgroundService
+	auth                 *adminauth.Service
+	logger               *slog.Logger
+	systemLogs           *systemlog.Recorder
+	capacity             *capacity.Manager
+	backgroundTracker    *backgroundTaskTracker
+	backgroundRestartMin time.Duration
+	backgroundRestartMax time.Duration
 
 	bootstrapMu       sync.Mutex
 	bootstrapPassword string
@@ -126,10 +150,17 @@ type Runtime struct {
 	closeErr  error
 }
 
+const (
+	defaultBackgroundRestartMin = time.Second
+	defaultBackgroundRestartMax = 30 * time.Second
+	backgroundStableRun         = 5 * time.Minute
+)
+
 func Open(ctx context.Context, options Options) (*Runtime, error) {
 	if ctx == nil {
 		return nil, errors.New("JieShan runtime context is required")
 	}
+	startedAt := time.Now().UTC()
 	if strings.TrimSpace(options.DataDir) == "" {
 		return nil, errors.New("JieShan data directory is required")
 	}
@@ -168,6 +199,20 @@ func Open(ctx context.Context, options Options) (*Runtime, error) {
 		return nil, fmt.Errorf("recover interrupted JieShan requests: %w", err)
 	}
 	client := outbound.New(options.Outbound)
+	systemLogOptions := options.SystemLog
+	if strings.TrimSpace(systemLogOptions.Path) == "" {
+		systemLogOptions.Path = filepath.Join(dataDir, "logs", "system.jsonl")
+	}
+	systemLogs, err := systemlog.New(systemLogOptions)
+	if err != nil {
+		client.CloseIdleConnections()
+		_ = store.Close()
+		return nil, fmt.Errorf("open JieShan system log: %w", err)
+	}
+	logger := slog.New(systemLogs)
+	if options.Logger != nil {
+		logger = slog.New(systemlog.Tee(options.Logger.Handler(), systemLogs))
+	}
 	committed := false
 	defer func() {
 		if committed {
@@ -175,7 +220,25 @@ func Open(ctx context.Context, options Options) (*Runtime, error) {
 		}
 		client.CloseIdleConnections()
 		_ = store.Close()
+		_ = systemLogs.Close()
 	}()
+	capacityConfig := options.Capacity
+	if capacityConfig == (capacity.Config{}) {
+		capacityConfig = capacity.DefaultConfig()
+	}
+	capacityManager, err := capacity.New(capacityConfig)
+	if err != nil {
+		return nil, fmt.Errorf("create Site capacity manager: %w", err)
+	}
+	defer func() {
+		if !committed {
+			_ = capacityManager.Close()
+		}
+	}()
+	capacityReloader, err := newCapacityReloadService(ctx, store, capacityManager, options.CapacityPollInterval)
+	if err != nil {
+		return nil, fmt.Errorf("load Site capacity configuration: %w", err)
+	}
 
 	authService, bootstrap, err := adminauth.NewService(ctx, store, options.AdminAuth)
 	if err != nil {
@@ -193,6 +256,10 @@ func Open(ctx context.Context, options Options) (*Runtime, error) {
 	siteRegistry, err := buildSiteAdminRegistry(client)
 	if err != nil {
 		return nil, err
+	}
+	platformDetector, err := platformdetect.New(client, siteRegistry)
+	if err != nil {
+		return nil, fmt.Errorf("create platform detector: %w", err)
 	}
 	priceService, err := pricing.NewRuntimeService(ctx, store)
 	if err != nil {
@@ -215,8 +282,9 @@ func Open(ctx context.Context, options Options) (*Runtime, error) {
 	settingsService, err := settings.NewService(ctx, store, settings.Options{
 		Initial: vnextstore.RuntimeSettingsWrite{
 			FailureThreshold: policy.FailureThreshold, FailureWindow: policy.FailureWindow,
-			Cooldown: policy.Cooldown, FirstOutputTimeout: options.Gateway.FirstOutputTimeout,
-			StreamIdleTimeout: options.Gateway.StreamIdleTimeout, RequestTimeout: options.Gateway.RequestTimeout,
+			Cooldown: policy.Cooldown, ProbeInterval: options.ProbeInterval,
+			FirstOutputTimeout: options.Gateway.FirstOutputTimeout,
+			StreamIdleTimeout:  options.Gateway.StreamIdleTimeout, RequestTimeout: options.Gateway.RequestTimeout,
 			MaxAttempts: options.Gateway.MaxAttempts,
 		},
 		HalfOpenLease: policy.HalfOpenLease,
@@ -227,6 +295,7 @@ func Open(ctx context.Context, options Options) (*Runtime, error) {
 	policy = settingsService.Snapshot().HealthPolicy
 	options.Gateway.HealthPolicy = policy
 	options.Gateway.PolicyProvider = settingsService
+	options.Gateway.Capacity = capacityManager
 	retentionService, err := retention.New(store, settingsService, options.Retention)
 	if err != nil {
 		return nil, fmt.Errorf("create operational history retention service: %w", err)
@@ -258,7 +327,7 @@ func Open(ctx context.Context, options Options) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create data-plane handler: %w", err)
 	}
-	inventoryHandler, err := inventoryapi.NewStoreHandler(store, box, registry)
+	inventoryHandler, err := inventoryapi.NewStoreHandlerWithPlatformDetector(store, box, registry, platformDetector)
 	if err != nil {
 		return nil, fmt.Errorf("create inventory handler: %w", err)
 	}
@@ -294,15 +363,29 @@ func Open(ctx context.Context, options Options) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create request logs handler: %w", err)
 	}
-	settingsHandler, err := settingsapi.NewServiceHandler(settingsService)
+	systemLogsHandler, err := systemlogapi.New(systemLogs)
 	if err != nil {
-		return nil, fmt.Errorf("create runtime settings handler: %w", err)
+		return nil, fmt.Errorf("create system logs handler: %w", err)
+	}
+	capacityHandler, err := capacityapi.New(capacityManager)
+	if err != nil {
+		return nil, fmt.Errorf("create capacity snapshot handler: %w", err)
 	}
 
 	var monitor BackgroundService
 	background := []namedBackgroundService{
-		{name: "operational history retention", service: retentionService},
-		{name: "site account synchronization", service: siteAccountScheduler},
+		{
+			id: "site_capacity_reload", name: "site capacity reload", label: "上游容量配置",
+			schedule: fmt.Sprintf("配置变更后约 %s 内应用", capacityReloader.interval), service: capacityReloader,
+		},
+		{
+			id: "operational_history_retention", name: "operational history retention", label: "运行记录清理",
+			schedule: "按日志保留策略定期运行", service: retentionService,
+		},
+		{
+			id: "site_account_synchronization", name: "site account synchronization", label: "上游账户同步",
+			schedule: "按账户同步周期运行", service: siteAccountScheduler,
+		},
 	}
 	if !nilLike(options.MonitorFactory) {
 		monitor, err = options.MonitorFactory.BuildMonitor(MonitorDependencies{
@@ -315,7 +398,10 @@ func Open(ctx context.Context, options Options) (*Runtime, error) {
 		if nilLike(monitor) {
 			return nil, errors.New("JieShan monitor factory returned no service")
 		}
-		background = append(background, namedBackgroundService{name: "model monitoring", service: monitor})
+		background = append(background, namedBackgroundService{
+			id: "model_monitoring", name: "model monitoring", label: "模型可用性监控",
+			schedule: "按探针间隔运行", service: monitor,
+		})
 	}
 	var modelProber monitorapi.ModelProber
 	if candidate, ok := monitor.(monitorapi.ModelProber); ok && !nilLike(candidate) {
@@ -325,19 +411,35 @@ func Open(ctx context.Context, options Options) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create monitor handler: %w", err)
 	}
+	backgroundTracker := newBackgroundTaskTracker(background)
+	overviewProvider, err := newRuntimeOverviewProvider(
+		startedAt, store, capacityManager, capacityReloader, priceService, backgroundTracker,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create runtime overview provider: %w", err)
+	}
+	settingsHandler, err := settingsapi.NewServiceHandlerWithOverview(settingsService, overviewProvider)
+	if err != nil {
+		return nil, fmt.Errorf("create runtime settings handler: %w", err)
+	}
 
 	handler, err := composeHTTPHandler(
 		authService, authHandler, options.WebDir, store, dataHandler, inventoryHandler, keyHandler,
-		routingHandler, siteAccountHandler, pricingHandler, requestLogsHandler, monitorHandler, settingsHandler,
+		routingHandler, siteAccountHandler, pricingHandler, requestLogsHandler, systemLogsHandler,
+		capacityHandler, monitorHandler, settingsHandler,
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	committed = true
+	restartMin, restartMax := normalizeBackgroundRestart(options.BackgroundRestartMin, options.BackgroundRestartMax)
+	logger.Info("JieShan runtime opened", "module", "runtime", "code", "runtime_opened")
 	return &Runtime{
 		handler: handler, store: store, outbound: client, background: background, auth: authService,
-		bootstrapPassword: bootstrap.GeneratedPassword,
+		bootstrapPassword: bootstrap.GeneratedPassword, logger: logger, systemLogs: systemLogs, capacity: capacityManager,
+		backgroundTracker:    backgroundTracker,
+		backgroundRestartMin: restartMin, backgroundRestartMax: restartMax,
 	}, nil
 }
 
@@ -350,9 +452,8 @@ func (runtime *Runtime) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 }
 
 // Run owns every bounded background service and periodic administrator-session
-// cleanup. Expired sessions are rejected during authentication even if a
-// cleanup pass fails, so cleanup remains best effort and cannot take down the
-// gateway data plane.
+// cleanup. A failed or panicking background service is restarted with bounded
+// exponential backoff; it cannot take down the gateway data plane.
 func (runtime *Runtime) Run(ctx context.Context) error {
 	if runtime == nil {
 		return errors.New("JieShan runtime is unavailable")
@@ -360,53 +461,105 @@ func (runtime *Runtime) Run(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("JieShan runtime context is required")
 	}
-	type backgroundResult struct {
-		name string
-		err  error
-	}
-	results := make(chan backgroundResult, len(runtime.background))
-	active := 0
+	var background sync.WaitGroup
 	for _, item := range runtime.background {
 		if strings.TrimSpace(item.name) == "" || nilLike(item.service) {
 			continue
 		}
-		active++
+		background.Add(1)
 		go func(item namedBackgroundService) {
-			results <- backgroundResult{name: item.name, err: item.service.Run(ctx)}
+			defer background.Done()
+			runtime.superviseBackground(ctx, item)
 		}(item)
 	}
 	cleanup := time.NewTicker(time.Hour)
 	defer cleanup.Stop()
-	ctxDone := ctx.Done()
-	shuttingDown := false
 	for {
-		if shuttingDown && active == 0 {
-			return nil
-		}
 		select {
-		case <-ctxDone:
-			shuttingDown = true
-			ctxDone = nil
-		case result := <-results:
-			active--
-			if ctx.Err() != nil {
-				shuttingDown = true
-				ctxDone = nil
-				continue
-			}
-			if result.err == nil {
-				return fmt.Errorf("JieShan %s stopped unexpectedly", result.name)
-			}
-			return fmt.Errorf("JieShan %s stopped: %w", result.name, result.err)
+		case <-ctx.Done():
+			background.Wait()
+			return nil
 		case <-cleanup.C:
-			if shuttingDown {
-				continue
-			}
 			cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			_, _ = runtime.auth.CleanupExpiredSessions(cleanupCtx)
 			cancel()
 		}
 	}
+}
+
+func (runtime *Runtime) superviseBackground(ctx context.Context, item namedBackgroundService) {
+	restartMin, restartMax := normalizeBackgroundRestart(runtime.backgroundRestartMin, runtime.backgroundRestartMax)
+	logger := runtime.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	delay := restartMin
+	for ctx.Err() == nil {
+		startedAt := time.Now().UTC()
+		if runtime.backgroundTracker != nil {
+			runtime.backgroundTracker.started(item, startedAt)
+		}
+		err := runBackgroundAttempt(ctx, item.service)
+		finishedAt := time.Now().UTC()
+		if ctx.Err() != nil {
+			if runtime.backgroundTracker != nil {
+				runtime.backgroundTracker.stopped(item, startedAt, finishedAt, nil, time.Time{})
+			}
+			return
+		}
+		logger.Error("JieShan background service stopped; restarting",
+			"service", item.name, "error", err, "restart_after", delay)
+		if time.Since(startedAt) >= backgroundStableRun {
+			delay = restartMin
+		}
+		if runtime.backgroundTracker != nil {
+			runtime.backgroundTracker.stopped(item, startedAt, finishedAt, err, finishedAt.Add(delay))
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-timer.C:
+		}
+		if delay < restartMax {
+			delay *= 2
+			if delay > restartMax {
+				delay = restartMax
+			}
+		}
+	}
+}
+
+func runBackgroundAttempt(ctx context.Context, service BackgroundService) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("background service panic: %v", recovered)
+		}
+	}()
+	err = service.Run(ctx)
+	if err == nil && ctx.Err() == nil {
+		return errors.New("background service stopped unexpectedly")
+	}
+	return err
+}
+
+func normalizeBackgroundRestart(minimum, maximum time.Duration) (time.Duration, time.Duration) {
+	if minimum <= 0 {
+		minimum = defaultBackgroundRestartMin
+	}
+	if maximum <= 0 {
+		maximum = defaultBackgroundRestartMax
+	}
+	if maximum < minimum {
+		maximum = minimum
+	}
+	return minimum, maximum
 }
 
 // TakeBootstrapPassword returns a generated first-run password once, then
@@ -431,9 +584,17 @@ func (runtime *Runtime) Close() error {
 		if runtime.outbound != nil {
 			runtime.outbound.CloseIdleConnections()
 		}
-		if runtime.store != nil {
-			runtime.closeErr = runtime.store.Close()
+		var capacityErr, storeErr, logErr error
+		if runtime.capacity != nil {
+			capacityErr = runtime.capacity.Close()
 		}
+		if runtime.store != nil {
+			storeErr = runtime.store.Close()
+		}
+		if runtime.systemLogs != nil {
+			logErr = runtime.systemLogs.Close()
+		}
+		runtime.closeErr = errors.Join(capacityErr, storeErr, logErr)
 	})
 	return runtime.closeErr
 }
@@ -497,6 +658,13 @@ func buildSiteAdminRegistry(client gateway.HTTPDoer) (*siteadmin.Registry, error
 	}
 	if err := registry.Register(oneAPI); err != nil {
 		return nil, fmt.Errorf("register One API site administration adapter: %w", err)
+	}
+	sub2API, err := siteadmin.NewSub2APIAdapter(client)
+	if err != nil {
+		return nil, fmt.Errorf("create Sub2API site administration adapter: %w", err)
+	}
+	if err := registry.Register(sub2API); err != nil {
+		return nil, fmt.Errorf("register Sub2API site administration adapter: %w", err)
 	}
 	return registry, nil
 }

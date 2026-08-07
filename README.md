@@ -19,16 +19,16 @@ old Metapi application packages.
   random selection, balance-based sorting, or hidden priority rewrite.
 - Switches the current request immediately after a retryable target failure.
   Under the default policy, one failure marks the target suspect; a second
-  independent failure inside five minutes starts a five-minute cooldown.
+  independent failure inside five minutes starts a fifteen-minute cooldown.
 - Rotates API keys inside the current site for credential-local failures such
   as authentication, quota, and rate-limit errors without cooling the whole
   route target.
 - Probes only models explicitly selected for monitoring. The global default
-  probe interval is five minutes, and one selected model can be probed across
+  probe interval is fifteen minutes, and one selected model can be probed across
   all of its ordered targets on demand.
 - Supports native OpenAI Chat Completions and Responses, Anthropic Messages,
   and Gemini GenerateContent request and streaming surfaces.
-- Issues downstream API keys with optional USD quota, RPM limit, expiry, and a
+- Issues downstream API keys with optional USD quota, expiry, and a
   selectable routing profile. Custom profiles inherit the global default route
   unless they explicitly override a model.
 - Charges downstream usage from an immutable, versioned official-price

@@ -21,4 +21,4 @@ INSERT INTO runtime_settings(
   singleton_id,failure_threshold,failure_window_ms,cooldown_ms,probe_interval_ms,
   first_output_timeout_ms,stream_idle_timeout_ms,request_timeout_ms,max_attempts,
   log_retention_days,revision,updated_at
-) VALUES (1,2,300000,300000,300000,15000,60000,300000,4,30,1,0);
+) VALUES (1,2,300000,900000,900000,15000,60000,300000,4,30,1,0);

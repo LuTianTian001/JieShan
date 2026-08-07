@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/LuTianTian001/JieShan/internal/vnext/gateway"
 	"github.com/LuTianTian001/JieShan/internal/vnext/monitoring"
 	"github.com/LuTianTian001/JieShan/internal/vnext/protocol"
+	"github.com/LuTianTian001/JieShan/internal/vnext/protocol/anthropic"
+	"github.com/LuTianTian001/JieShan/internal/vnext/protocol/gemini"
 	"github.com/LuTianTian001/JieShan/internal/vnext/protocol/openai"
 	"github.com/LuTianTian001/JieShan/internal/vnext/resolver"
 	"github.com/LuTianTian001/JieShan/internal/vnext/routing"
@@ -30,7 +33,7 @@ func TestExecutorTriesNextCredentialAndUsesSharedCredentialEffects(t *testing.T)
 		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
 		}
-		if payload["model"] != "upstream-model" || payload["stream"] != false {
+		if payload["model"] != "upstream-model" || payload["stream"] != true {
 			t.Fatalf("probe payload = %#v", payload)
 		}
 		if request.Header.Get("Authorization") != "Bearer valid-key" {
@@ -39,12 +42,9 @@ func TestExecutorTriesNextCredentialAndUsesSharedCredentialEffects(t *testing.T)
 			_, _ = writer.Write([]byte(`{"error":{"code":"invalid_api_key","message":"bad key"}}`))
 			return
 		}
-		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{
-			"id":"chatcmpl_probe","object":"chat.completion","model":"upstream-model",
-			"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
-			"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}
-		}`))
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte("data: {\"model\":\"upstream-model\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"))
+		_, _ = writer.Write([]byte("data: {\"model\":\"upstream-model\",\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n"))
 	}))
 	defer server.Close()
 
@@ -135,6 +135,124 @@ func TestProbePayloadsAreBoundedNativeJSON(t *testing.T) {
 			}
 			if _, leaksRouteModel := object["model"]; leaksRouteModel {
 				t.Fatalf("probe payload must let the adapter inject the source model: %s", payload)
+			}
+			if !strings.Contains(string(payload), "Reply exactly OK.") {
+				t.Fatalf("probe payload lost the bounded OK instruction: %s", payload)
+			}
+			if object["stream"] != true {
+				t.Fatalf("probe payload must request semantic streaming: %s", payload)
+			}
+			switch surface {
+			case protocol.OpenAIChatCompletions:
+				if object["max_tokens"] != float64(4) {
+					t.Fatalf("chat probe output is not capped at 4 tokens: %s", payload)
+				}
+			case protocol.OpenAIResponses:
+				if object["max_output_tokens"] != float64(16) {
+					t.Fatalf("responses probe output cap = %v", object["max_output_tokens"])
+				}
+			case protocol.AnthropicMessages:
+				if object["max_tokens"] != float64(16) {
+					t.Fatalf("anthropic probe output cap = %v", object["max_tokens"])
+				}
+			case protocol.GeminiGenerateContent:
+				config, ok := object["generationConfig"].(map[string]any)
+				if !ok || config["maxOutputTokens"] != float64(16) {
+					t.Fatalf("gemini probe output cap = %v", object["generationConfig"])
+				}
+			}
+		})
+	}
+}
+
+func TestExecutorMeasuresFirstSemanticOutputAcrossSurfaces(t *testing.T) {
+	tests := []struct {
+		name          string
+		wire          protocol.Protocol
+		surface       protocol.Surface
+		auth          protocol.AuthScheme
+		path          string
+		query         string
+		encodedStream bool
+		streamBody    string
+		adapter       func(*http.Client) (any, error)
+	}{
+		{
+			name: "openai_chat", wire: protocol.OpenAI, surface: protocol.OpenAIChatCompletions,
+			auth: protocol.AuthBearer, path: "/v1/chat/completions", encodedStream: true,
+			streamBody: "data: {\"model\":\"upstream-model\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+				"data: {\"model\":\"upstream-model\",\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n",
+			adapter: func(client *http.Client) (any, error) { return openai.NewChatCompletionsAdapter(client) },
+		},
+		{
+			name: "openai_responses", wire: protocol.OpenAI, surface: protocol.OpenAIResponses,
+			auth: protocol.AuthBearer, path: "/v1/responses", encodedStream: true,
+			streamBody: "data: {\"type\":\"response.created\",\"response\":{\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"upstream-model\"}}\n\n" +
+				"data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n",
+			adapter: func(client *http.Client) (any, error) { return openai.NewResponsesAdapter(client) },
+		},
+		{
+			name: "anthropic_messages", wire: protocol.Anthropic, surface: protocol.AnthropicMessages,
+			auth: protocol.AuthXAPIKey, path: "/v1/messages", encodedStream: true,
+			streamBody: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_probe\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"upstream-model\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n" +
+				"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
+			adapter: func(client *http.Client) (any, error) { return anthropic.NewMessagesAdapter(client) },
+		},
+		{
+			name: "gemini_generate_content", wire: protocol.Gemini, surface: protocol.GeminiGenerateContent,
+			auth: protocol.AuthXGoogAPIKey, path: "/v1beta/models/upstream-model:streamGenerateContent", query: "alt=sse",
+			streamBody: "data: {\"modelVersion\":\"upstream-model\"}\n\n" +
+				"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"OK\"}]}}],\"modelVersion\":\"upstream-model\"}\n\n",
+			adapter: func(client *http.Client) (any, error) { return gemini.NewGenerateContentAdapter(client) },
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.URL.Path != test.path || request.URL.RawQuery != test.query {
+					t.Fatalf("request target = %s?%s", request.URL.Path, request.URL.RawQuery)
+				}
+				if request.Header.Get("Accept") != "text/event-stream" {
+					t.Fatalf("accept = %q", request.Header.Get("Accept"))
+				}
+				var payload map[string]any
+				if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+					t.Fatal(err)
+				}
+				if test.encodedStream && payload["stream"] != true {
+					t.Fatalf("encoded payload = %#v", payload)
+				}
+				writer.Header().Set("Content-Type", "text/event-stream")
+				_, _ = writer.Write([]byte(test.streamBody))
+			}))
+			defer server.Close()
+
+			adapter, err := test.adapter(server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			registry := protocol.NewRegistry()
+			if _, err := registry.Register(test.wire, test.surface, adapter); err != nil {
+				t.Fatal(err)
+			}
+			executor, err := New(registry, server.Client(), staticSecrets{
+				values: map[routing.CredentialID]string{11: "valid-key"},
+			}, &recordingEffects{}, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := openAIProbeRequest(server.URL, 11)
+			request.Target.WireProtocol = string(test.wire)
+			request.Target.Surface = string(test.surface)
+			request.Target.AuthScheme = string(test.auth)
+			result, err := executor.Probe(t.Context(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Outcome != monitoring.OutcomeSuccess || result.FirstOutputLatency == nil {
+				t.Fatalf("probe result = %+v", result)
 			}
 		})
 	}

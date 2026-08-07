@@ -19,6 +19,7 @@ const (
 	OperationSessionRefresh = "session_refresh"
 	OperationBalanceRefresh = "balance_refresh"
 	OperationUsageSync      = "usage_sync"
+	sessionPersistenceLimit = 5 * time.Second
 )
 
 // StoredConnection is the decrypted, short-lived view needed for one
@@ -36,11 +37,16 @@ type UsageSaveResult struct {
 	Deduplicated int
 }
 
+type UsagePageProgress struct {
+	WindowID       int64
+	ExpectedCursor string
+}
+
 type Repository interface {
 	LoadConnection(context.Context, int64) (StoredConnection, error)
 	PersistSessionUpdate(context.Context, StoredConnection, SessionUpdate) error
 	SaveBalanceSnapshot(context.Context, int64, string, BalanceSnapshot) error
-	SaveUsagePage(context.Context, int64, string, UsagePage) (UsageSaveResult, error)
+	SaveUsagePage(context.Context, int64, string, UsagePage, *UsagePageProgress) (UsageSaveResult, error)
 	RecordFailure(context.Context, int64, string, string, time.Time) error
 }
 
@@ -135,6 +141,10 @@ func (service *Service) RefreshBalance(ctx context.Context, siteID int64) (Balan
 	}
 	snapshot, update, err := reader.ReadBalance(ctx, connection.Connection)
 	if err != nil {
+		if _, persistErr := service.persistSessionUpdate(ctx, connection, update); persistErr != nil {
+			service.recordFailure(ctx, siteID, OperationBalanceRefresh, "session_persistence_failed")
+			return BalanceResult{}, persistErr
+		}
 		service.recordFailure(ctx, siteID, OperationBalanceRefresh, "upstream_failed")
 		return BalanceResult{}, fmt.Errorf("%w: read balance", ErrSyncFailed)
 	}
@@ -155,6 +165,32 @@ func (service *Service) RefreshBalance(ctx context.Context, siteID int64) (Balan
 }
 
 func (service *Service) SyncUsagePage(ctx context.Context, siteID int64, query UsageQuery) (UsageResult, error) {
+	return service.syncUsagePage(ctx, siteID, query, nil)
+}
+
+func (service *Service) SyncUsageWindowPage(
+	ctx context.Context,
+	siteID int64,
+	window UsageSyncWindow,
+	limit int,
+) (UsageResult, error) {
+	if err := window.Validate(); err != nil {
+		return UsageResult{}, err
+	}
+	return service.syncUsagePage(ctx, siteID, UsageQuery{
+		Cursor: window.Cursor,
+		From:   window.From,
+		To:     window.To,
+		Limit:  limit,
+	}, &UsagePageProgress{WindowID: window.ID, ExpectedCursor: window.Cursor})
+}
+
+func (service *Service) syncUsagePage(
+	ctx context.Context,
+	siteID int64,
+	query UsageQuery,
+	progress *UsagePageProgress,
+) (UsageResult, error) {
 	if err := query.Validate(); err != nil {
 		return UsageResult{}, err
 	}
@@ -174,6 +210,10 @@ func (service *Service) SyncUsagePage(ctx context.Context, siteID int64, query U
 	}
 	page, update, err := reader.ReadUsage(ctx, connection.Connection, query)
 	if err != nil {
+		if _, persistErr := service.persistSessionUpdate(ctx, connection, update); persistErr != nil {
+			service.recordFailure(ctx, siteID, OperationUsageSync, "session_persistence_failed")
+			return UsageResult{}, persistErr
+		}
 		service.recordFailure(ctx, siteID, OperationUsageSync, "upstream_failed")
 		return UsageResult{}, fmt.Errorf("%w: read upstream usage", ErrSyncFailed)
 	}
@@ -181,17 +221,21 @@ func (service *Service) SyncUsagePage(ctx context.Context, siteID int64, query U
 		service.recordFailure(ctx, siteID, OperationUsageSync, "invalid_page")
 		return UsageResult{}, fmt.Errorf("%w: invalid upstream usage page", ErrSyncFailed)
 	}
+	if progress != nil && page.HasMore && strings.TrimSpace(page.NextCursor) == strings.TrimSpace(progress.ExpectedCursor) {
+		service.recordFailure(ctx, siteID, OperationUsageSync, "invalid_page")
+		return UsageResult{}, fmt.Errorf("%w: upstream usage cursor did not advance", ErrSyncFailed)
+	}
 	changed, err := service.persistSessionUpdate(ctx, connection, update)
 	if err != nil {
 		service.recordFailure(ctx, siteID, OperationUsageSync, "session_persistence_failed")
 		return UsageResult{}, err
 	}
-	saved, err := service.repository.SaveUsagePage(ctx, siteID, adapter.Kind(), page)
+	saved, err := service.repository.SaveUsagePage(ctx, siteID, adapter.Kind(), page, progress)
 	if err != nil {
 		service.recordFailure(ctx, siteID, OperationUsageSync, "persistence_failed")
 		return UsageResult{}, fmt.Errorf("%w: persist upstream usage", ErrSyncFailed)
 	}
-	if saved.Inserted < 0 || saved.Deduplicated < 0 || saved.Inserted+saved.Deduplicated > len(page.Records) {
+	if saved.Inserted < 0 || saved.Deduplicated < 0 || saved.Inserted+saved.Deduplicated != len(page.Records) {
 		service.recordFailure(ctx, siteID, OperationUsageSync, "invalid_persistence_result")
 		return UsageResult{}, fmt.Errorf("%w: invalid upstream usage persistence result", ErrSyncFailed)
 	}
@@ -209,10 +253,20 @@ func (service *Service) persistSessionUpdate(
 	if err := validateSessionUpdate(*update); err != nil {
 		return false, fmt.Errorf("%w: invalid session update", ErrSyncFailed)
 	}
-	if err := service.repository.PersistSessionUpdate(ctx, connection, *update); err != nil {
+	persistenceCtx, cancel := detachedPersistenceContext(ctx)
+	defer cancel()
+	if err := service.repository.PersistSessionUpdate(persistenceCtx, connection, *update); err != nil {
 		return false, fmt.Errorf("%w: persist refreshed session", ErrSyncFailed)
 	}
 	return true, nil
+}
+
+func detachedPersistenceContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if ctx != nil {
+		base = context.WithoutCancel(ctx)
+	}
+	return context.WithTimeout(base, sessionPersistenceLimit)
 }
 
 func (service *Service) load(ctx context.Context, siteID int64) (StoredConnection, Adapter, error) {
@@ -256,7 +310,9 @@ func (service *Service) lock(siteID int64) (func(), error) {
 }
 
 func (service *Service) recordFailure(ctx context.Context, siteID int64, operation, code string) {
-	_ = service.repository.RecordFailure(ctx, siteID, operation, code, time.Now().UTC())
+	persistenceCtx, cancel := detachedPersistenceContext(ctx)
+	defer cancel()
+	_ = service.repository.RecordFailure(persistenceCtx, siteID, operation, code, time.Now().UTC())
 }
 
 func validateSessionUpdate(update SessionUpdate) error {

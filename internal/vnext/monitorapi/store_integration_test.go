@@ -3,6 +3,7 @@ package monitorapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,13 @@ import (
 func TestStoreHandlerMatrixAndRealTargetHistory(t *testing.T) {
 	fixture := newAPIFixture(t)
 	seedProbeHistory(t, fixture)
+	seedLiveTrafficEvidence(t, fixture)
+	recentAt, recent, err := fixture.storage.LatestSuccessfulRequestAttempt(
+		context.Background(), fixture.selectedTargetIDs[0], 1, fixture.now.Add(-15*time.Minute),
+	)
+	if err != nil || !recent || !recentAt.Equal(fixture.now.Add(-10*time.Minute+time.Second)) {
+		t.Fatalf("recent live success evidence = %s, %t, %v", recentAt, recent, err)
+	}
 
 	matrix := serveMonitor(fixture.handler, http.MethodGet, APIPrefix, nil, nil)
 	if matrix.Code != http.StatusOK {
@@ -34,10 +42,11 @@ func TestStoreHandlerMatrixAndRealTargetHistory(t *testing.T) {
 				IntervalMS int64 `json:"intervalMs"`
 			} `json:"monitor"`
 			Targets []struct {
-				ProviderModelTargetID int64                `json:"providerModelTargetId"`
-				SuccessBasisPoints    int                  `json:"successBasisPoints"`
-				Latest                *probePointResponse  `json:"latest"`
-				StatusBar             []probePointResponse `json:"statusBar"`
+				ProviderModelTargetID int64                   `json:"providerModelTargetId"`
+				SuccessBasisPoints    int                     `json:"successBasisPoints"`
+				Latest                *probePointResponse     `json:"latest"`
+				StatusBar             []probePointResponse    `json:"statusBar"`
+				Evidence              monitorEvidenceResponse `json:"evidence"`
 			} `json:"targets"`
 		} `json:"items"`
 	}
@@ -47,7 +56,7 @@ func TestStoreHandlerMatrixAndRealTargetHistory(t *testing.T) {
 	if len(matrixBody.Items) != 1 || matrixBody.Items[0].PublishedModelID != fixture.selectedRouteID {
 		t.Fatalf("matrix leaked an unselected route: %+v", matrixBody.Items)
 	}
-	if matrixBody.Items[0].Monitor.IntervalMS != int64((5*time.Minute)/time.Millisecond) {
+	if matrixBody.Items[0].Monitor.IntervalMS != int64((15*time.Minute)/time.Millisecond) {
 		t.Fatalf("default matrix interval = %d", matrixBody.Items[0].Monitor.IntervalMS)
 	}
 	if len(matrixBody.Items[0].Targets) != 2 {
@@ -63,6 +72,22 @@ func TestStoreHandlerMatrixAndRealTargetHistory(t *testing.T) {
 	}
 	if firstTarget.Latest == nil || firstTarget.Latest.FirstOutputMS == nil || *firstTarget.Latest.FirstOutputMS != 700 {
 		t.Fatalf("latest firstOutputMs = %+v", firstTarget.Latest)
+	}
+	live := firstTarget.Evidence.LiveTraffic
+	if live.WindowMS != monitoring.LiveTrafficEvidenceWindow.Milliseconds() || live.Samples != 4 ||
+		live.Successes != 1 || live.Failures != 2 || live.Skipped != 1 || live.SuccessBasisPoints != 3333 ||
+		live.P50FirstOutputMS == nil || *live.P50FirstOutputMS != 300 ||
+		live.P95FirstOutputMS == nil || *live.P95FirstOutputMS != 400 ||
+		live.LastFailureKind != string(routing.FailureTransport) {
+		t.Fatalf("live traffic evidence = %+v", live)
+	}
+	probe := firstTarget.Evidence.Probe
+	if probe.WindowMS != monitoring.ProbeEvidenceWindow.Milliseconds() || probe.Samples != 2 ||
+		probe.Successes != 1 || probe.Failures != 1 || probe.Skipped != 0 || probe.SuccessBasisPoints != 5000 ||
+		probe.P50FirstOutputMS == nil || *probe.P50FirstOutputMS != 500 ||
+		probe.P95FirstOutputMS == nil || *probe.P95FirstOutputMS != 700 ||
+		probe.LastFailureKind != string(routing.FailureTransport) {
+		t.Fatalf("probe evidence = %+v", probe)
 	}
 	if strings.Contains(matrix.Body.String(), "firstToken") {
 		t.Fatalf("monitor contract exposed the old ambiguous latency name: %s", matrix.Body.String())
@@ -84,6 +109,16 @@ func TestStoreHandlerMatrixAndRealTargetHistory(t *testing.T) {
 	if len(historyBody.Items) != 2 || historyBody.Items[0].Outcome != "success" ||
 		historyBody.Items[1].Outcome != "failure" {
 		t.Fatalf("history points = %+v", historyBody.Items)
+	}
+	if len(historyBody.CircuitTransitions) != 5 ||
+		historyBody.CircuitTransitions[0].FromPhase != string(routing.CircuitClosed) ||
+		historyBody.CircuitTransitions[0].ToPhase != string(routing.CircuitSuspect) ||
+		historyBody.CircuitTransitions[1].ToPhase != string(routing.CircuitOpen) ||
+		historyBody.CircuitTransitions[2].Trigger != string(routing.HealthEvidenceTimer) ||
+		historyBody.CircuitTransitions[3].ToPhase != string(routing.CircuitClosed) ||
+		historyBody.CircuitTransitions[4].Trigger != string(routing.HealthEvidenceProbe) ||
+		historyBody.CircuitTransitions[4].ToPhase != string(routing.CircuitSuspect) {
+		t.Fatalf("circuit transitions = %+v", historyBody.CircuitTransitions)
 	}
 	if historyBody.Items[1].TotalLatencyMS != 1400 || historyBody.Items[1].FirstOutputMS == nil ||
 		*historyBody.Items[1].FirstOutputMS != 700 || historyBody.Items[1].HTTPStatus == nil ||
@@ -122,7 +157,7 @@ func TestStoreHandlerCreatesDefaultsAndUpdatesWithCAS(t *testing.T) {
 	if err := json.Unmarshal(created.Body.Bytes(), &createdBody); err != nil {
 		t.Fatal(err)
 	}
-	if !createdBody.Item.Enabled || createdBody.Item.IntervalMS != int64((5*time.Minute)/time.Millisecond) ||
+	if !createdBody.Item.Enabled || createdBody.Item.IntervalMS != int64((15*time.Minute)/time.Millisecond) ||
 		createdBody.Item.HistoryLimit != vnextstore.DefaultModelMonitorHistoryLimit {
 		t.Fatalf("create defaults = %+v", createdBody.Item)
 	}
@@ -148,7 +183,7 @@ func TestStoreHandlerCreatesDefaultsAndUpdatesWithCAS(t *testing.T) {
 	if err := json.Unmarshal(updated.Body.Bytes(), &updatedBody); err != nil {
 		t.Fatal(err)
 	}
-	if updatedBody.Item.Enabled || updatedBody.Item.IntervalMS != int64((5*time.Minute)/time.Millisecond) ||
+	if updatedBody.Item.Enabled || updatedBody.Item.IntervalMS != int64((15*time.Minute)/time.Millisecond) ||
 		updatedBody.Item.HistoryLimit != 48 {
 		t.Fatalf("updated setting = %+v", updatedBody.Item)
 	}
@@ -280,6 +315,47 @@ func TestStoreHandlerManualProbeSemantics(t *testing.T) {
 	}
 }
 
+func TestStoreHandlerManualTargetProbe(t *testing.T) {
+	fixture := newAPIFixture(t)
+	targetID := fixture.selectedTargetIDs[0]
+	path := fmt.Sprintf("%s/models/%d/targets/%d/probe", APIPrefix, fixture.selectedRouteID, targetID)
+	startedAt := fixture.now.Add(time.Minute)
+	finishedAt := startedAt.Add(500 * time.Millisecond)
+	fixture.prober.set(monitoring.ModelRun{
+		Run: vnextstore.ModelProbeRun{
+			ID: "manual-target", PublishedModelID: fixture.selectedRouteID, PublicModelSnapshot: "public-selected",
+			TriggerKind: "manual", Status: "completed", TargetCount: 1, StartedAt: startedAt, FinishedAt: &finishedAt,
+		},
+		Results: []monitoring.TargetResult{{
+			RunID: "manual-target", TargetID: targetID, Outcome: monitoring.OutcomeSuccess,
+			HTTPStatus: http.StatusOK, LatencyMS: 500, FirstOutputLatencyMS: int64Pointer(180),
+			StartedAt: startedAt, FinishedAt: finishedAt,
+		}},
+	}, nil)
+
+	response := serveMonitor(fixture.handler, http.MethodPost, path, nil, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("target probe status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Run probeRunResponse `json:"run"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Run.TargetCount != 1 || len(body.Run.Results) != 1 || body.Run.Results[0].ProviderModelTargetID != targetID {
+		t.Fatalf("target probe response = %+v", body.Run)
+	}
+	modelID, calledTargetID, calls := fixture.prober.targetCall()
+	if calls != 1 || modelID != fixture.selectedRouteID || calledTargetID != targetID {
+		t.Fatalf("target prober call = model %d target %d calls %d", modelID, calledTargetID, calls)
+	}
+
+	unknown := fmt.Sprintf("%s/models/%d/targets/%d/probe", APIPrefix, fixture.selectedRouteID, 999999)
+	assertAPIError(t, serveMonitor(fixture.handler, http.MethodPost, unknown, nil, nil),
+		http.StatusNotFound, "monitor_target_not_found")
+}
+
 type apiFixture struct {
 	storage             *vnextstore.Store
 	handler             *Handler
@@ -387,7 +463,7 @@ func seedProbeHistory(t *testing.T, fixture apiFixture) {
 		t.Fatalf("selected target fixture = %+v", selected.Targets)
 	}
 	for runIndex := 0; runIndex < 2; runIndex++ {
-		startedAt := fixture.now.Add(time.Duration(runIndex+1) * time.Minute)
+		startedAt := fixture.now.Add(time.Duration(runIndex-2) * time.Minute)
 		owner := fmt.Sprintf("monitor-api-seed-%d", runIndex)
 		job, err := fixture.storage.ClaimModelMonitor(ctx, fixture.selectedRouteID, owner, startedAt, time.Minute)
 		if err != nil {
@@ -456,11 +532,129 @@ func seedProbeHistory(t *testing.T, fixture apiFixture) {
 	}
 }
 
+func seedLiveTrafficEvidence(t *testing.T, fixture apiFixture) {
+	t.Helper()
+	ctx := context.Background()
+	views, err := fixture.storage.ListMonitorRouteViews(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var selected vnextstore.MonitorRouteView
+	for _, view := range views {
+		if view.Setting.PublishedModelID == fixture.selectedRouteID {
+			selected = view
+			break
+		}
+	}
+	if len(selected.Targets) == 0 {
+		t.Fatal("selected monitor has no target")
+	}
+	target := selected.Targets[0]
+	var credentialID int64
+	if err := fixture.storage.DB.QueryRowContext(ctx,
+		`SELECT credential_id FROM credential_endpoint_bindings WHERE endpoint_id=? AND enabled=1 ORDER BY position,credential_id LIMIT 1`,
+		target.EndpointID).Scan(&credentialID); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte("monitor-live-evidence-key"))
+	key, err := fixture.storage.CreateRevealableDownstreamKey(ctx, vnextstore.DownstreamKeyWrite{
+		Name: "Monitor evidence", KeyPrefix: "js_monitor_evidence", KeyDigest: digest[:], Enabled: true,
+	}, 1, func(int64) ([]byte, error) { return []byte{1, 2, 3}, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type evidenceAttempt struct {
+		id          string
+		startedAt   time.Time
+		status      string
+		httpStatus  int
+		failureKind string
+		errorCode   string
+		firstOutput *int64
+	}
+	firstFailureOutput := int64(300)
+	secondFailureOutput := int64(400)
+	successOutput := int64(250)
+	attempts := []evidenceAttempt{
+		{id: "live-failure-1", startedAt: fixture.now.Add(-30 * time.Minute), status: "failed", httpStatus: 503,
+			failureKind: string(routing.FailureTransport), errorCode: "upstream_reset", firstOutput: &firstFailureOutput},
+		{id: "live-failure-2", startedAt: fixture.now.Add(-26 * time.Minute), status: "failed", httpStatus: 503,
+			failureKind: string(routing.FailureTransport), errorCode: "upstream_reset", firstOutput: &secondFailureOutput},
+		{id: "live-success", startedAt: fixture.now.Add(-10 * time.Minute), status: "success", httpStatus: 200,
+			firstOutput: &successOutput},
+		{id: "live-throttle", startedAt: fixture.now.Add(-5 * time.Minute), status: "failed", httpStatus: 429,
+			failureKind: string(routing.FailureUnknown), errorCode: "upstream_concurrency"},
+	}
+	for _, item := range attempts {
+		startedAt := item.startedAt.UTC().UnixMilli()
+		if _, err := fixture.storage.StartRequestWithQuotaReservation(ctx, vnextstore.RequestStart{
+			ID: item.id, DownstreamKeyID: key.ID,
+			PublishedModelID: fixture.selectedRouteID, PublishedModelRevision: selected.PublishedModelRevision,
+			EffectiveRoutingProfileID: key.RoutingProfileID, EffectiveRoutingProfileName: key.RoutingProfileName,
+			SourceRoutingProfileID: key.RoutingProfileID, SourceRoutingProfileName: key.RoutingProfileName,
+			RouteRevision: selected.PublishedModelRevision,
+			RouteCandidates: []vnextstore.RequestRouteCandidateWrite{{
+				Position: target.Position, PublishedModelTargetID: target.PublishedModelTargetID,
+				PublishedModelTargetRevision: target.PublishedModelTargetRevision,
+				ProviderModelTargetID:        target.ProviderModelTargetID,
+				ProviderModelTargetRevision:  target.ProviderModelTargetRevision,
+				SiteID:                       target.SiteID, SiteName: target.SiteName, EndpointID: target.EndpointID,
+				EndpointName: target.EndpointName, SourceModel: target.SourceModel,
+				WireProtocol: target.WireProtocol, APISurface: target.Surface,
+				Credentials:        []vnextstore.RequestRouteCredentialSnapshot{},
+				InitialEligibility: "eligible", InitialReason: "ready",
+			}},
+			PublicModel: selected.PublicModel, APISurface: target.Surface,
+			PriceCatalogVersion: "monitor-evidence", PriceSKU: selected.OfficialPriceSKU,
+			StartedAt: startedAt,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		finishedAt := startedAt + 1000
+		status := item.httpStatus
+		if err := fixture.storage.RecordRequestAttempt(ctx, vnextstore.RequestAttemptWrite{
+			RequestID: item.id, AttemptIndex: 0,
+			PublishedModelTargetID:       target.PublishedModelTargetID,
+			PublishedModelTargetRevision: target.PublishedModelTargetRevision,
+			ProviderModelTargetID:        target.ProviderModelTargetID,
+			ProviderModelTargetRevision:  target.ProviderModelTargetRevision,
+			SiteID:                       target.SiteID, EndpointID: target.EndpointID, CredentialID: credentialID,
+			SiteName: target.SiteName, EndpointName: target.EndpointName, CredentialName: "Primary",
+			SourceModel: target.SourceModel, WireProtocol: target.WireProtocol, APISurface: target.Surface,
+			Status: item.status, HTTPStatus: &status, FailureKind: item.failureKind, ErrorCode: item.errorCode,
+			FirstTokenMS: item.firstOutput, DurationMS: 1000, StartedAt: startedAt, FinishedAt: finishedAt,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if item.status == "success" {
+			permit, err := fixture.storage.AcquireTargetAttempt(
+				ctx, target.ProviderModelTargetID, routing.Revision(target.ProviderModelTargetRevision),
+				routing.DefaultHealthPolicy(), item.startedAt,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, result, err := fixture.storage.ApplyTargetHealthEvent(
+				ctx, target.ProviderModelTargetID, routing.DefaultHealthPolicy(), routing.HealthEvent{
+					Revision: routing.Revision(target.ProviderModelTargetRevision), Sequence: permit.Sequence,
+					OccurredAt: time.UnixMilli(finishedAt).UTC(), Outcome: routing.HealthSuccess,
+				},
+			); err != nil || !result.Applied {
+				t.Fatalf("apply live success health evidence: result=%+v err=%v", result, err)
+			}
+		}
+	}
+}
+
 type fakeModelProber struct {
-	mu    sync.Mutex
-	run   monitoring.ModelRun
-	err   error
-	calls int
+	mu           sync.Mutex
+	run          monitoring.ModelRun
+	err          error
+	calls        int
+	targetCalls  int
+	lastModelID  int64
+	lastTargetID int64
 }
 
 func (prober *fakeModelProber) set(run monitoring.ModelRun, err error) {
@@ -475,6 +669,21 @@ func (prober *fakeModelProber) ProbeModel(context.Context, int64) (monitoring.Mo
 	defer prober.mu.Unlock()
 	prober.calls++
 	return prober.run, prober.err
+}
+
+func (prober *fakeModelProber) ProbeTarget(_ context.Context, modelID, targetID int64) (monitoring.ModelRun, error) {
+	prober.mu.Lock()
+	defer prober.mu.Unlock()
+	prober.targetCalls++
+	prober.lastModelID = modelID
+	prober.lastTargetID = targetID
+	return prober.run, prober.err
+}
+
+func (prober *fakeModelProber) targetCall() (int64, int64, int) {
+	prober.mu.Lock()
+	defer prober.mu.Unlock()
+	return prober.lastModelID, prober.lastTargetID, prober.targetCalls
 }
 
 func (prober *fakeModelProber) callCount() int {
@@ -539,5 +748,19 @@ func TestProbeModelFuncRejectsNilFunction(t *testing.T) {
 	_, err := function.ProbeModel(context.Background(), 1)
 	if err == nil {
 		t.Fatal("nil ProbeModelFunc unexpectedly succeeded")
+	}
+}
+
+func TestTargetStatusKeepsRecentLiveSuccessHealthyAfterProbeExemption(t *testing.T) {
+	target := vnextstore.MonitorTargetView{
+		ProviderModelTargetRevision: 1,
+		SiteEnabled:                 true, EndpointEnabled: true, ProviderTargetEnabled: true, UsableCredentialCount: 1,
+		Health: &vnextstore.TargetHealthSnapshot{State: routing.HealthState{
+			Revision: 1, Phase: routing.CircuitClosed, Capability: routing.CapabilitySupported,
+		}},
+	}
+	latest := &probePointResponse{Outcome: string(monitoring.OutcomeSkipped), PermitReason: string(routing.PermitRecentSuccess)}
+	if status := targetStatus(target, latest, monitorEvidenceSummaryResponse{}, time.Now().UTC()); status != "healthy" {
+		t.Fatalf("recent live success with skipped duplicate probe status = %q", status)
 	}
 }

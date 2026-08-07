@@ -22,6 +22,8 @@ import (
 
 const defaultMaxResponseBytes = int64(4 << 20)
 
+var errFirstSemanticOutput = errors.New("probe observed first semantic output")
+
 type Options struct {
 	MaxResponseBytes int64
 	Now              func() time.Time
@@ -156,17 +158,16 @@ func (executor *Executor) Probe(ctx context.Context, request monitoring.ProbeReq
 			return finishObservation(executor.now, startedAt, observation, failure, attempt.ErrorCode, 0, nil), nil
 		}
 
-		body, firstOutput, readErr := executor.readBody(response.Body, startedAt)
-		_ = response.Body.Close()
 		status := response.StatusCode
-		if readErr != nil {
-			failure := routing.Failure{Kind: routing.FailureUpstreamTransient}
-			attempt = finishAttempt(executor.now, attemptStartedAt, attempt, failure.Kind, "probe_body_invalid", status)
-			observation.Attempts = append(observation.Attempts, attempt)
-			return finishObservation(executor.now, startedAt, observation, failure, attempt.ErrorCode, status, firstOutput), nil
-		}
-
 		if status < http.StatusOK || status >= http.StatusMultipleChoices {
+			body, readErr := executor.readBody(response.Body)
+			_ = response.Body.Close()
+			if readErr != nil {
+				failure := routing.Failure{Kind: routing.FailureUpstreamTransient}
+				attempt = finishAttempt(executor.now, attemptStartedAt, attempt, failure.Kind, "probe_body_invalid", status)
+				observation.Attempts = append(observation.Attempts, attempt)
+				return finishObservation(executor.now, startedAt, observation, failure, attempt.ErrorCode, status, nil), nil
+			}
 			decoded, decodeErr := components.ErrorDecoder.DecodeError(ctx, protocol.ErrorInput{
 				StatusCode: status, Header: response.Header.Clone(), Body: body,
 			})
@@ -187,14 +188,14 @@ func (executor *Executor) Probe(ctx context.Context, request monitoring.ProbeReq
 			if disposition.Retry == routing.RetryNextCredential {
 				continue
 			}
-			return finishObservation(executor.now, startedAt, observation, failure, code, status, firstOutput), nil
+			return finishObservation(executor.now, startedAt, observation, failure, code, status, nil), nil
 		}
 
-		if _, decodeErr := components.ResponseDecoder.DecodeResponse(ctx, protocol.ResponseInput{
-			StatusCode: status, Header: response.Header.Clone(), Body: body,
-		}); decodeErr != nil {
+		firstOutput, decodeErr := executor.readFirstSemanticOutput(ctx, components.StreamDecoder, response, attemptStartedAt)
+		_ = response.Body.Close()
+		if decodeErr != nil {
 			failure := routing.Failure{Kind: routing.FailureUpstreamTransient}
-			attempt = finishAttempt(executor.now, attemptStartedAt, attempt, failure.Kind, "probe_malformed_success", status)
+			attempt = finishAttempt(executor.now, attemptStartedAt, attempt, failure.Kind, "probe_stream_invalid", status)
 			observation.Attempts = append(observation.Attempts, attempt)
 			return finishObservation(executor.now, startedAt, observation, failure, attempt.ErrorCode, status, firstOutput), nil
 		}
@@ -238,7 +239,7 @@ func (executor *Executor) prepare(target monitoring.ProbeTarget) (
 		return "", "", "", protocol.AdapterComponents{}, nil, resolver.EndpointMetadata{}, err
 	}
 	components, err := executor.registry.Components(wireProtocol, surface)
-	if err != nil || components.RequestEncoder == nil || components.ResponseDecoder == nil || components.ErrorDecoder == nil {
+	if err != nil || components.RequestEncoder == nil || components.StreamDecoder == nil || components.ErrorDecoder == nil {
 		return "", "", "", protocol.AdapterComponents{}, nil, resolver.EndpointMetadata{}, errors.New("probe protocol adapter is incomplete")
 	}
 	payload, err := probePayload(surface)
@@ -267,41 +268,63 @@ func (executor *Executor) prepare(target monitoring.ProbeTarget) (
 func probePayload(surface protocol.Surface) ([]byte, error) {
 	switch surface {
 	case protocol.OpenAIChatCompletions:
-		return []byte(`{"messages":[{"role":"user","content":"Reply exactly OK."}],"stream":false}`), nil
+		return []byte(`{"messages":[{"role":"user","content":"Reply exactly OK."}],"max_tokens":4,"stream":true}`), nil
 	case protocol.OpenAIResponses:
-		return []byte(`{"input":"Reply exactly OK.","max_output_tokens":16,"stream":false}`), nil
+		return []byte(`{"input":"Reply exactly OK.","max_output_tokens":16,"stream":true}`), nil
 	case protocol.AnthropicMessages:
-		return []byte(`{"max_tokens":16,"messages":[{"role":"user","content":"Reply exactly OK."}],"stream":false}`), nil
+		return []byte(`{"max_tokens":16,"messages":[{"role":"user","content":"Reply exactly OK."}],"stream":true}`), nil
 	case protocol.GeminiGenerateContent:
-		return []byte(`{"contents":[{"role":"user","parts":[{"text":"Reply exactly OK."}]}],"generationConfig":{"maxOutputTokens":16,"temperature":0},"stream":false}`), nil
+		return []byte(`{"contents":[{"role":"user","parts":[{"text":"Reply exactly OK."}]}],"generationConfig":{"maxOutputTokens":16,"temperature":0},"stream":true}`), nil
 	default:
 		return nil, fmt.Errorf("unsupported probe surface %q", surface)
 	}
 }
 
-func (executor *Executor) readBody(body io.Reader, startedAt time.Time) ([]byte, *time.Duration, error) {
+func (executor *Executor) readBody(body io.Reader) ([]byte, error) {
 	limited := &io.LimitedReader{R: body, N: executor.maxBody + 1}
-	first := make([]byte, 1)
-	n, firstErr := limited.Read(first)
+	result, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(result)) > executor.maxBody {
+		return nil, errors.New("probe response exceeds the safety limit")
+	}
+	return result, nil
+}
+
+func (executor *Executor) readFirstSemanticOutput(
+	ctx context.Context,
+	decoder protocol.StreamDecoder,
+	response *http.Response,
+	startedAt time.Time,
+) (*time.Duration, error) {
+	limited := &io.LimitedReader{R: response.Body, N: executor.maxBody + 1}
 	var firstOutput *time.Duration
-	result := make([]byte, 0, 4096)
-	if n > 0 {
+	_, err := decoder.DecodeStream(ctx, protocol.StreamInput{
+		StatusCode: response.StatusCode,
+		Header:     response.Header.Clone(),
+		Body:       limited,
+	}, func(event protocol.StreamEvent) error {
+		if !event.Semantic {
+			return nil
+		}
 		value := elapsed(startedAt, executor.now().UTC())
 		firstOutput = &value
-		result = append(result, first[:n]...)
+		return errFirstSemanticOutput
+	})
+	if limited.N <= 0 {
+		return firstOutput, errors.New("probe response exceeds the safety limit")
 	}
-	if firstErr != nil && !errors.Is(firstErr, io.EOF) {
-		return nil, firstOutput, firstErr
+	if errors.Is(err, errFirstSemanticOutput) {
+		return firstOutput, nil
 	}
-	rest, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, firstOutput, err
+		return firstOutput, err
 	}
-	result = append(result, rest...)
-	if int64(len(result)) > executor.maxBody {
-		return nil, firstOutput, errors.New("probe response exceeds the safety limit")
+	if firstOutput == nil {
+		return nil, errors.New("probe stream ended before semantic output")
 	}
-	return result, firstOutput, nil
+	return firstOutput, nil
 }
 
 func (executor *Executor) applyCredentialEffect(

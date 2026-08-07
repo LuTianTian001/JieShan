@@ -86,6 +86,19 @@ func (handler *Handler) updateSite(w http.ResponseWriter, r *http.Request, siteI
 	writeJSON(w, http.StatusOK, map[string]any{"item": newSiteResponse(item)})
 }
 
+func (handler *Handler) deleteSite(w http.ResponseWriter, r *http.Request, siteID int64) {
+	revision, ok := requiredIfMatch(w, r)
+	if !ok {
+		return
+	}
+	if err := handler.repository.DeleteSite(r.Context(), siteID, revision); err != nil {
+		writeRepositoryError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (handler *Handler) listEndpoints(w http.ResponseWriter, r *http.Request, siteID int64) {
 	items, err := handler.repository.ListSiteEndpoints(r.Context(), siteID)
 	if err != nil {

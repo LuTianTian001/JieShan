@@ -19,6 +19,8 @@ type Repository interface {
 	CreateModelMonitorSetting(context.Context, int64, vnextstore.ModelMonitorSettingWrite, time.Time) (vnextstore.ModelMonitorSetting, error)
 	UpdateModelMonitorSettingCAS(context.Context, int64, int64, vnextstore.ModelMonitorSettingWrite, time.Time) (vnextstore.ModelMonitorSetting, error)
 	ListModelProbeTargetResults(context.Context, int64, int64, int) ([]vnextstore.ModelProbeTargetResult, error)
+	ListMonitorTrafficObservations(context.Context, int64, int64, time.Time, time.Time, int) ([]vnextstore.MonitorTrafficObservation, error)
+	GetRuntimeSettings(context.Context) (vnextstore.RuntimeSettings, error)
 }
 
 // ModelProber is intentionally the scheduler's narrow manual-probe surface.
@@ -26,6 +28,10 @@ type Repository interface {
 // HTTP package owning scheduler lifecycle or probe execution.
 type ModelProber interface {
 	ProbeModel(context.Context, int64) (monitoring.ModelRun, error)
+}
+
+type TargetProber interface {
+	ProbeTarget(context.Context, int64, int64) (monitoring.ModelRun, error)
 }
 
 type ProbeModelFunc func(context.Context, int64) (monitoring.ModelRun, error)
@@ -40,6 +46,7 @@ func (function ProbeModelFunc) ProbeModel(ctx context.Context, publishedModelID 
 type Handler struct {
 	repository Repository
 	prober     ModelProber
+	target     TargetProber
 	now        func() time.Time
 }
 
@@ -52,7 +59,11 @@ func New(repository Repository, prober ModelProber) (*Handler, error) {
 	if nilLike(prober) {
 		prober = nil
 	}
-	return &Handler{repository: repository, prober: prober, now: time.Now}, nil
+	handler := &Handler{repository: repository, prober: prober, now: time.Now}
+	if target, ok := prober.(TargetProber); ok && !nilLike(target) {
+		handler.target = target
+	}
+	return handler, nil
 }
 
 func NewStoreHandler(store *vnextstore.Store, prober ModelProber) (*Handler, error) {
@@ -79,4 +90,5 @@ var (
 	_ http.Handler = (*Handler)(nil)
 	_ Repository   = (*vnextstore.Store)(nil)
 	_ ModelProber  = (*monitoring.Scheduler)(nil)
+	_ TargetProber = (*monitoring.Scheduler)(nil)
 )

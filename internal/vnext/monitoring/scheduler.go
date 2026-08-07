@@ -22,7 +22,10 @@ const (
 	defaultMaxConcurrentTargets = 2
 )
 
-var ErrProbeInProgress = errors.New("model probe is already in progress")
+var (
+	ErrProbeInProgress    = errors.New("model probe is already in progress")
+	ErrProbeTargetMissing = errors.New("model probe target is unavailable")
+)
 
 type Repository interface {
 	ClaimDueModelMonitors(context.Context, string, time.Time, time.Duration, int) ([]vnextstore.ModelMonitorJob, error)
@@ -32,6 +35,10 @@ type Repository interface {
 	StartModelProbeRun(context.Context, vnextstore.ModelProbeRunWrite) error
 	SaveModelProbeTargetResult(context.Context, vnextstore.ModelProbeTargetWrite) error
 	FinishModelProbeRun(context.Context, string, string, time.Time) (vnextstore.ModelProbeRun, error)
+}
+
+type LiveTrafficRepository interface {
+	LatestSuccessfulRequestAttempt(context.Context, int64, int64, time.Time) (time.Time, bool, error)
 }
 
 // HealthRepository deliberately matches the gateway health boundary. A probe
@@ -129,6 +136,7 @@ type Options struct {
 type Scheduler struct {
 	repository Repository
 	health     HealthRepository
+	live       LiveTrafficRepository
 	executor   ProbeExecutor
 	policy     RuntimePolicyProvider
 	poll       time.Duration
@@ -195,7 +203,7 @@ func NewScheduler(repository Repository, health HealthRepository, executor Probe
 	if options.NewID == nil {
 		options.NewID = newRandomID
 	}
-	return &Scheduler{
+	scheduler := &Scheduler{
 		repository: repository,
 		health:     health,
 		executor:   executor,
@@ -209,7 +217,11 @@ func NewScheduler(repository Repository, health HealthRepository, executor Probe
 		newID:      options.NewID,
 		targets:    make(chan struct{}, options.MaxConcurrentTargets),
 		active:     make(map[int64]struct{}),
-	}, nil
+	}
+	if live, ok := repository.(LiveTrafficRepository); ok {
+		scheduler.live = live
+	}
+	return scheduler, nil
 }
 
 func (scheduler *Scheduler) Run(ctx context.Context) error {
@@ -273,6 +285,26 @@ func (scheduler *Scheduler) RunDueOnce(ctx context.Context) ([]ModelRun, error) 
 // ProbeModel performs one manual model-wide run. Every currently enabled
 // published model target is included once, preserving the operator's order.
 func (scheduler *Scheduler) ProbeModel(ctx context.Context, publishedModelID int64) (ModelRun, error) {
+	return scheduler.probeManual(ctx, publishedModelID, 0)
+}
+
+// ProbeTarget performs one manual run for exactly one currently enabled
+// upstream target. The model-wide lease remains the serialization boundary so
+// scheduled, model-wide, and target-specific probes cannot overlap.
+func (scheduler *Scheduler) ProbeTarget(
+	ctx context.Context,
+	publishedModelID, providerModelTargetID int64,
+) (ModelRun, error) {
+	if providerModelTargetID <= 0 {
+		return ModelRun{}, errors.New("provider model target ID must be positive")
+	}
+	return scheduler.probeManual(ctx, publishedModelID, providerModelTargetID)
+}
+
+func (scheduler *Scheduler) probeManual(
+	ctx context.Context,
+	publishedModelID, providerModelTargetID int64,
+) (ModelRun, error) {
 	if ctx == nil {
 		return ModelRun{}, errors.New("monitor probe context is required")
 	}
@@ -295,6 +327,26 @@ func (scheduler *Scheduler) ProbeModel(ctx context.Context, publishedModelID int
 	}
 	if err != nil {
 		return ModelRun{}, err
+	}
+	if providerModelTargetID > 0 {
+		selected := job.Targets[:0]
+		for _, target := range job.Targets {
+			if target.ProviderModelTargetID == providerModelTargetID {
+				selected = append(selected, target)
+				break
+			}
+		}
+		if len(selected) == 0 {
+			cleanupCtx, cancel := cleanupContext()
+			scheduler.stateMu.Lock()
+			releaseErr := scheduler.repository.ReleaseModelMonitorClaim(
+				cleanupCtx, publishedModelID, job.Setting.LeaseOwner,
+			)
+			scheduler.stateMu.Unlock()
+			cancel()
+			return ModelRun{}, errors.Join(ErrProbeTargetMissing, releaseErr)
+		}
+		job.Targets = selected
 	}
 	return scheduler.runClaimed(ctx, job, "manual")
 }
@@ -330,7 +382,7 @@ func (scheduler *Scheduler) runClaimed(ctx context.Context, job vnextstore.Model
 		go func() {
 			defer wait.Done()
 			for index := range work {
-				results[index] = scheduler.probeTarget(ctx, runID, job, job.Targets[index])
+				results[index] = scheduler.probeTarget(ctx, runID, job, job.Targets[index], trigger)
 				cleanupCtx, cancel := cleanupContext()
 				scheduler.stateMu.Lock()
 				persistErrors[index] = scheduler.repository.SaveModelProbeTargetResult(
@@ -371,6 +423,7 @@ func (scheduler *Scheduler) probeTarget(
 	runID string,
 	job vnextstore.ModelMonitorJob,
 	target vnextstore.ModelMonitorTarget,
+	trigger string,
 ) TargetResult {
 	startedAt := scheduler.now().UTC()
 	result := TargetResult{RunID: runID, TargetID: target.ProviderModelTargetID, StartedAt: startedAt}
@@ -386,8 +439,25 @@ func (scheduler *Scheduler) probeTarget(
 		return result
 	}
 
-	scheduler.stateMu.Lock()
 	policy := normalizeRuntimePolicy(scheduler.policy.MonitoringSnapshot())
+	if trigger == "scheduled" && scheduler.live != nil {
+		scheduler.stateMu.Lock()
+		_, recent, recentErr := scheduler.live.LatestSuccessfulRequestAttempt(
+			ctx, target.ProviderModelTargetID, target.ProviderModelTargetRevision,
+			startedAt.Add(-policy.ProbeInterval),
+		)
+		scheduler.stateMu.Unlock()
+		if recentErr == nil && recent {
+			result.Outcome = OutcomeSkipped
+			result.PermitReason = routing.PermitRecentSuccess
+			result.ErrorCode = string(routing.PermitRecentSuccess)
+			result.FinishedAt = scheduler.now().UTC()
+			result.LatencyMS = elapsedMilliseconds(startedAt, result.FinishedAt)
+			return result
+		}
+	}
+
+	scheduler.stateMu.Lock()
 	permit, err := scheduler.health.AcquireTargetAttempt(ctx, target.ProviderModelTargetID,
 		routing.Revision(target.ProviderModelTargetRevision), policy.HealthPolicy, scheduler.now().UTC())
 	scheduler.stateMu.Unlock()
@@ -450,6 +520,11 @@ func (scheduler *Scheduler) probeTarget(
 		result.FailureKind = routing.FailureUnknown
 		result.ErrorCode = "invalid_probe_result"
 		result.FirstOutputLatencyMS = nil
+	} else if result.Outcome == OutcomeSuccess && observation.FirstOutputLatency != nil &&
+		*observation.FirstOutputLatency > policy.FirstOutputTimeout {
+		result.Outcome = OutcomeFailure
+		result.FailureKind = routing.FailureFirstOutputTimeout
+		result.ErrorCode = string(routing.FailureFirstOutputTimeout)
 	}
 	if result.Outcome == "" {
 		result.Outcome = OutcomeFailure

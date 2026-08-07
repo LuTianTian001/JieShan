@@ -541,6 +541,17 @@
 .monitor-target-observation .status-history > span { flex: 1 1 5px; min-width: 4px; max-width: 7px; }
 .monitor-target-observation .target-next-state { min-height: 20px; font-size: var(--font-size-2xs); }
 
+.probe-refresh.is-probing > svg { animation: spin 0.9s linear infinite; }
+
+.monitor-target-action-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.monitor-target-action-row .status-history { flex: 1; min-width: 0; }
+.target-probe-button { flex: 0 0 auto; }
+
 .monitor-selection-toolbar { margin-bottom: 12px; }
 .monitor-selection-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .monitor-selection-actions > span { margin-left: 4px; color: var(--color-text-muted); font-size: var(--font-size-xs); white-space: nowrap; }
@@ -569,7 +580,7 @@
 .probe-policy-preview small { color: var(--color-text-muted); font-size: var(--font-size-2xs); }
 .probe-policy-preview strong { font-size: var(--font-size-xs); font-weight: var(--font-weight-semibold); }
 
-.probe-history-summary { grid-template-columns: 1.1fr repeat(4, minmax(0, 1fr)); }
+.probe-history-summary { grid-template-columns: 1.1fr repeat(3, minmax(0, 1fr)); }
 .probe-history-summary > div { min-height: 64px; }
 .probe-history-list > div { padding: 11px 12px; }
 .probe-history-list > div > div { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
@@ -741,7 +752,7 @@
   .probe-history-summary { grid-template-columns: 1fr 1fr; }
   .probe-history-summary > div:nth-child(odd) { border-left: 0; }
   .probe-history-summary > div:nth-child(n+3) { border-top: 1px solid var(--color-border-subtle); }
-  .probe-history-summary > div:last-child { grid-column: 1 / -1; }
+  .probe-history-summary > div:last-child { grid-column: auto; }
 }
 
 @media (max-width: 480px) {

@@ -8,13 +8,13 @@ import (
 )
 
 const (
-	BuiltinOfficialCatalogVersion = "official-usd-2026-08-07-v4"
+	BuiltinOfficialCatalogVersion = "official-usd-2026-08-07-v5"
 	builtinOfficialCatalogSource  = "JieShan bundled official API pricing snapshot"
 	openAILongContextThreshold    = int64(272_000)
 	xAILongContextThreshold       = int64(200_000)
 
 	openAIOfficialPricingURL    = "https://developers.openai.com/api/docs/pricing"
-	anthropicOfficialPricingURL = "https://platform.claude.com/docs/en/about-claude/pricing"
+	anthropicOfficialPricingURL = "https://claude.com/pricing#api"
 	geminiOfficialPricingURL    = "https://ai.google.dev/gemini-api/docs/pricing"
 	deepSeekOfficialPricingURL  = "https://api-docs.deepseek.com/quick_start/pricing/"
 	xAIOfficialPricingURL       = "https://docs.x.ai/developers/pricing"
@@ -26,10 +26,12 @@ var builtinOfficialVerifiedAt = time.Date(2026, time.August, 7, 0, 0, 0, 0, time
 // catalog. Their SHA-256 digests prove exactly which official price facts were
 // reviewed without requiring network access during startup.
 const openAIPricingEvidence = `source=https://developers.openai.com/api/docs/pricing
-verified_at=2026-08-06
+verified_at=2026-08-07
 currency=USD
-basis=standard API text-token prices per 1M tokens
-long_context_rule=input+cached_input+cache_write tokens >272000 applies the long-context rates to the whole request
+basis=standard global API text-token prices per 1M tokens; excludes batch, flex, fast, priority, and regional-processing uplifts
+legacy_model_price_sources=https://developers.openai.com/api/docs/models/gpt-5.2,https://developers.openai.com/api/docs/models/gpt-5.2-codex,https://developers.openai.com/api/docs/models/gpt-5.1,https://developers.openai.com/api/docs/models/gpt-5.1-codex,https://developers.openai.com/api/docs/models/gpt-5.1-codex-mini,https://developers.openai.com/api/docs/models/gpt-5,https://developers.openai.com/api/docs/models/gpt-5-mini,https://developers.openai.com/api/docs/models/gpt-5-nano,https://developers.openai.com/api/docs/models/gpt-4.1,https://developers.openai.com/api/docs/models/gpt-4.1-mini,https://developers.openai.com/api/docs/models/gpt-4.1-nano,https://developers.openai.com/api/docs/models/gpt-4o,https://developers.openai.com/api/docs/models/gpt-4o-mini
+reasoning_rule=reasoning tokens are billed as output tokens
+long_context_rule=input+cached_input+cache_write tokens >=272000 applies the long-context rates to the whole request for GPT-5.4 and newer models
 gpt-5.6-sol=input:5.00,cached_input:0.50,cache_write:6.25,output:30.00;long=input:10.00,cached_input:1.00,cache_write:12.50,output:45.00
 gpt-5.6-terra=input:2.00,cached_input:0.20,cache_write:2.50,output:12.00;long=input:4.00,cached_input:0.40,cache_write:5.00,output:18.00
 gpt-5.6-luna=input:0.20,cached_input:0.02,cache_write:0.25,output:1.20;long=input:0.40,cached_input:0.04,cache_write:0.50,output:1.80
@@ -37,8 +39,8 @@ gpt-5.5=input:5.00,cached_input:0.50,output:30.00;long=input:10.00,cached_input:
 gpt-5.5-pro=input:30.00,output:180.00;long=input:60.00,output:270.00
 gpt-5.4=input:2.50,cached_input:0.25,output:15.00;long=input:5.00,cached_input:0.50,output:22.50
 gpt-5.4-pro=input:30.00,output:180.00;long=input:60.00,output:270.00
-gpt-5.4-mini=input:0.75,cached_input:0.075,output:4.50
-gpt-5.4-nano=input:0.20,cached_input:0.02,output:1.25
+gpt-5.4-mini=input:0.75,cached_input:0.075,output:4.50;long=input:1.50,cached_input:0.15,output:6.75
+gpt-5.4-nano=input:0.20,cached_input:0.02,output:1.25;long=input:0.40,cached_input:0.04,output:1.875
 gpt-5.3-codex=input:1.75,cached_input:0.175,output:14.00
 gpt-5.2=input:1.75,cached_input:0.175,output:14.00
 gpt-5.2-codex=input:1.75,cached_input:0.175,output:14.00
@@ -54,33 +56,39 @@ gpt-4.1-nano=input:0.10,cached_input:0.025,output:0.40
 gpt-4o=input:2.50,cached_input:1.25,output:10.00
 gpt-4o-mini=input:0.15,cached_input:0.075,output:0.60`
 
-const anthropicPricingEvidence = `source=https://platform.claude.com/docs/en/about-claude/pricing
-verified_at=2026-08-06
+const anthropicPricingEvidence = `source=https://claude.com/pricing#api
+model_id_source=https://platform.claude.com/docs/en/about-claude/models/overview
+verified_at=2026-08-07
 currency=USD
-basis=standard API token prices per 1M tokens
+basis=standard first-party Claude API token prices per 1M tokens effective on 2026-08-07
+reasoning_rule=thinking tokens are output tokens and use the output price
+long_context_rule=Claude 4.6 and newer use standard pricing across the full 1M-token context window
 claude-fable-5=input:10.00,cache_write_5m:12.50,cache_write_1h:20.00,cache_read:1.00,output:50.00
 claude-opus-5=input:5.00,cache_write_5m:6.25,cache_write_1h:10.00,cache_read:0.50,output:25.00
 claude-opus-4-8=input:5.00,cache_write_5m:6.25,cache_write_1h:10.00,cache_read:0.50,output:25.00
 claude-opus-4-7=input:5.00,cache_write_5m:6.25,cache_write_1h:10.00,cache_read:0.50,output:25.00
 claude-opus-4-6=input:5.00,cache_write_5m:6.25,cache_write_1h:10.00,cache_read:0.50,output:25.00
+claude-sonnet-5=input:2.00,cache_write_5m:2.50,cache_write_1h:4.00,cache_read:0.20,output:10.00;introductory_price_through=2026-08-31T23:59:00-07:00
 claude-sonnet-4-6=input:3.00,cache_write_5m:3.75,cache_write_1h:6.00,cache_read:0.30,output:15.00
+claude-sonnet-4-5-20250929=input:3.00,cache_write_5m:3.75,cache_write_1h:6.00,cache_read:0.30,output:15.00
 claude-opus-4-5-20251101=input:5.00,cache_write_5m:6.25,cache_write_1h:10.00,cache_read:0.50,output:25.00
-claude-haiku-4-5-20251001=input:1.00,cache_write_5m:1.25,cache_write_1h:2.00,cache_read:0.10,output:5.00
-excluded=temporary Claude Sonnet 5 introductory pricing and long-context premium models are not included`
+claude-haiku-4-5-20251001=input:1.00,cache_write_5m:1.25,cache_write_1h:2.00,cache_read:0.10,output:5.00`
 
 const geminiPricingEvidence = `source=https://ai.google.dev/gemini-api/docs/pricing
-verified_at=2026-08-06
+verified_at=2026-08-07
 currency=USD
 basis=standard paid-tier token prices per 1M tokens
+reasoning_rule=thought tokens use the published output price labeled as including thinking
 gemini-3.6-flash=input:1.50,cache_read:0.15,output_including_thinking:7.50
 gemini-3.5-flash=input:1.50,cache_read:0.15,output_including_thinking:9.00
 gemini-3.5-flash-lite=input:0.30,cache_read:0.03,output_including_thinking:2.50
 excluded=context-tiered or modality-dependent Gemini prices are not included`
 
 const deepSeekPricingEvidence = `source=https://api-docs.deepseek.com/quick_start/pricing/
-verified_at=2026-08-06
+verified_at=2026-08-07
 currency=USD
 basis=official API token prices per 1M tokens
+reasoning_rule=thinking-mode reasoning_content tokens are included in output-token charges
 deepseek-v4-flash=input_cache_miss:0.14,input_cache_hit:0.0028,output:0.28
 deepseek-v4-pro=input_cache_miss:0.435,input_cache_hit:0.003625,output:0.87
 notice=official page states that a future price increase is planned but not yet specified`
@@ -109,8 +117,8 @@ func BuiltinOfficialUSDCatalog() Catalog {
 		openAITieredEntry("gpt-5.5-pro", "30.00", "", "", "180.00", "60.00", "", "", "270.00", openAIDigest),
 		openAITieredEntry("gpt-5.4", "2.50", "0.25", "", "15.00", "5.00", "0.50", "", "22.50", openAIDigest),
 		openAITieredEntry("gpt-5.4-pro", "30.00", "", "", "180.00", "60.00", "", "", "270.00", openAIDigest),
-		openAIEntry("gpt-5.4-mini", "0.75", "0.075", "4.50", true, openAIDigest),
-		openAIEntry("gpt-5.4-nano", "0.20", "0.02", "1.25", true, openAIDigest),
+		openAITieredEntry("gpt-5.4-mini", "0.75", "0.075", "", "4.50", "1.50", "0.15", "", "6.75", openAIDigest),
+		openAITieredEntry("gpt-5.4-nano", "0.20", "0.02", "", "1.25", "0.40", "0.04", "", "1.875", openAIDigest),
 		openAIEntry("gpt-5.3-codex", "1.75", "0.175", "14.00", true, openAIDigest),
 		openAIEntry("gpt-5.2", "1.75", "0.175", "14.00", true, openAIDigest),
 		openAIEntry("gpt-5.2-codex", "1.75", "0.175", "14.00", true, openAIDigest),
@@ -130,7 +138,9 @@ func BuiltinOfficialUSDCatalog() Catalog {
 		anthropicEntry("claude-opus-4-8", "5.00", "6.25", "10.00", "0.50", "25.00", anthropicDigest),
 		anthropicEntry("claude-opus-4-7", "5.00", "6.25", "10.00", "0.50", "25.00", anthropicDigest),
 		anthropicEntry("claude-opus-4-6", "5.00", "6.25", "10.00", "0.50", "25.00", anthropicDigest),
+		anthropicEntry("claude-sonnet-5", "2.00", "2.50", "4.00", "0.20", "10.00", anthropicDigest),
 		anthropicEntry("claude-sonnet-4-6", "3.00", "3.75", "6.00", "0.30", "15.00", anthropicDigest),
+		anthropicEntry("claude-sonnet-4-5-20250929", "3.00", "3.75", "6.00", "0.30", "15.00", anthropicDigest),
 		anthropicEntry("claude-opus-4-5-20251101", "5.00", "6.25", "10.00", "0.50", "25.00", anthropicDigest),
 		anthropicEntry("claude-haiku-4-5-20251001", "1.00", "1.25", "2.00", "0.10", "5.00", anthropicDigest),
 		geminiEntry("gemini-3.6-flash", "1.50", "0.15", "7.50", geminiDigest),
@@ -162,8 +172,9 @@ func openAIEntry(sku, input, cacheRead, output string, reasoning bool, sourceDig
 func openAITieredEntry(sku, input, cacheRead, cacheWrite, output, longInput, longCacheRead, longCacheWrite, longOutput, sourceDigest string) Entry {
 	entry := builtinUSDEntry(sku, "openai", openAIOfficialPricingURL, sourceDigest, openAIRates(input, cacheRead, cacheWrite, output, true))
 	entry.LongContext = &LongContextTier{
-		ThresholdTokens: openAILongContextThreshold,
-		Rates:           openAIRates(longInput, longCacheRead, longCacheWrite, longOutput, true),
+		ThresholdTokens:    openAILongContextThreshold,
+		ThresholdInclusive: true,
+		Rates:              openAIRates(longInput, longCacheRead, longCacheWrite, longOutput, true),
 	}
 	return entry
 }

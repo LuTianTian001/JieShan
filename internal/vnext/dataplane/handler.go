@@ -13,8 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"time"
 
+	"github.com/LuTianTian001/JieShan/internal/vnext/capacity"
 	"github.com/LuTianTian001/JieShan/internal/vnext/gateway"
 	"github.com/LuTianTian001/JieShan/internal/vnext/protocol"
 	"github.com/LuTianTian001/JieShan/internal/vnext/resolver"
@@ -435,16 +435,12 @@ func writeRuntimeError(writer http.ResponseWriter, style errorStyle, err error) 
 		writeProtocolError(writer, style, http.StatusBadRequest, "invalid_request", "Request is not valid for this API surface")
 	case errors.Is(err, gateway.ErrQuotaExceeded):
 		writeProtocolError(writer, style, http.StatusTooManyRequests, "insufficient_quota", "API key quota is exhausted or cannot admit this request")
-	case errors.Is(err, gateway.ErrRateLimitExceeded):
-		if retryAfter := gateway.RateLimitRetryAfter(err); retryAfter > 0 {
-			seconds := int64((retryAfter + time.Second - 1) / time.Second)
-			writer.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
-		}
-		writeProtocolError(writer, style, http.StatusTooManyRequests, "rate_limit_exceeded", "API key request rate limit was exceeded")
 	case errors.Is(err, gateway.ErrPricingUnavailable):
 		writeProtocolError(writer, style, http.StatusServiceUnavailable, "pricing_unavailable", "Official pricing is unavailable for this model")
 	case errors.Is(err, gateway.ErrRequestAlreadyStarted):
 		writeProtocolError(writer, style, http.StatusConflict, "request_conflict", "Request ID has already been used")
+	case errors.Is(err, capacity.ErrUpstreamBusy):
+		writeProtocolError(writer, style, http.StatusServiceUnavailable, capacity.UpstreamBusyCode, "Upstream capacity is currently busy")
 	case errors.Is(err, gateway.ErrNoAvailableUpstream):
 		writeProtocolError(writer, style, http.StatusServiceUnavailable, "upstream_unavailable", "No upstream target is currently available")
 	case errors.Is(err, gateway.ErrRequestTimeout), errors.Is(err, gateway.ErrFirstOutputTimeout), errors.Is(err, gateway.ErrStreamIdleTimeout):

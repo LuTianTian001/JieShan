@@ -219,7 +219,7 @@ func newStreamSurfaceFixture(t *testing.T, doer *scriptedDoer, test streamSurfac
 		t.Fatal(err)
 	}
 	resolution := resolver.Resolution{
-		DownstreamKeyID: 7, DownstreamKeyRevision: 2,
+		DownstreamKeyID:  7,
 		PublishedModelID: 70, PublishedModelRevision: 3,
 		RoutingProfileID: 9, RoutingProfileName: "Strict order",
 		SourceProfileID: 1, SourceProfileName: "Default", RouteRevision: 3,
@@ -241,7 +241,10 @@ func newStreamSurfaceFixture(t *testing.T, doer *scriptedDoer, test streamSurfac
 		newGatewayPriceBook(t),
 		NewConservativeJSONReservationPlanner(),
 		doer,
-		Options{Now: monotonicClock(time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)), DefaultMaxOutputTokens: 128},
+		Options{
+			Now:                    monotonicClock(time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)),
+			DefaultMaxOutputTokens: 128, Capacity: directCapacity{},
+		},
 	)
 	if err != nil {
 		t.Fatal(err)

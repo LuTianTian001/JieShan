@@ -16,7 +16,7 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { ArrowDown, ArrowUp, GripVertical, LoaderCircle } from 'lucide-react';
-import { Badge, IconButton, Switch } from '../../components/ui';
+import { Badge, IconButton } from '../../components/ui';
 import { formatDateTime, protocolLabel } from '../../lib/format';
 import type { ModelTarget, MonitorTarget, RouteTarget } from '../../lib/types';
 
@@ -92,10 +92,8 @@ function probePresentation(
 function routingPresentation(
   catalog: ModelTarget | undefined,
   monitor: MonitorTarget | undefined,
-  paused: boolean,
   slowFirstOutputThresholdMs: number,
 ): StatePresentation {
-  if (paused) return { label: '手动暂停', tone: 'neutral' };
   if (!catalog?.routable || !catalog.usableCredentialCount || !catalog.enabled || !catalog.siteEnabled || !catalog.endpointEnabled) {
     return { label: '不可路由', tone: 'danger' };
   }
@@ -116,22 +114,18 @@ function SortableTarget({
   catalog,
   monitor,
   slowFirstOutputThresholdMs,
-  paused,
   disabled,
   total,
   onMove,
-  onTogglePaused,
 }: {
   target: RouteTarget;
   position: number;
   catalog?: ModelTarget;
   monitor?: MonitorTarget;
   slowFirstOutputThresholdMs: number;
-  paused: boolean;
   disabled: boolean;
   total: number;
   onMove: (direction: -1 | 1) => void;
-  onTogglePaused?: (paused: boolean) => void;
 }) {
   const sortable = useSortable({ id: target.providerModelTargetId, disabled });
   const style = {
@@ -140,7 +134,7 @@ function SortableTarget({
   };
   const connection = connectionPresentation(catalog, monitor);
   const probe = probePresentation(monitor, slowFirstOutputThresholdMs);
-  const routing = routingPresentation(catalog, monitor, paused, slowFirstOutputThresholdMs);
+  const routing = routingPresentation(catalog, monitor, slowFirstOutputThresholdMs);
   const slowFirstOutput = isSlowFirstOutput(monitor, slowFirstOutputThresholdMs);
   const recovery = cooldownLabel(monitor);
 
@@ -188,7 +182,6 @@ function SortableTarget({
       </div>
 
       <div className="route-target-controls">
-        {onTogglePaused && <Switch checked={!paused} label={paused ? '已暂停' : '参与路由'} disabled={disabled} onChange={(enabled) => onTogglePaused(!enabled)} />}
         <div className="route-move-actions">
           <IconButton label={`上移 ${target.siteName}`} disabled={disabled || position === 0} onClick={() => onMove(-1)}><ArrowUp size={15} /></IconButton>
           <IconButton label={`下移 ${target.siteName}`} disabled={disabled || position === total - 1} onClick={() => onMove(1)}><ArrowDown size={15} /></IconButton>
@@ -203,21 +196,17 @@ export function RouteTargetOrder({
   catalog,
   monitorTargets = [],
   slowFirstOutputThresholdMs,
-  pausedTargetIds,
   saving,
   readOnly = false,
   onReorder,
-  onTogglePaused,
 }: {
   targets: RouteTarget[];
   catalog: ModelTarget[];
   monitorTargets?: MonitorTarget[];
   slowFirstOutputThresholdMs: number;
-  pausedTargetIds?: Set<number>;
   saving: boolean;
   readOnly?: boolean;
   onReorder: (targetIds: number[]) => Promise<void>;
-  onTogglePaused?: (targetId: number, paused: boolean) => void;
 }) {
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -246,7 +235,7 @@ export function RouteTargetOrder({
     <div className="route-order-wrap">
       {saving && <span className="route-saving"><LoaderCircle className="spin" size={13} />正在保存顺序</span>}
       <div className="route-target-table-head" aria-hidden="true">
-        <span>优先级</span><span>上游与 API Key</span><span>运行状态</span><span>响应速度</span><span>路由开关</span>
+        <span>优先级</span><span>上游与 API Key</span><span>运行状态</span><span>响应速度</span><span>排序操作</span>
       </div>
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={dragEnd}>
         <SortableContext items={targets.map((item) => item.providerModelTargetId)} strategy={verticalListSortingStrategy}>
@@ -259,11 +248,9 @@ export function RouteTargetOrder({
                 catalog={catalogById.get(target.providerModelTargetId)}
                 monitor={monitorById.get(target.providerModelTargetId)}
                 slowFirstOutputThresholdMs={slowFirstOutputThresholdMs}
-                paused={pausedTargetIds?.has(target.providerModelTargetId) || false}
                 disabled={saving || readOnly}
                 total={targets.length}
                 onMove={(direction) => move(index, direction)}
-                onTogglePaused={onTogglePaused ? (paused) => onTogglePaused(target.providerModelTargetId, paused) : undefined}
               />
             ))}
           </div>

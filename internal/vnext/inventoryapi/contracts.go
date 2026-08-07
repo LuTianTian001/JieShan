@@ -35,6 +35,22 @@ type CredentialRecord struct {
 	Runtime    vnextstore.CredentialRuntimeState
 }
 
+type TokenJSONImportItem struct {
+	CredentialName string
+	Secret         []byte
+	EndpointName   string
+	BaseURL        string
+	WireProtocol   string
+	Surface        string
+	AdapterKind    string
+	AuthScheme     string
+}
+
+type TokenJSONImportRecords struct {
+	CredentialIDs []int64
+	EndpointIDs   []int64
+}
+
 type ModelTargetCatalogEntry struct {
 	Target       vnextstore.ProviderModelTargetInventory
 	Capabilities vnextprotocol.Capabilities
@@ -62,6 +78,7 @@ type Repository interface {
 	CreateSite(context.Context, vnextstore.SiteWrite) (vnextstore.Site, error)
 	GetSite(context.Context, int64) (vnextstore.Site, error)
 	UpdateSite(context.Context, int64, vnextstore.SiteUpdate) (vnextstore.Site, error)
+	DeleteSite(context.Context, int64, int64) error
 
 	ListSiteEndpoints(context.Context, int64) ([]vnextstore.SiteEndpoint, error)
 	CreateSiteEndpoint(context.Context, int64, vnextstore.SiteEndpointWrite) (vnextstore.SiteEndpoint, error)
@@ -75,6 +92,7 @@ type Repository interface {
 	GetSiteCredential(context.Context, int64, int64) (CredentialRecord, error)
 	UpdateSiteCredential(context.Context, int64, int64, vnextstore.SiteCredentialUpdate) (CredentialRecord, error)
 	ReplaceSiteCredentialSecret(context.Context, int64, int64, CredentialSecretUpdate) (CredentialRecord, error)
+	ImportTokenJSONItems(context.Context, int64, []TokenJSONImportItem) (TokenJSONImportRecords, error)
 
 	ListProviderModelTargets(context.Context, int64, int64) ([]vnextstore.ProviderModelTarget, error)
 	CreateProviderModelTarget(context.Context, vnextstore.ProviderModelTargetWrite) (vnextstore.ProviderModelTarget, error)

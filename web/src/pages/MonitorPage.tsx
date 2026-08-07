@@ -5,6 +5,7 @@ import {
   Badge,
   Button,
   Dialog,
+  Disclosure,
   EmptyState,
   ErrorState,
   Field,
@@ -21,11 +22,6 @@ import {
 import { api, ApiUnavailableError } from '../lib/api';
 import { formatDateTime, formatRelativeTime, protocolLabel } from '../lib/format';
 import { useResource } from '../lib/hooks';
-import {
-  DEFAULT_PROBE_PROTOTYPE_PREFERENCES,
-  loadProbePrototypePreferences,
-  saveProbePrototypePreferences,
-} from '../lib/probePreferences';
 import type { GatewaySettings, ModelRoute, MonitorHealth, MonitorModel, MonitorSetting, MonitorSnapshot, MonitorTarget, MonitorTargetHistory } from '../lib/types';
 
 interface MonitorData {
@@ -45,16 +41,17 @@ interface BulkProbeState {
   running: boolean;
   completed: number;
   total: number;
+  currentModelId: number | null;
 }
 
-type MonitorStatusFilter = 'all' | 'ready' | 'attention' | 'unavailable' | 'cooling' | 'unprobed';
+type MonitorStatusFilter = 'all' | 'cooling';
 type BadgeTone = 'neutral' | 'accent' | 'success' | 'warning' | 'danger' | 'info';
 
 const DEFAULT_PROBE_PREFERENCES: ProbePreferences = {
-  okProbeIntervalMs: 5 * 60_000,
+  okProbeIntervalMs: 15 * 60_000,
   failureThreshold: 2,
-  cooldownMs: 5 * 60_000,
-  slowFirstOutputThresholdMs: DEFAULT_PROBE_PROTOTYPE_PREFERENCES.slowFirstOutputThresholdMs,
+  cooldownMs: 15 * 60_000,
+  slowFirstOutputThresholdMs: 15_000,
 };
 
 async function loadMonitor(): Promise<MonitorData> {
@@ -72,12 +69,11 @@ async function loadMonitor(): Promise<MonitorData> {
 }
 
 function preferencesFromSettings(settings: GatewaySettings): ProbePreferences {
-  const prototypePreferences = loadProbePrototypePreferences();
   return {
     okProbeIntervalMs: settings.probeIntervalMs || DEFAULT_PROBE_PREFERENCES.okProbeIntervalMs,
     failureThreshold: settings.failureThreshold || DEFAULT_PROBE_PREFERENCES.failureThreshold,
     cooldownMs: settings.cooldownMs || DEFAULT_PROBE_PREFERENCES.cooldownMs,
-    slowFirstOutputThresholdMs: prototypePreferences.slowFirstOutputThresholdMs,
+    slowFirstOutputThresholdMs: settings.firstOutputTimeoutMs || DEFAULT_PROBE_PREFERENCES.slowFirstOutputThresholdMs,
   };
 }
 
@@ -105,8 +101,23 @@ function pointTitle(
   slowFirstOutputThresholdMs: number,
 ): string {
   const status = point.outcome === 'success' ? '成功' : point.outcome === 'failure' ? '失败' : '跳过';
-  const slowFirstOutput = isSlowFirstOutput(point, slowFirstOutputThresholdMs) ? ' · 首字超阈值，触发冷却' : '';
-  return `${formatRelativeTime(point.finishedAt)} · ${status} · 首字 ${formatProbeSeconds(point.firstOutputMs)} · 总耗时 ${formatProbeSeconds(point.totalLatencyMs)}${slowFirstOutput}`;
+  const slowFirstOutput = isSlowFirstOutput(point, slowFirstOutputThresholdMs) ? ' · 首 Token 超阈值，触发冷却' : '';
+  return `${formatRelativeTime(point.finishedAt)} · ${status} · 首 Token 延迟 ${formatProbeSeconds(point.firstOutputMs)}${slowFirstOutput}`;
+}
+
+function probeCountdown(deadline: number | null | undefined, now: number, busy: boolean): string {
+  if (busy) return '探测中';
+  if (!deadline) return '未安排';
+  const remaining = Math.max(0, deadline - now);
+  if (remaining === 0) return '即将开始';
+  const seconds = Math.ceil(remaining / 1_000);
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  if (minutes >= 60) {
+    const hours = Math.floor(minutes / 60);
+    return `${hours}:${String(minutes % 60).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
+  }
+  return `${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
 }
 
 function probeIntervalLabel(value: number): string {
@@ -130,6 +141,21 @@ function probePermitReasonLabel(value: string): string {
     busy: '已有探针正在执行',
   };
   return labels[value] ?? value;
+}
+
+function circuitPhaseLabel(value: string): string {
+  return {
+    closed: '正常',
+    suspect: '观察中',
+    cooling: '冷却中',
+    recovering: '恢复测试',
+    open: '已断开',
+  }[value] || value;
+}
+
+function evidenceWindowLabel(value: number): string {
+  if (value >= 60 * 60_000) return `${Math.round(value / (60 * 60_000))} 小时`;
+  return `${Math.max(1, Math.round(value / 60_000))} 分钟`;
 }
 
 function monitorCredentialName(target: MonitorTarget): string {
@@ -157,7 +183,7 @@ function targetProbeState(target: MonitorTarget, slowFirstOutputThresholdMs: num
 }
 
 function routingLabel(target: MonitorTarget, slowFirstOutputThresholdMs: number): string {
-  if (isSlowFirstOutput(target.latest, slowFirstOutputThresholdMs)) return '慢首字冷却';
+  if (isSlowFirstOutput(target.latest, slowFirstOutputThresholdMs)) return '慢首 Token 冷却';
   const labels: Partial<Record<MonitorHealth, string>> = {
     healthy: '可路由',
     degraded: '部分可用',
@@ -200,13 +226,7 @@ function isRouteReady(target: MonitorTarget, slowFirstOutputThresholdMs: number)
 
 function modelMatchesFilter(model: MonitorModel, filter: MonitorStatusFilter, slowFirstOutputThresholdMs: number): boolean {
   if (filter === 'all') return true;
-  const targetCount = model.targets.length;
-  const routeReadyCount = model.targets.filter((target) => isRouteReady(target, slowFirstOutputThresholdMs)).length;
-  if (filter === 'ready') return targetCount > 0 && routeReadyCount === targetCount;
-  if (filter === 'attention') return routeReadyCount > 0 && routeReadyCount < targetCount;
-  if (filter === 'unavailable') return targetCount > 0 && routeReadyCount === 0;
-  if (filter === 'cooling') return model.targets.some((target) => effectiveTargetStatus(target, slowFirstOutputThresholdMs) === 'cooling');
-  return model.targets.some((target) => !target.latest || ['unprobed', 'skipped'].includes(target.status));
+  return model.targets.some((target) => effectiveTargetStatus(target, slowFirstOutputThresholdMs) === 'cooling');
 }
 
 async function keepPrototypeProgressVisible(): Promise<void> {
@@ -226,8 +246,10 @@ export function MonitorPage() {
   const [selectionQuery, setSelectionQuery] = useState('');
   const [savingSelection, setSavingSelection] = useState(false);
   const [probingModel, setProbingModel] = useState<number | null>(null);
+  const [probingTarget, setProbingTarget] = useState<{ modelId: number; targetId: number } | null>(null);
   const [expandedModelIds, setExpandedModelIds] = useState<Set<number>>(() => new Set());
-  const [bulkProbe, setBulkProbe] = useState<BulkProbeState>({ running: false, completed: 0, total: 0 });
+  const [bulkProbe, setBulkProbe] = useState<BulkProbeState>({ running: false, completed: 0, total: 0, currentModelId: null });
+  const [clockNow, setClockNow] = useState(() => Date.now());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [probePreferences, setProbePreferences] = useState<ProbePreferences>(DEFAULT_PROBE_PREFERENCES);
   const [draftPreferences, setDraftPreferences] = useState<ProbePreferences>(DEFAULT_PROBE_PREFERENCES);
@@ -254,6 +276,13 @@ export function MonitorPage() {
   useEffect(() => {
     if (selectionOpen) setSelectionQuery('');
   }, [selectionOpen]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (!document.hidden) setClockNow(Date.now());
+    }, 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -284,13 +313,10 @@ export function MonitorPage() {
     return { targetCount: targets.length, routeReady, cooling, failed, lastProbeAt };
   }, [monitored, probePreferences.slowFirstOutputThresholdMs]);
 
-  const statusCounts = useMemo(() => {
-    const filters: Array<Exclude<MonitorStatusFilter, 'all'>> = ['ready', 'attention', 'unavailable', 'cooling', 'unprobed'];
-    return filters.reduce<Record<Exclude<MonitorStatusFilter, 'all'>, number>>((counts, filter) => {
-      counts[filter] = monitored.filter((model) => modelMatchesFilter(model, filter, probePreferences.slowFirstOutputThresholdMs)).length;
-      return counts;
-    }, { ready: 0, attention: 0, unavailable: 0, cooling: 0, unprobed: 0 });
-  }, [monitored, probePreferences.slowFirstOutputThresholdMs]);
+  const coolingModelCount = useMemo(
+    () => monitored.filter((model) => modelMatchesFilter(model, 'cooling', probePreferences.slowFirstOutputThresholdMs)).length,
+    [monitored, probePreferences.slowFirstOutputThresholdMs],
+  );
 
   const selectableModels = useMemo(() => {
     const normalized = selectionQuery.trim().toLowerCase();
@@ -309,7 +335,7 @@ export function MonitorPage() {
   const probe = async (publishedModelId: number) => {
     setProbingModel(publishedModelId);
     try {
-      await api.probeModel(publishedModelId);
+      await Promise.all([api.probeModel(publishedModelId), keepPrototypeProgressVisible()]);
       toast.show('这个模型的全部上游已探测', 'success');
       await resource.refresh();
     } catch (reason) {
@@ -320,13 +346,31 @@ export function MonitorPage() {
     }
   };
 
+  const probeTarget = async (publishedModelId: number, providerModelTargetId: number, siteName: string) => {
+    setProbingTarget({ modelId: publishedModelId, targetId: providerModelTargetId });
+    try {
+      await Promise.all([
+        api.probeTarget(publishedModelId, providerModelTargetId),
+        keepPrototypeProgressVisible(),
+      ]);
+      toast.show(`${siteName} 已完成探测`, 'success');
+      await resource.refresh();
+    } catch (reason) {
+      toast.show(reason instanceof Error ? reason.message : '上游探测失败', 'error');
+      await resource.refresh();
+    } finally {
+      setProbingTarget(null);
+    }
+  };
+
   const probeAll = async () => {
     if (!monitored.length || bulkProbe.running) return;
-    setBulkProbe({ running: true, completed: 0, total: monitored.length });
+    setBulkProbe({ running: true, completed: 0, total: monitored.length, currentModelId: null });
     let failed = 0;
     try {
       await keepPrototypeProgressVisible();
       for (const model of monitored) {
+        setBulkProbe((current) => ({ ...current, currentModelId: model.publishedModelId }));
         try {
           await api.probeModel(model.publishedModelId);
         } catch {
@@ -341,7 +385,7 @@ export function MonitorPage() {
     } catch (reason) {
       toast.show(reason instanceof Error ? reason.message : '探测结果刷新失败', 'error');
     } finally {
-      setBulkProbe({ running: false, completed: monitored.length, total: monitored.length });
+      setBulkProbe({ running: false, completed: monitored.length, total: monitored.length, currentModelId: null });
     }
   };
 
@@ -353,10 +397,6 @@ export function MonitorPage() {
   const saveProbeSettings = async () => {
     const settings = resource.data?.settings;
     if (!settings) return;
-    if (draftPreferences.slowFirstOutputThresholdMs >= settings.firstOutputTimeoutMs) {
-      toast.show('首字冷却阈值需要短于首字超时，才能在请求超时前生效。', 'error');
-      return;
-    }
     setSavingProbeSettings(true);
     try {
       const { revision, ...current } = settings;
@@ -365,14 +405,9 @@ export function MonitorPage() {
         probeIntervalMs: draftPreferences.okProbeIntervalMs,
         failureThreshold: draftPreferences.failureThreshold,
         cooldownMs: draftPreferences.cooldownMs,
+        firstOutputTimeoutMs: draftPreferences.slowFirstOutputThresholdMs,
       });
-      const savedPrototypePreferences = saveProbePrototypePreferences({
-        slowFirstOutputThresholdMs: draftPreferences.slowFirstOutputThresholdMs,
-      });
-      setProbePreferences({
-        ...preferencesFromSettings(updated),
-        slowFirstOutputThresholdMs: savedPrototypePreferences.slowFirstOutputThresholdMs,
-      });
+      setProbePreferences(preferencesFromSettings(updated));
       resource.setData((value) => value ? { ...value, settings: updated } : value);
       setSettingsOpen(false);
       toast.show('探针设置已保存，并与全局设置同步', 'success');
@@ -440,17 +475,17 @@ export function MonitorPage() {
     <div className="page monitor-page">
       <PageHeader
         title="模型监控"
-        description="只探测选中的模型；每个上游分别展示连接、探针、路由资格和真实响应速度。"
+        description="真实请求与主动探针分开呈现；每个上游同时展示连接、路由资格和熔断变化。"
         actions={<>
           <Button icon={ListChecks} onClick={() => setSelectionOpen(true)} disabled={!snapshot}>选择监控模型</Button>
           <Button icon={Settings2} onClick={openProbeSettings}>探针设置</Button>
-          <Button variant="primary" icon={RefreshCw} busy={bulkProbe.running} onClick={() => void probeAll()} disabled={!monitored.length}>{bulkProbeLabel}</Button>
+          <Button variant="primary" icon={RefreshCw} className={bulkProbe.running ? 'probe-refresh is-probing' : 'probe-refresh'} aria-busy={bulkProbe.running || undefined} onClick={() => void probeAll()} disabled={!monitored.length || bulkProbe.running}>{bulkProbeLabel}</Button>
         </>}
       />
 
       <div className="routing-policy-strip" role="status">
         <Activity size={15} />
-        <span><strong>自动 OK 探针</strong> · 每 {probeIntervalLabel(probePreferences.okProbeIntervalMs)}检测一次 · 首字超过 {probeIntervalLabel(probePreferences.slowFirstOutputThresholdMs)}单次冷却 · 普通失败连续 {probePreferences.failureThreshold} 次后冷却 {probeIntervalLabel(probePreferences.cooldownMs)}</span>
+        <span><strong>自动 OK 探针</strong> · 每 {probeIntervalLabel(probePreferences.okProbeIntervalMs)}检测一次 · 首 Token 超过 {probeIntervalLabel(probePreferences.slowFirstOutputThresholdMs)}单次冷却 · 普通失败连续 {probePreferences.failureThreshold} 次后冷却 {probeIntervalLabel(probePreferences.cooldownMs)}</span>
       </div>
 
       {snapshot && <div className="monitor-overview-strip">
@@ -466,11 +501,7 @@ export function MonitorPage() {
           <div className="segmented" role="group" aria-label="监控状态">
             {([
               { value: 'all', label: '全部', count: monitored.length },
-              { value: 'ready', label: '全部可路由', count: statusCounts.ready },
-              { value: 'attention', label: '部分可路由', count: statusCounts.attention },
-              { value: 'unavailable', label: '无可用路由', count: statusCounts.unavailable },
-              { value: 'cooling', label: '冷却中', count: statusCounts.cooling },
-              { value: 'unprobed', label: '尚未探测', count: statusCounts.unprobed },
+              { value: 'cooling', label: '冷却中', count: coolingModelCount },
             ] as const).map((item) => <button type="button" className={status === item.value ? 'is-active' : ''} onClick={() => setStatus(item.value)} key={item.value}>{item.label}<span className="monitor-filter-count">{item.count}</span></button>)}
           </div>
         </FilterBar>
@@ -480,6 +511,10 @@ export function MonitorPage() {
           const connected = model.targets.filter((target) => targetConnection(target).tone === 'success').length;
           const probeHealthy = model.targets.filter((target) => targetProbeState(target, probePreferences.slowFirstOutputThresholdMs) === 'healthy').length;
           const routeReady = model.targets.filter((target) => isRouteReady(target, probePreferences.slowFirstOutputThresholdMs)).length;
+          const modelProbing = probingModel === model.publishedModelId || bulkProbe.currentModelId === model.publishedModelId || probingTarget?.modelId === model.publishedModelId || model.monitor.busy;
+          const renderedTargets = status === 'cooling'
+            ? model.targets.filter((target) => effectiveTargetStatus(target, probePreferences.slowFirstOutputThresholdMs) === 'cooling')
+            : model.targets;
           return <article className="monitor-model" key={model.publishedModelId}>
             <header className="monitor-model-header">
               <button
@@ -490,17 +525,18 @@ export function MonitorPage() {
                 onClick={() => toggleModelDetails(model.publishedModelId)}
               >
                 <span className="monitor-model-icon"><HeartPulse size={17} /></span>
-                <span className="monitor-model-name"><span><code>{model.publicModel}</code><Badge tone={routeReady === model.targets.length && model.targets.length ? 'success' : routeReady ? 'warning' : 'danger'}>{routeReady === model.targets.length && model.targets.length ? '全部可路由' : routeReady ? `${routeReady} / ${model.targets.length} 可路由` : '无可用路由'}</Badge></span><small>最近探测 {formatRelativeTime(model.monitor.lastProbeFinishedAt)}</small></span>
+                <span className="monitor-model-name"><span><code>{model.publicModel}</code><Badge tone={routeReady === model.targets.length && model.targets.length ? 'success' : routeReady ? 'warning' : 'danger'}>{routeReady === model.targets.length && model.targets.length ? '全部可路由' : routeReady ? `${routeReady} / ${model.targets.length} 可路由` : '无可用路由'}</Badge></span><small>最近探测 {formatRelativeTime(model.monitor.lastProbeFinishedAt)} · 下次自动探针 {probeCountdown(model.monitor.nextProbeAt, clockNow, modelProbing)}</small></span>
                 <span className="monitor-model-stats"><span><strong>{connected} / {model.targets.length}</strong>连接正常</span><span><strong>{probeHealthy} / {model.targets.length}</strong>探针通过</span><span><strong>{routeReady} / {model.targets.length}</strong>参与路由</span></span>
               </button>
-              <div className="model-route-actions"><Button size="sm" icon={RefreshCw} busy={probingModel === model.publishedModelId || model.monitor.busy} disabled={bulkProbe.running} onClick={() => void probe(model.publishedModelId)}>探测全部上游</Button><IconButton className={`model-route-disclosure ${expanded ? 'is-open' : ''}`} label={`${expanded ? '收起' : '展开'} ${model.publicModel} 的监控明细`} aria-expanded={expanded} onClick={() => toggleModelDetails(model.publishedModelId)}><ChevronDown size={17} /></IconButton></div>
+              <div className="model-route-actions"><Button size="sm" icon={RefreshCw} className={modelProbing ? 'probe-refresh is-probing' : 'probe-refresh'} aria-busy={modelProbing || undefined} disabled={bulkProbe.running || modelProbing || probingTarget !== null} onClick={() => void probe(model.publishedModelId)}>探测全部上游</Button><IconButton className={`model-route-disclosure ${expanded ? 'is-open' : ''}`} label={`${expanded ? '收起' : '展开'} ${model.publicModel} 的监控明细`} aria-expanded={expanded} onClick={() => toggleModelDetails(model.publishedModelId)}><ChevronDown size={17} /></IconButton></div>
             </header>
-            {expanded && <div className="monitor-targets">{model.targets.map((target) => {
+            {expanded && <div className="monitor-targets">{renderedTargets.map((target) => {
               const connection = targetConnection(target);
               const slowFirstOutput = isSlowFirstOutput(target.latest, probePreferences.slowFirstOutputThresholdMs);
               const effectiveStatus = effectiveTargetStatus(target, probePreferences.slowFirstOutputThresholdMs);
               const probeState = probePresentation(target, probePreferences.slowFirstOutputThresholdMs);
               const routeState = routingPresentation(target, probePreferences.slowFirstOutputThresholdMs);
+              const targetProbing = modelProbing && (probingTarget === null || probingTarget.targetId === target.providerModelTargetId);
               return <div className="monitor-target" key={target.publishedModelTargetId}>
                 <span className="monitor-target-rank" title={`路由优先级 ${target.position + 1}`}>{target.position + 1}</span>
                 <div className="monitor-target-identity"><strong>{target.siteName}</strong><span>{monitorCredentialName(target) || `${protocolLabel(target.wireProtocol)} · ${target.usableCredentialCount} 个 API Key`}</span><code>{target.sourceModel}</code></div>
@@ -509,17 +545,16 @@ export function MonitorPage() {
                   <span><small>探针</small><Badge tone={probeState.tone}>{probeState.label}</Badge></span>
                   <span><small>路由资格</small><Badge tone={routeState.tone}>{routeState.label}</Badge></span>
                 </div>
-                <div className="monitor-target-metrics">
-                  <span><small>成功率</small><strong>{basisPoints(target.successBasisPoints)}</strong></span>
-                  <span><small>首字</small><strong>{formatProbeSeconds(target.latest?.firstOutputMs)}</strong></span>
-                  <span><small>总耗时</small><strong>{formatProbeSeconds(target.latest?.totalLatencyMs)}</strong></span>
+                <div className="monitor-target-metrics monitor-target-evidence">
+                  <span><small>真实流量 · {evidenceWindowLabel(target.evidence.liveTraffic.windowMs)}</small><strong>{basisPoints(target.evidence.liveTraffic.successBasisPoints)}</strong><em>{target.evidence.liveTraffic.samples} 请求 · P95 首 Token {formatProbeSeconds(target.evidence.liveTraffic.p95FirstOutputMs)}</em></span>
+                  <span><small>主动探针 · {evidenceWindowLabel(target.evidence.probe.windowMs)}</small><strong>{basisPoints(target.evidence.probe.successBasisPoints)}</strong><em>{target.evidence.probe.samples} 次 · 首 Token {formatProbeSeconds(target.latest?.firstOutputMs)}</em></span>
                 </div>
                 <div className="monitor-target-observation">
-                  <button type="button" className="status-history" aria-label={`查看 ${target.siteName} 的完整探针历史`} title="查看完整探针历史" onClick={() => void openHistory(model, target)}>{target.statusBar.slice(-16).map((point) => <span className={`history-${isSlowFirstOutput(point, probePreferences.slowFirstOutputThresholdMs) ? 'slow' : point.outcome}`} title={pointTitle(point, probePreferences.slowFirstOutputThresholdMs)} key={`${point.runId}-${point.finishedAt}`} />)}<History size={14} /></button>
-                  <div className="target-next-state">{slowFirstOutput ? <><TimerReset size={14} /><span title={`首字超过 ${probeIntervalLabel(probePreferences.slowFirstOutputThresholdMs)}，冷却 ${probeIntervalLabel(probePreferences.cooldownMs)}`}>慢首字 · 冷却 {probeIntervalLabel(probePreferences.cooldownMs)}</span></> : effectiveStatus === 'cooling' ? <><TimerReset size={14} /><span>{formatRelativeTime(target.health?.cooldownUntil)}恢复测试</span></> : target.latest?.errorCode ? <span title={target.latest.errorCode}>{target.latest.errorCode}</span> : <><History size={14} /><span>{formatRelativeTime(target.latest?.finishedAt)}检测</span></>}</div>
+                  <div className="monitor-target-action-row"><button type="button" className="status-history" aria-label={`查看 ${target.siteName} 的完整探针历史`} title="查看完整探针历史" onClick={() => void openHistory(model, target)}>{target.statusBar.slice(-16).map((point) => <span className={`history-${isSlowFirstOutput(point, probePreferences.slowFirstOutputThresholdMs) ? 'slow' : point.outcome}`} title={pointTitle(point, probePreferences.slowFirstOutputThresholdMs)} key={`${point.runId}-${point.finishedAt}`} />)}<History size={14} /></button><IconButton size="sm" className="target-probe-button" label={`立即探测 ${target.siteName}`} aria-busy={targetProbing || undefined} disabled={bulkProbe.running || probingModel !== null || probingTarget !== null || model.monitor.busy || !target.enabled} onClick={() => void probeTarget(model.publishedModelId, target.providerModelTargetId, target.siteName)}><RefreshCw className={targetProbing ? 'spin' : undefined} size={15} /></IconButton></div>
+                  <div className="target-next-state">{slowFirstOutput ? <><TimerReset size={14} /><span title={`首 Token 超过 ${probeIntervalLabel(probePreferences.slowFirstOutputThresholdMs)}，冷却 ${probeIntervalLabel(probePreferences.cooldownMs)}`}>慢首 Token · 冷却 {probeIntervalLabel(probePreferences.cooldownMs)}</span></> : effectiveStatus === 'cooling' ? <><TimerReset size={14} /><span>{formatRelativeTime(target.health?.cooldownUntil)}恢复测试</span></> : target.latest?.errorCode ? <span title={target.latest.errorCode}>{target.latest.errorCode}</span> : <><History size={14} /><span>{formatRelativeTime(target.latest?.finishedAt)}检测</span></>}</div>
                 </div>
               </div>;
-            })}</div>}
+            })}{status === 'cooling' && !renderedTargets.length ? <EmptyState title="没有冷却中的上游" description="该模型当前没有处于冷却状态的上游。" /> : null}</div>}
           </article>;
         })}</div>}
       </Panel>}
@@ -532,26 +567,33 @@ export function MonitorPage() {
         })}{!selectableModels.length && <EmptyState title="没有匹配的模型" description="调整搜索词后再选择。" />}</div>
       </Dialog>
 
-      <Dialog open={settingsOpen} title="探针设置" description="低 Token 的 OK 探针同时测量首字延迟和总耗时；只有选中的模型会定时检测。" onClose={() => setSettingsOpen(false)} footer={<><Button onClick={() => setSettingsOpen(false)}>取消</Button><Button variant="primary" busy={savingProbeSettings} onClick={() => void saveProbeSettings()}>保存设置</Button></>}>
+      <Dialog open={settingsOpen} title="探针设置" description="低 Token 的 OK 探针测量首 Token 延迟；只有选中的模型会定时检测。" onClose={() => setSettingsOpen(false)} footer={<><Button onClick={() => setSettingsOpen(false)}>取消</Button><Button variant="primary" busy={savingProbeSettings} onClick={() => void saveProbeSettings()}>保存设置</Button></>}>
         <div className="form-stack">
           <div className="form-grid two-columns">
             <Field label="OK 模型探针"><select className="select" value={draftPreferences.okProbeIntervalMs} onChange={(event) => setDraftPreferences((current) => ({ ...current, okProbeIntervalMs: Number(event.target.value) }))}><option value={60_000}>1 分钟</option><option value={300_000}>5 分钟</option><option value={600_000}>10 分钟</option><option value={900_000}>15 分钟</option></select></Field>
             <Field label="连续失败阈值"><select className="select" value={draftPreferences.failureThreshold} onChange={(event) => setDraftPreferences((current) => ({ ...current, failureThreshold: Number(event.target.value) }))}><option value={2}>2 次</option><option value={3}>3 次</option><option value={4}>4 次</option></select></Field>
-            <Field label="冷却时间"><select className="select" value={draftPreferences.cooldownMs} onChange={(event) => setDraftPreferences((current) => ({ ...current, cooldownMs: Number(event.target.value) }))}><option value={60_000}>1 分钟</option><option value={300_000}>5 分钟</option><option value={600_000}>10 分钟</option><option value={1_800_000}>30 分钟</option></select></Field>
-            <Field label="首字冷却阈值" hint="单次超过阈值即进入冷却。"><div className="unit-input"><input className="input" type="number" min={1} max={120} value={Math.round(draftPreferences.slowFirstOutputThresholdMs / 1_000)} onChange={(event) => setDraftPreferences((current) => ({ ...current, slowFirstOutputThresholdMs: Math.max(1, Number(event.target.value)) * 1_000 }))} /><span>秒</span></div></Field>
+            <Field label="冷却时间"><select className="select" value={draftPreferences.cooldownMs} onChange={(event) => setDraftPreferences((current) => ({ ...current, cooldownMs: Number(event.target.value) }))}><option value={60_000}>1 分钟</option><option value={300_000}>5 分钟</option><option value={600_000}>10 分钟</option><option value={900_000}>15 分钟</option><option value={1_800_000}>30 分钟</option></select></Field>
+            <Field label="首 Token 冷却阈值" hint="单次超过阈值即进入冷却。"><div className="unit-input"><input className="input" type="number" min={1} max={120} value={Math.round(draftPreferences.slowFirstOutputThresholdMs / 1_000)} onChange={(event) => setDraftPreferences((current) => ({ ...current, slowFirstOutputThresholdMs: Math.max(1, Number(event.target.value)) * 1_000 }))} /><span>秒</span></div></Field>
           </div>
-          <div className="probe-policy-preview"><span><small>探测频率</small><strong>{probeIntervalLabel(draftPreferences.okProbeIntervalMs)}</strong></span><span><small>慢首字阈值</small><strong>{probeIntervalLabel(draftPreferences.slowFirstOutputThresholdMs)}</strong></span><span><small>失败冷却</small><strong>{draftPreferences.failureThreshold} 次后</strong></span><span><small>冷却时长</small><strong>{probeIntervalLabel(draftPreferences.cooldownMs)}</strong></span></div>
-          <InlineNotice tone="info">固定提示词：<code>Reply exactly OK</code>，最多 4 Token。慢首字单次冷却，普通失败累计到阈值后冷却。</InlineNotice>
+          <div className="probe-policy-preview"><span><small>探测频率</small><strong>{probeIntervalLabel(draftPreferences.okProbeIntervalMs)}</strong></span><span><small>慢首 Token 阈值</small><strong>{probeIntervalLabel(draftPreferences.slowFirstOutputThresholdMs)}</strong></span><span><small>失败冷却</small><strong>{draftPreferences.failureThreshold} 次后</strong></span><span><small>冷却时长</small><strong>{probeIntervalLabel(draftPreferences.cooldownMs)}</strong></span></div>
+          <InlineNotice tone="info">固定提示词：<code>Reply exactly OK</code>，通常只产生 1–2 个输出 Token。慢首 Token 单次冷却，普通失败累计到阈值后冷却。</InlineNotice>
         </div>
       </Dialog>
 
       <Dialog open={Boolean(historySelection)} title={historySelection ? `${historySelection.model.publicModel} · ${historySelection.target.siteName}` : ''} description={historySelection ? `${monitorCredentialName(historySelection.target) || protocolLabel(historySelection.target.wireProtocol)} · ${historySelection.target.sourceModel}` : ''} onClose={() => { setHistorySelection(null); setTargetHistory(null); setHistoryError(''); }} width="lg">
         {historyLoading ? <LoadingState label="正在读取完整探针历史" /> : historyError ? <ErrorState message={historyError} onRetry={() => historySelection && void openHistory(historySelection.model, historySelection.target)} /> : targetHistory && <div className="probe-history-detail">
-          <div className="probe-history-summary"><div><span>当前状态</span><HealthBadge state={isSlowFirstOutput(latestHistoryPoint, probePreferences.slowFirstOutputThresholdMs) ? 'cooling' : targetHistory.status} /></div><div><span>成功率</span><strong>{basisPoints(targetHistory.successBasisPoints)}</strong></div><div><span>最近首字</span><strong>{formatProbeSeconds(latestHistoryPoint?.firstOutputMs)}</strong></div><div><span>最近总耗时</span><strong>{formatProbeSeconds(latestHistoryPoint?.totalLatencyMs)}</strong></div><div><span>成功 / 失败</span><strong>{targetHistory.successes} / {targetHistory.failures}</strong></div></div>
+          <div className="probe-history-summary"><div><span>当前状态</span><HealthBadge state={isSlowFirstOutput(latestHistoryPoint, probePreferences.slowFirstOutputThresholdMs) ? 'cooling' : targetHistory.status} /></div><div><span>成功率</span><strong>{basisPoints(targetHistory.successBasisPoints)}</strong></div><div><span>最近首 Token</span><strong>{formatProbeSeconds(latestHistoryPoint?.firstOutputMs)}</strong></div><div><span>成功 / 失败</span><strong>{targetHistory.successes} / {targetHistory.failures}</strong></div></div>
+          <Disclosure summary={<span className="settings-disclosure-title"><Activity size={17} /><span><strong>熔断状态时间线</strong><small>{targetHistory.circuitTransitions.length ? `${targetHistory.circuitTransitions.length} 次状态变化` : '当前历史窗口内没有状态变化'}</small></span></span>} open={targetHistory.circuitTransitions.length > 0}>
+            {!targetHistory.circuitTransitions.length ? <EmptyState title="没有熔断状态变化" description="正常请求与探针尚未触发观察、冷却或恢复转换。" /> : <div className="circuit-transition-list">{[...targetHistory.circuitTransitions].reverse().map((event) => <div key={event.id}>
+              <span className={`circuit-trigger circuit-${event.trigger}`}><Activity size={14} /></span>
+              <div><header><strong>{circuitPhaseLabel(event.fromPhase)} → {circuitPhaseLabel(event.toPhase)}</strong><Badge tone={event.trigger === 'live_traffic' ? 'accent' : event.trigger === 'probe' ? 'info' : 'neutral'}>{event.trigger === 'live_traffic' ? '真实流量' : event.trigger === 'probe' ? '主动探针' : event.trigger === 'timer' ? '计时器' : '人工操作'}</Badge></header><p>{event.reason}{event.failureKind ? ` · ${event.failureKind}` : ''}</p>{event.requestId && <code>{event.requestId}</code>}</div>
+              <time dateTime={new Date(event.occurredAt).toISOString()}>{formatDateTime(event.occurredAt, true)}</time>
+            </div>)}</div>}
+          </Disclosure>
           <div className="probe-history-list">{[...targetHistory.items].reverse().map((point) => {
             const slowFirstOutput = isSlowFirstOutput(point, probePreferences.slowFirstOutputThresholdMs);
             const permitReason = probePermitReasonLabel(point.permitReason);
-            return <div key={`${point.runId}-${point.id || point.finishedAt}`}><span className={`history-mark history-${slowFirstOutput ? 'slow' : point.outcome}`} /><div><header><strong>{formatDateTime(point.finishedAt)}</strong><Badge tone={slowFirstOutput ? 'warning' : point.outcome === 'success' ? 'success' : point.outcome === 'failure' ? 'danger' : 'neutral'}>{slowFirstOutput ? '首字过慢' : probeOutcomeLabel(point.outcome)}</Badge></header><p>首字延迟 {formatProbeSeconds(point.firstOutputMs)} · 总耗时 {formatProbeSeconds(point.totalLatencyMs)}{point.httpStatus ? ` · HTTP ${point.httpStatus}` : ''}</p>{slowFirstOutput && <small>超过 {probeIntervalLabel(probePreferences.slowFirstOutputThresholdMs)}阈值，本次探针触发冷却。</small>}{point.errorCode && <small>{point.failureKind || '探针错误'} · {point.errorCode}</small>}{permitReason && <small>调度结果：{permitReason}</small>}</div></div>;
+            return <div key={`${point.runId}-${point.id || point.finishedAt}`}><span className={`history-mark history-${slowFirstOutput ? 'slow' : point.outcome}`} /><div><header><strong>{formatDateTime(point.finishedAt)}</strong><Badge tone={slowFirstOutput ? 'warning' : point.outcome === 'success' ? 'success' : point.outcome === 'failure' ? 'danger' : 'neutral'}>{slowFirstOutput ? '首 Token 过慢' : probeOutcomeLabel(point.outcome)}</Badge></header><p>首 Token 延迟 {formatProbeSeconds(point.firstOutputMs)}{point.httpStatus ? ` · HTTP ${point.httpStatus}` : ''}</p>{slowFirstOutput && <small>超过 {probeIntervalLabel(probePreferences.slowFirstOutputThresholdMs)}阈值，本次探针触发冷却。</small>}{point.errorCode && <small>{point.failureKind || '探针错误'} · {point.errorCode}</small>}{permitReason && <small>调度结果：{permitReason}</small>}</div></div>;
           })}</div>
         </div>}
       </Dialog>

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/LuTianTian001/JieShan/internal/vnext/platformdetect"
 	vnextprotocol "github.com/LuTianTian001/JieShan/internal/vnext/protocol"
 	"github.com/LuTianTian001/JieShan/internal/vnext/secretbox"
 	vnextstore "github.com/LuTianTian001/JieShan/internal/vnext/store"
@@ -38,6 +39,19 @@ func NewStoreHandler(store *vnextstore.Store, box *secretbox.Box, registry *vnex
 	return New(repository)
 }
 
+func NewStoreHandlerWithPlatformDetector(
+	store *vnextstore.Store,
+	box *secretbox.Box,
+	registry *vnextprotocol.Registry,
+	detector PlatformDetector,
+) (*Handler, error) {
+	repository, err := NewStoreRepository(store, box, registry)
+	if err != nil {
+		return nil, err
+	}
+	return NewWithPlatformDetector(repository, detector)
+}
+
 func (repository *StoreRepository) ListSites(ctx context.Context) ([]vnextstore.Site, error) {
 	return repository.store.ListSites(ctx)
 }
@@ -54,8 +68,27 @@ func (repository *StoreRepository) GetSite(ctx context.Context, id int64) (vnext
 	return repository.store.GetSite(ctx, id)
 }
 
+func (repository *StoreRepository) GetPlatformSelection(
+	ctx context.Context,
+	siteID int64,
+) (*platformdetect.ManualSelection, error) {
+	connection, err := repository.store.GetSiteAccountConnection(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	return &platformdetect.ManualSelection{
+		Platform: connection.AdapterKind,
+		Origin:   connection.Origin,
+		Locked:   true,
+	}, nil
+}
+
 func (repository *StoreRepository) UpdateSite(ctx context.Context, id int64, input vnextstore.SiteUpdate) (vnextstore.Site, error) {
 	return repository.store.UpdateSite(ctx, id, input)
+}
+
+func (repository *StoreRepository) DeleteSite(ctx context.Context, id, expectedRevision int64) error {
+	return repository.store.DeleteSite(ctx, id, expectedRevision)
 }
 
 func (repository *StoreRepository) ListSiteEndpoints(ctx context.Context, siteID int64) ([]vnextstore.SiteEndpoint, error) {
@@ -192,6 +225,58 @@ func (repository *StoreRepository) ReplaceSiteCredentialSecret(ctx context.Conte
 		return CredentialRecord{}, err
 	}
 	return repository.GetSiteCredential(ctx, siteID, credentialID)
+}
+
+func (repository *StoreRepository) ImportTokenJSONItems(
+	ctx context.Context,
+	siteID int64,
+	items []TokenJSONImportItem,
+) (TokenJSONImportRecords, error) {
+	if len(items) == 0 || len(items) > vnextstore.MaxSealedEndpointCredentialImports {
+		return TokenJSONImportRecords{}, errors.New("token JSON import item count is invalid")
+	}
+	imports := make([]vnextstore.SealedEndpointCredentialImport, len(items))
+	for index, item := range items {
+		if len(item.Secret) == 0 {
+			return TokenJSONImportRecords{}, errors.New("credential secret is required")
+		}
+		imports[index] = vnextstore.SealedEndpointCredentialImport{
+			Credential: vnextstore.SealedSiteCredentialInput{
+				Name: item.CredentialName, CipherVersion: siteCredentialCipherVersion, Enabled: true,
+			},
+			Endpoint: vnextstore.SiteEndpointWrite{
+				Name: item.EndpointName, BaseURL: item.BaseURL, WireProtocol: item.WireProtocol,
+				Surface: item.Surface, AdapterKind: item.AdapterKind, AuthScheme: item.AuthScheme,
+				HeaderTemplate: []byte(`{}`), Enabled: true,
+			},
+		}
+	}
+	stored, err := repository.store.ImportSealedEndpointCredentials(
+		ctx,
+		siteID,
+		imports,
+		func(index int, credentialID, ownerSiteID int64) ([]byte, error) {
+			if index < 0 || index >= len(items) || len(items[index].Secret) == 0 {
+				return nil, errors.New("credential secret is unavailable")
+			}
+			return repository.box.Seal(secretbox.PurposeSiteCredential, secretbox.Identity{
+				RecordID: credentialID,
+				OwnerID:  ownerSiteID,
+			}, items[index].Secret)
+		},
+	)
+	if err != nil {
+		return TokenJSONImportRecords{}, err
+	}
+	result := TokenJSONImportRecords{
+		CredentialIDs: make([]int64, 0, len(stored)),
+		EndpointIDs:   make([]int64, 0, len(stored)),
+	}
+	for _, item := range stored {
+		result.CredentialIDs = append(result.CredentialIDs, item.CredentialID)
+		result.EndpointIDs = append(result.EndpointIDs, item.EndpointID)
+	}
+	return result, nil
 }
 
 func (repository *StoreRepository) ListProviderModelTargets(ctx context.Context, siteID, endpointID int64) ([]vnextstore.ProviderModelTarget, error) {

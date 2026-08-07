@@ -44,9 +44,9 @@ func (s *Store) ImportDigestOnlyDownstreamKey(ctx context.Context, input Downstr
 	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO downstream_keys(
 name,key_prefix,key_digest,encrypted_secret,reveal_version,routing_profile_id,enabled,quota_nano_usd,
-hourly_quota_nano_usd,billing_multiplier_bps,rpm_limit,expires_at,revision,created_at,updated_at)
-VALUES (?,?,?,NULL,0,?,?,?,?,?,?,?,1,?,?)`, input.Name, input.KeyPrefix, input.KeyDigest, profileID,
-		boolInt(input.Enabled), input.QuotaNanoUSD, input.HourlyQuotaNanoUSD, billingMultiplierBPS, 0,
+hourly_quota_nano_usd,billing_multiplier_bps,expires_at,revision,created_at,updated_at)
+VALUES (?,?,?,NULL,0,?,?,?,?,?,?,1,?,?)`, input.Name, input.KeyPrefix, input.KeyDigest, profileID,
+		boolInt(input.Enabled), input.QuotaNanoUSD, input.HourlyQuotaNanoUSD, billingMultiplierBPS,
 		input.ExpiresAt, now, now)
 	if err != nil {
 		return 0, normalizeDownstreamKeyConflict(err)

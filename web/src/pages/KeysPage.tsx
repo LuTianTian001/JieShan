@@ -1,4 +1,4 @@
-import { Check, ChevronDown, Clipboard, Eye, EyeOff, KeyRound, MoreHorizontal, Pencil, Plus, RefreshCw } from 'lucide-react';
+import { Check, ChevronDown, Clipboard, Eye, EyeOff, KeyRound, Pencil, Plus, RefreshCw } from 'lucide-react';
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { useToast } from '../components/Toast';
 import {
@@ -42,18 +42,6 @@ type KeyEditorInput = {
 
 function formatBillingMultiplier(value: number): string {
   return `${value.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 2 })}x`;
-}
-
-function KeyMoreMenu({ onRegenerate }: { onRegenerate: () => void }) {
-  return <details className="key-more-menu">
-    <summary className="icon-button" aria-label="更多操作" title="更多操作"><MoreHorizontal size={17} aria-hidden="true" /></summary>
-    <div className="key-more-popover">
-      <button type="button" className="button button-ghost button-sm" onClick={(event) => {
-        event.currentTarget.closest('details')?.removeAttribute('open');
-        onRegenerate();
-      }}><RefreshCw size={16} aria-hidden="true" />重新生成密钥</button>
-    </div>
-  </details>;
 }
 
 function KeyDialog({
@@ -346,7 +334,7 @@ export function KeysPage() {
            const routeName = item.routingProfileName || (followsDefault ? defaultProfile?.name : '') || '未命名方案';
            const billingMultiplier = item.billingMultiplier;
            return <article className="key-row" key={item.id}>
-            <header><span className="key-icon"><KeyRound size={17} /></span><div><span><strong>{item.name}</strong><Badge tone={item.enabled ? 'success' : 'neutral'}>{item.enabled ? '已启用' : '已停用'}</Badge>{followsDefault && <Badge tone="info">默认路由</Badge>}</span><code>{item.keyPrefix}••••••••</code><span className="table-subline">{routeName} · 自动同步 {item.models.length} 个模型 · 扣款 {formatBillingMultiplier(billingMultiplier)}</span></div><div className="key-actions">{item.revealable && <Button className="key-compact-action" size="sm" icon={Clipboard} aria-label="复制密钥" title="复制密钥" busy={revealingId === item.id} onClick={() => void requestSecret('copy', item)}>复制密钥</Button>}<Button className="key-compact-action" size="sm" icon={Pencil} aria-label="编辑密钥" title="编辑密钥" onClick={() => { setEditing(item); setDialogOpen(true); }}>编辑</Button><Switch checked={item.enabled} label={item.enabled ? '启用' : '停用'} onChange={(next) => void toggle(item, next)} /><KeyMoreMenu onRegenerate={() => { setRotateTarget(item); setRotateConfirmation(''); }} /></div></header>
+            <header><span className="key-icon"><KeyRound size={17} /></span><div><span><strong>{item.name}</strong><Badge tone={item.enabled ? 'success' : 'neutral'}>{item.enabled ? '已启用' : '已停用'}</Badge>{followsDefault && <Badge tone="info">默认路由</Badge>}</span><code>{item.keyPrefix}••••••••</code><span className="table-subline">{routeName} · 自动同步 {item.models.length} 个模型 · 扣款 {formatBillingMultiplier(billingMultiplier)}</span></div><div className="key-actions">{item.revealable && <Button className="key-compact-action" size="sm" icon={Clipboard} aria-label="复制密钥" title="复制密钥" busy={revealingId === item.id} onClick={() => void requestSecret('copy', item)}>复制密钥</Button>}<Button className="key-compact-action" size="sm" icon={Pencil} aria-label="编辑密钥" title="编辑密钥" onClick={() => { setEditing(item); setDialogOpen(true); }}>编辑</Button><Switch checked={item.enabled} label={item.enabled ? '启用' : '停用'} onChange={(next) => void toggle(item, next)} /><Button className="key-compact-action" size="sm" icon={RefreshCw} aria-label="重新生成密钥" title={item.revealable ? '重新生成密钥' : '迁移密钥无法复制，重新生成后可查看和复制'} onClick={() => { setRotateTarget(item); setRotateConfirmation(''); }}>重新生成密钥</Button></div></header>
             <div className="key-facts">
               <div className="key-quota-overview">
                 <span>额度使用</span>

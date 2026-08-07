@@ -78,6 +78,14 @@ func TestStoreHandlerRefreshesBalanceAndPersistsSearchableSourceUsageWithoutLeak
 	if adapter.receivedAccessToken != secret {
 		t.Fatalf("adapter received access token = %q", adapter.receivedAccessToken)
 	}
+	connections := performRequest(handler, http.MethodGet, "/api/vnext/site-accounts", "", "")
+	if connections.Code != http.StatusOK || !strings.Contains(connections.Body.String(), `"latestBalance":{"id":`) ||
+		!strings.Contains(connections.Body.String(), `"availableValue":"19.7500"`) {
+		t.Fatalf("connections status = %d, body = %s", connections.Code, connections.Body.String())
+	}
+	if strings.Contains(connections.Body.String(), secret) {
+		t.Fatal("connections response leaked account secret")
+	}
 
 	sync := performRequest(handler, http.MethodPost,
 		"/api/vnext/site-accounts/sites/"+intString(siteID)+"/usage/sync", `{"limit":100}`, "")

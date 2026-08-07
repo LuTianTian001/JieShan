@@ -39,8 +39,8 @@ func TestSettingsAPIRequiresCASAndReturnsFrontendContract(t *testing.T) {
 	}
 	var initial settingsResponse
 	decodeResponse(t, response, &initial)
-	if initial.FailureThreshold != 2 || initial.FailureWindowMS != 300000 || initial.CooldownMS != 300000 ||
-		initial.ProbeIntervalMS != 300000 || initial.FirstOutputTimeoutMS != 15000 ||
+	if initial.FailureThreshold != 2 || initial.FailureWindowMS != 300000 || initial.CooldownMS != 900000 ||
+		initial.ProbeIntervalMS != 900000 || initial.FirstOutputTimeoutMS != 15000 ||
 		initial.StreamIdleTimeoutMS != 60000 || initial.RequestTimeoutMS != 300000 ||
 		initial.MaxAttempts != 4 || initial.LogRetentionDays != 30 || initial.Revision != 1 {
 		t.Fatalf("initial API settings = %+v", initial)
@@ -80,6 +80,61 @@ func TestSettingsAPIRequiresCASAndReturnsFrontendContract(t *testing.T) {
 	response = perform(handler, http.MethodPatch, APIPrefix, body,
 		map[string]string{"If-Match": `"2"`})
 	assertAPIError(t, response, http.StatusBadRequest, "invalid_request")
+}
+
+func TestRuntimeOverviewUsesInjectedProvider(t *testing.T) {
+	ctx := context.Background()
+	storage, err := vnextstore.Open(ctx, filepath.Join(t.TempDir(), "jieshan.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	service, err := settings.NewService(ctx, storage, settings.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := staticRuntimeOverviewProvider{value: RuntimeOverview{
+		Runtime: GatewayRuntimeSnapshot{
+			ProcessStartedAt: 1_000, SnapshotAt: 2_000, ConfigRevision: 3,
+			ConfigLoadedAt: 1_500, ActivePriceCatalogVersion: "official-usd",
+			InflightRequests: 2, MaxConcurrency: 8, QueuedRequests: 1, MeteringMode: "normal",
+		},
+		BackgroundTasks: []BackgroundTaskHealth{{ID: "monitor", Label: "模型监控", State: "healthy"}},
+	}}
+	handler, err := NewServiceHandlerWithOverview(service, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := perform(handler, http.MethodGet, APIPrefix+"/runtime-overview", "", nil)
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("runtime overview status/headers = %d/%v, body=%s", response.Code, response.Header(), response.Body.String())
+	}
+	var overview RuntimeOverview
+	decodeResponse(t, response, &overview)
+	if overview.Runtime.ConfigRevision != 3 || overview.Runtime.MaxConcurrency != 8 ||
+		len(overview.BackgroundTasks) != 1 || overview.BackgroundTasks[0].ID != "monitor" {
+		t.Fatalf("runtime overview = %+v", overview)
+	}
+
+	response = perform(handler, http.MethodPost, APIPrefix+"/runtime-overview", "", nil)
+	assertAPIError(t, response, http.StatusMethodNotAllowed, "method_not_allowed")
+
+	withoutOverview, err := NewServiceHandler(service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = perform(withoutOverview, http.MethodGet, APIPrefix+"/runtime-overview", "", nil)
+	assertAPIError(t, response, http.StatusServiceUnavailable, "runtime_overview_unavailable")
+}
+
+type staticRuntimeOverviewProvider struct {
+	value RuntimeOverview
+	err   error
+}
+
+func (provider staticRuntimeOverviewProvider) RuntimeOverview(context.Context) (RuntimeOverview, error) {
+	return provider.value, provider.err
 }
 
 func perform(handler http.Handler, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {

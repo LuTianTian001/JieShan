@@ -22,6 +22,8 @@ func TestGatewayCoreDoesNotImportConcretePersistenceRoutesOrProtocolAdapters(t *
 		"github.com/LuTianTian001/JieShan/internal/gateway",
 		"github.com/LuTianTian001/JieShan/internal/vnext/dataplane",
 		"github.com/LuTianTian001/JieShan/internal/vnext/controlapi",
+		"github.com/LuTianTian001/JieShan/internal/vnext/siteadmin",
+		"github.com/LuTianTian001/JieShan/internal/vnext/siteadminapi",
 		"github.com/LuTianTian001/JieShan/internal/vnext/protocol/openai",
 		"github.com/LuTianTian001/JieShan/internal/vnext/protocol/anthropic",
 		"github.com/LuTianTian001/JieShan/internal/vnext/protocol/gemini",

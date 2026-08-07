@@ -118,6 +118,13 @@ func TestMigrateSQLiteFilePreservesCoreStateAndResealsSecrets(t *testing.T) {
 		keys[0].Key.UsedNanoUSD != 3_000_000 || keys[0].Key.ReservedNanoUSD != 1_000_000 || keys[0].Key.Revealable {
 		t.Fatalf("migrated key = %+v digest=%x", keys[0].Key, keys[0].KeyDigest)
 	}
+	var deprecatedRPMLimit int
+	if err := storage.DB.QueryRow(`SELECT rpm_limit FROM downstream_keys WHERE id=?`, keys[0].Key.ID).Scan(&deprecatedRPMLimit); err != nil {
+		t.Fatal(err)
+	}
+	if deprecatedRPMLimit != 0 {
+		t.Fatalf("migrated deprecated RPM value = %d, want 0", deprecatedRPMLimit)
+	}
 	profileID := keys[0].Key.RoutingProfileID
 	if _, err := storage.LoadResolverRoute(context.Background(), profileID, "gpt-4o-mini"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("allowlist unexpectedly exposes gpt-4o-mini: %v", err)

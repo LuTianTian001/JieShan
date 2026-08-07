@@ -12,6 +12,7 @@ type siteResponse struct {
 	Name         string `json:"name"`
 	DashboardURL string `json:"dashboardUrl"`
 	Enabled      bool   `json:"enabled"`
+	MaxInFlight  int    `json:"maxConcurrency"`
 	Revision     int64  `json:"revision"`
 	CreatedAt    int64  `json:"createdAt"`
 	UpdatedAt    int64  `json:"updatedAt"`

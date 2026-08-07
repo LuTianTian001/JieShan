@@ -224,6 +224,51 @@ func TestUnavailableMeteringReleasesReservationWithoutRecordingZeroUsage(t *test
 	}
 }
 
+func TestUnavailableMeteringCannotChargeOrPersistInventedUsage(t *testing.T) {
+	s := newTestStore(t)
+	quota := int64(500)
+	fixture := createAccountingFixture(t, s, &quota)
+	ctx := context.Background()
+	start := accountingRequestStart(fixture, "request-invalid-unmetered-charge", 100)
+	if _, err := s.StartRequestWithQuotaReservation(ctx, start); err != nil {
+		t.Fatal(err)
+	}
+
+	inputTokens := int64(3)
+	invalid := []RequestSettlement{
+		{
+			Status: "success", MeteringStatus: "unavailable", MeteringErrorCode: "usage_unavailable",
+			DurationMS: 100, OfficialCostNanoUSD: 25, FinishedAt: 1_100,
+		},
+		{
+			Status: "success", MeteringStatus: "unavailable", MeteringErrorCode: "usage_unavailable",
+			DurationMS: 100, InputTokens: &inputTokens, FinishedAt: 1_100,
+		},
+		{
+			Status: "success", MeteringStatus: "unavailable", DurationMS: 100, FinishedAt: 1_100,
+		},
+	}
+	for index, settlement := range invalid {
+		if _, err := s.SettleRequest(ctx, start.ID, settlement); err == nil {
+			t.Fatalf("invalid settlement %d unexpectedly succeeded", index)
+		}
+	}
+	key, err := s.GetDownstreamKey(ctx, fixture.keyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key.UsedNanoUSD != 0 || key.ReservedNanoUSD != 100 {
+		t.Fatalf("invalid settlement changed quota: used=%d reserved=%d", key.UsedNanoUSD, key.ReservedNanoUSD)
+	}
+
+	if _, err := s.SettleRequest(ctx, start.ID, RequestSettlement{
+		Status: "success", MeteringStatus: "unavailable", MeteringErrorCode: "usage_unavailable",
+		DurationMS: 100, FinishedAt: 1_100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRecoverInterruptedRequestsReleasesReservationWithoutCharging(t *testing.T) {
 	s := newTestStore(t)
 	quota := int64(500)

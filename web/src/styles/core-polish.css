@@ -196,42 +196,6 @@
   gap: 6px;
 }
 
-.key-more-menu {
-  position: relative;
-}
-
-.key-more-menu > summary {
-  list-style: none;
-}
-
-.key-more-menu > summary::-webkit-details-marker {
-  display: none;
-}
-
-.key-more-menu[open] > summary {
-  border-color: var(--color-border-strong);
-  background: var(--color-surface-active);
-}
-
-.key-more-popover {
-  position: absolute;
-  z-index: 12;
-  top: calc(100% + 6px);
-  right: 0;
-  width: max-content;
-  min-width: 170px;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  padding: 5px;
-  background: var(--color-surface);
-  box-shadow: var(--shadow-popover);
-}
-
-.key-more-popover .button {
-  width: 100%;
-  justify-content: flex-start;
-}
-
 .key-facts {
   grid-template-columns: repeat(4, minmax(0, 1fr));
   border-color: var(--color-border-subtle);
@@ -848,20 +812,6 @@
     grid-template-columns: 1fr;
     gap: 16px;
     padding: 12px;
-  }
-
-  .key-more-popover {
-    position: fixed;
-    right: 12px;
-    bottom: 12px;
-    top: auto;
-    min-width: 220px;
-  }
-
-  .key-more-menu > summary.icon-button {
-    width: 44px;
-    min-width: 44px;
-    height: 44px;
   }
 
   .logs-page .filter-trailing {

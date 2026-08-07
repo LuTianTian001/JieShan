@@ -63,6 +63,43 @@ func TestManualProbeRunsEveryTargetAndPersistsSemanticMetrics(t *testing.T) {
 	}
 }
 
+func TestManualTargetProbeRunsOnlySelectedUpstreamAndReleasesMissingTargetClaim(t *testing.T) {
+	fixture := newSchedulerFixture(t, "one-target", 3)
+	executor := &trackingExecutor{run: func(_ context.Context, request ProbeRequest) (ProbeObservation, error) {
+		return ProbeObservation{Outcome: OutcomeSuccess, HTTPStatus: 200, Latency: 40 * time.Millisecond}, nil
+	}}
+	scheduler := newTestScheduler(t, fixture.storage, executor, Options{MaxConcurrentTargets: 2})
+
+	if _, err := scheduler.ProbeTarget(context.Background(), fixture.routeID, 999999); !errors.Is(err, ErrProbeTargetMissing) {
+		t.Fatalf("missing target error = %v", err)
+	}
+	run, err := scheduler.ProbeTarget(context.Background(), fixture.routeID, fixture.targetIDs[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Run.TargetCount != 1 || len(run.Results) != 1 || run.Results[0].TargetID != fixture.targetIDs[1] {
+		t.Fatalf("target-specific run = %+v", run)
+	}
+	if executor.callCount() != 1 {
+		t.Fatalf("executor calls = %d, want 1", executor.callCount())
+	}
+	for index, targetID := range fixture.targetIDs {
+		history, historyErr := fixture.storage.ListModelProbeTargetResults(
+			context.Background(), fixture.routeID, targetID, 5,
+		)
+		if historyErr != nil {
+			t.Fatal(historyErr)
+		}
+		want := 0
+		if index == 1 {
+			want = 1
+		}
+		if len(history) != want {
+			t.Fatalf("target %d history count = %d, want %d", targetID, len(history), want)
+		}
+	}
+}
+
 func TestOrdinaryProbeFailureBecomesSuspectBeforeCooling(t *testing.T) {
 	fixture := newSchedulerFixture(t, "threshold", 1)
 	executor := &trackingExecutor{run: func(context.Context, ProbeRequest) (ProbeObservation, error) {
@@ -116,6 +153,40 @@ func TestOrdinaryProbeFailureBecomesSuspectBeforeCooling(t *testing.T) {
 	}
 }
 
+func TestSlowSuccessfulProbeBecomesFirstOutputFailureAndImmediatelyCools(t *testing.T) {
+	fixture := newSchedulerFixture(t, "slow-first-token", 1)
+	firstOutput := 16 * time.Second
+	executor := &trackingExecutor{run: func(context.Context, ProbeRequest) (ProbeObservation, error) {
+		return ProbeObservation{
+			Outcome: OutcomeSuccess, HTTPStatus: 200, Latency: 17 * time.Second,
+			FirstOutputLatency: &firstOutput,
+		}, nil
+	}}
+	scheduler := newTestScheduler(t, fixture.storage, executor, Options{PolicyProvider: StaticRuntimePolicyProvider{
+		Policy: RuntimePolicy{
+			HealthPolicy: routing.DefaultHealthPolicy(), ProbeInterval: 15 * time.Minute,
+			FirstOutputTimeout: 15 * time.Second,
+		},
+	}})
+
+	run, err := scheduler.ProbeModel(context.Background(), fixture.routeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(run.Results) != 1 || run.Results[0].Outcome != OutcomeFailure ||
+		run.Results[0].FailureKind != routing.FailureFirstOutputTimeout ||
+		run.Results[0].FirstOutputLatencyMS == nil || *run.Results[0].FirstOutputLatencyMS != 16_000 {
+		t.Fatalf("slow probe result = %+v", run)
+	}
+	health, err := fixture.storage.GetTargetHealth(context.Background(), fixture.targetIDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.State.Phase != routing.CircuitOpen || health.State.ConsecutiveFailures != 1 || health.State.CooldownUntil.IsZero() {
+		t.Fatalf("slow first token did not immediately cool target: %+v", health.State)
+	}
+}
+
 func TestSchedulerSamplesDynamicHealthPolicyForEachTargetProbe(t *testing.T) {
 	fixture := newSchedulerFixture(t, "dynamic-policy", 1)
 	executor := &trackingExecutor{run: func(context.Context, ProbeRequest) (ProbeObservation, error) {
@@ -161,6 +232,61 @@ func TestSchedulerSamplesDynamicHealthPolicyForEachTargetProbe(t *testing.T) {
 	if health.State.Phase != routing.CircuitOpen || health.State.ConsecutiveFailures != 2 ||
 		health.State.CooldownUntil.Sub(time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)) != 2*time.Minute {
 		t.Fatalf("second failure did not use dynamic policy = %+v", health.State)
+	}
+}
+
+func TestScheduledProbeSkipsRecentLiveSuccessButManualProbeStillRuns(t *testing.T) {
+	fixture := newSchedulerFixture(t, "live-success", 1)
+	executor := &trackingExecutor{run: func(context.Context, ProbeRequest) (ProbeObservation, error) {
+		return ProbeObservation{Outcome: OutcomeSuccess, HTTPStatus: 200, Latency: 20 * time.Millisecond}, nil
+	}}
+	repository := &recentLiveRepository{
+		Store: fixture.storage, targetID: fixture.targetIDs[0], revision: 1,
+		observedAt: time.Date(2026, 8, 6, 11, 55, 0, 0, time.UTC),
+	}
+	scheduler := newTestSchedulerWithRepositories(t, repository, fixture.storage, executor, Options{})
+
+	runs, err := scheduler.RunDueOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || len(runs[0].Results) != 1 || runs[0].Results[0].Outcome != OutcomeSkipped ||
+		runs[0].Results[0].PermitReason != routing.PermitRecentSuccess {
+		t.Fatalf("scheduled recent-success exemption = %+v", runs)
+	}
+	if executor.callCount() != 0 {
+		t.Fatalf("scheduled probe duplicated live traffic: calls=%d", executor.callCount())
+	}
+
+	manual, err := scheduler.ProbeModel(context.Background(), fixture.routeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manual.Results) != 1 || manual.Results[0].Outcome != OutcomeSuccess || executor.callCount() != 1 {
+		t.Fatalf("manual probe did not force execution: run=%+v calls=%d", manual, executor.callCount())
+	}
+}
+
+func TestScheduledProbeFallsBackWhenLiveTrafficLookupFails(t *testing.T) {
+	fixture := newSchedulerFixture(t, "live-lookup-failure", 1)
+	executor := &trackingExecutor{run: func(context.Context, ProbeRequest) (ProbeObservation, error) {
+		return ProbeObservation{Outcome: OutcomeSuccess, HTTPStatus: 200, Latency: 20 * time.Millisecond}, nil
+	}}
+	repository := &recentLiveRepository{
+		Store: fixture.storage,
+		err:   errors.New("live traffic unavailable"),
+	}
+	scheduler := newTestSchedulerWithRepositories(t, repository, fixture.storage, executor, Options{})
+
+	runs, err := scheduler.RunDueOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || len(runs[0].Results) != 1 || runs[0].Results[0].Outcome != OutcomeSuccess {
+		t.Fatalf("scheduled lookup failure fallback = %+v", runs)
+	}
+	if executor.callCount() != 1 {
+		t.Fatalf("live lookup failure suppressed active probe: calls=%d", executor.callCount())
 	}
 }
 
@@ -306,6 +432,16 @@ func newSchedulerFixture(t *testing.T, suffix string, targetCount int) scheduler
 }
 
 func newTestScheduler(t *testing.T, storage *vnextstore.Store, executor ProbeExecutor, options Options) *Scheduler {
+	return newTestSchedulerWithRepositories(t, storage, storage, executor, options)
+}
+
+func newTestSchedulerWithRepositories(
+	t *testing.T,
+	repository Repository,
+	health HealthRepository,
+	executor ProbeExecutor,
+	options Options,
+) *Scheduler {
 	t.Helper()
 	var idMu sync.Mutex
 	idSequence := 0
@@ -317,11 +453,33 @@ func newTestScheduler(t *testing.T, storage *vnextstore.Store, executor ProbeExe
 		idSequence++
 		return fmt.Sprintf("id-%d", idSequence), nil
 	}
-	scheduler, err := NewScheduler(storage, storage, executor, options)
+	scheduler, err := NewScheduler(repository, health, executor, options)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return scheduler
+}
+
+type recentLiveRepository struct {
+	*vnextstore.Store
+	targetID   int64
+	revision   int64
+	observedAt time.Time
+	err        error
+}
+
+func (repository *recentLiveRepository) LatestSuccessfulRequestAttempt(
+	_ context.Context,
+	targetID, revision int64,
+	since time.Time,
+) (time.Time, bool, error) {
+	if repository.err != nil {
+		return time.Time{}, false, repository.err
+	}
+	if targetID != repository.targetID || revision != repository.revision || repository.observedAt.Before(since) {
+		return time.Time{}, false, nil
+	}
+	return repository.observedAt, true, nil
 }
 
 type trackingExecutor struct {

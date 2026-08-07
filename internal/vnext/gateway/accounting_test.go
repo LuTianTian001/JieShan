@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LuTianTian001/JieShan/internal/vnext/capacity"
 	"github.com/LuTianTian001/JieShan/internal/vnext/pricing"
 	"github.com/LuTianTian001/JieShan/internal/vnext/protocol"
 	"github.com/LuTianTian001/JieShan/internal/vnext/protocol/openai"
@@ -18,7 +19,7 @@ import (
 	vnextstore "github.com/LuTianTian001/JieShan/internal/vnext/store"
 )
 
-func TestExecuteReservesBeforeSendingRecordsEveryAttemptAndSettlesFrozenPrice(t *testing.T) {
+func TestExecuteAcquiresCapacityThenReservesBeforeSendingAndSettlesFrozenPrice(t *testing.T) {
 	doer := &scriptedDoer{scripts: []responseScript{
 		{status: http.StatusUnauthorized, body: `{"error":{"code":"invalid_api_key"}}`},
 		{status: http.StatusServiceUnavailable, body: `{"error":{"code":"service_unavailable"}}`},
@@ -27,6 +28,15 @@ func TestExecuteReservesBeforeSendingRecordsEveryAttemptAndSettlesFrozenPrice(t 
 	service, _, _ := newGatewayFixture(t, doer)
 	accounting := &fakeAccounting{}
 	service.accounting = accounting
+	var orderMu sync.Mutex
+	order := make([]string, 0, 3)
+	recordOrder := func(event string) {
+		orderMu.Lock()
+		defer orderMu.Unlock()
+		order = append(order, event)
+	}
+	service.capacity = directCapacity{onAcquire: func() { recordOrder("capacity") }}
+	accounting.onStart = func() { recordOrder("accounting") }
 	thinkingBudget := int64(20)
 	service.planner = &staticReservationPlanner{plan: ReservationPlan{
 		MaximumUsage: pricing.Usage{
@@ -35,6 +45,7 @@ func TestExecuteReservesBeforeSendingRecordsEveryAttemptAndSettlesFrozenPrice(t 
 		ReasoningEffort: "high", ThinkingBudgetTokens: &thinkingBudget,
 	}}
 	doer.onDo = func() {
+		recordOrder("upstream")
 		accounting.mu.Lock()
 		defer accounting.mu.Unlock()
 		if len(accounting.starts) != 1 {
@@ -50,6 +61,11 @@ func TestExecuteReservesBeforeSendingRecordsEveryAttemptAndSettlesFrozenPrice(t 
 	if err != nil {
 		t.Fatal(err)
 	}
+	orderMu.Lock()
+	if len(order) < 3 || order[0] != "capacity" || order[1] != "accounting" || order[2] != "upstream" {
+		t.Fatalf("capacity/accounting/upstream order = %v", order)
+	}
+	orderMu.Unlock()
 
 	accounting.mu.Lock()
 	defer accounting.mu.Unlock()
@@ -94,6 +110,32 @@ func TestExecuteReservesBeforeSendingRecordsEveryAttemptAndSettlesFrozenPrice(t 
 	}
 	if result.OfficialCostNanoUSD != 4_000 || result.ChargedNanoUSD != 4_000 || result.ReservationNanoUSD != 240_000 {
 		t.Fatalf("result accounting = %+v", result)
+	}
+}
+
+func TestCapacityBusyDoesNotReserveOrSendUpstream(t *testing.T) {
+	doer := &scriptedDoer{}
+	service, _, _ := newGatewayFixture(t, doer)
+	accounting := &fakeAccounting{}
+	service.accounting = accounting
+	service.capacity = directCapacity{err: &capacity.BusyError{Reason: capacity.BusyQueueTimeout}}
+
+	_, err := service.Execute(context.Background(), Input{
+		RequestID: "req-capacity-busy", DownstreamKey: "js_test", PublicModel: "public-model",
+		IngressProtocol: protocol.OpenAI, IngressSurface: protocol.OpenAIChatCompletions,
+		Payload: []byte(`{"model":"public-model","messages":[{"role":"user","content":"hello"}]}`),
+	}, nil)
+	if !errors.Is(err, capacity.ErrUpstreamBusy) {
+		t.Fatalf("capacity error = %v", err)
+	}
+	accounting.mu.Lock()
+	defer accounting.mu.Unlock()
+	if len(accounting.starts) != 0 || len(accounting.attempts) != 0 || len(accounting.settlements) != 0 {
+		t.Fatalf("busy request touched accounting: starts=%d attempts=%d settlements=%d",
+			len(accounting.starts), len(accounting.attempts), len(accounting.settlements))
+	}
+	if len(doer.requests) != 0 {
+		t.Fatalf("busy request reached upstream: %+v", doer.requests)
 	}
 }
 
@@ -162,7 +204,7 @@ func TestGatewayAccountingRunsAgainstTheCanonicalStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	resolution := resolver.Resolution{
-		DownstreamKeyID: keyID, DownstreamKeyRevision: 1,
+		DownstreamKeyID:  keyID,
 		PublishedModelID: model.ID, PublishedModelRevision: model.Revision,
 		RoutingProfileID: profile.ID, RoutingProfileName: profile.Name,
 		SourceProfileID: profile.ID, SourceProfileName: profile.Name, RouteRevision: model.Revision,
@@ -195,6 +237,7 @@ func TestGatewayAccountingRunsAgainstTheCanonicalStore(t *testing.T) {
 		Options{
 			Now:                    monotonicClock(time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)),
 			DefaultMaxOutputTokens: 128,
+			Capacity:               directCapacity{},
 		},
 	)
 	if err != nil {

@@ -66,15 +66,49 @@ func (repository *StoreRepository) ListSyncCandidates(ctx context.Context) ([]si
 	if err != nil {
 		return nil, err
 	}
+	states, err := repository.store.ListSiteUsageSyncStates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stateBySite := make(map[int64]vnextstore.SiteUsageSyncState, len(states))
+	for _, state := range states {
+		stateBySite[state.SiteID] = state
+	}
 	result := make([]siteadmin.SyncCandidate, 0, len(connections))
 	for _, connection := range connections {
+		state := stateBySite[connection.SiteID]
 		result = append(result, siteadmin.SyncCandidate{
 			SiteID: connection.SiteID, Enabled: connection.Enabled, SecretConfigured: connection.SecretConfigured,
 			LastBalanceRefreshAt: millisTime(connection.LastBalanceRefreshAt),
-			LastUsageRefreshAt:   millisTime(connection.LastUsageRefreshAt),
+			UsageSyncThroughAt:   millisTime(state.ThroughAt),
+			HasPendingUsageSync:  state.HasPending,
 		})
 	}
 	return result, nil
+}
+
+func (repository *StoreRepository) PlanUsageSyncWindow(
+	ctx context.Context,
+	siteID int64,
+	through time.Time,
+	initialLookback, overlap time.Duration,
+) error {
+	_, err := repository.store.PlanSiteUsageSyncWindow(ctx, siteID, through.UTC().UnixMilli(),
+		initialLookback.Milliseconds(), overlap.Milliseconds())
+	return err
+}
+
+func (repository *StoreRepository) NextUsageSyncWindow(
+	ctx context.Context,
+	siteID int64,
+) (siteadmin.UsageSyncWindow, bool, error) {
+	window, ok, err := repository.store.NextSiteUsageSyncWindow(ctx, siteID)
+	if err != nil || !ok {
+		return siteadmin.UsageSyncWindow{}, ok, err
+	}
+	return siteadmin.UsageSyncWindow{
+		ID: window.ID, From: time.UnixMilli(window.FromAt).UTC(), To: time.UnixMilli(window.ToAt).UTC(), Cursor: window.Cursor,
+	}, true, nil
 }
 
 func (repository *StoreRepository) GetConnection(ctx context.Context, siteID int64) (vnextstore.SiteAccountConnection, error) {
@@ -239,6 +273,7 @@ func (repository *StoreRepository) SaveUsagePage(
 	siteID int64,
 	adapterKind string,
 	page siteadmin.UsagePage,
+	progress *siteadmin.UsagePageProgress,
 ) (siteadmin.UsageSaveResult, error) {
 	records := make([]vnextstore.SiteUsageRecordWrite, 0, len(page.Records))
 	for _, record := range page.Records {
@@ -268,7 +303,17 @@ func (repository *StoreRepository) SaveUsagePage(
 		}
 		records = append(records, item)
 	}
-	saved, err := repository.store.SaveSiteUsageRecords(ctx, siteID, adapterKind, records, page.FetchedAt.UTC().UnixMilli())
+	var saved vnextstore.SiteUsageSaveResult
+	var err error
+	if progress == nil {
+		saved, err = repository.store.SaveSiteUsageRecords(ctx, siteID, adapterKind, records, page.FetchedAt.UTC().UnixMilli())
+	} else {
+		saved, err = repository.store.SaveSiteUsageWindowPage(ctx, siteID, adapterKind, records,
+			page.FetchedAt.UTC().UnixMilli(), vnextstore.SiteUsageSyncProgress{
+				WindowID: progress.WindowID, ExpectedCursor: progress.ExpectedCursor,
+				NextCursor: page.NextCursor, HasMore: page.HasMore,
+			})
+	}
 	return siteadmin.UsageSaveResult{Inserted: saved.Inserted, Deduplicated: saved.Deduplicated}, err
 }
 

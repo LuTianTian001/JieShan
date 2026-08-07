@@ -8,6 +8,7 @@ import {
   PanelLeftOpen,
   ScrollText,
   Server,
+  ServerCog,
   Settings2,
   Waypoints,
   X,
@@ -24,6 +25,7 @@ const primaryNavigation = [
   { to: '/monitor', label: '模型监控', icon: HeartPulse },
   { to: '/keys', label: '下游密钥', icon: KeyRound },
   { to: '/logs', label: '调用日志', icon: ScrollText },
+  { to: '/system-logs', label: '系统日志', icon: ServerCog },
 ];
 
 const pageTitles: Array<[RegExp, string]> = [
@@ -34,6 +36,7 @@ const pageTitles: Array<[RegExp, string]> = [
   [/^\/monitor$/, '模型监控'],
   [/^\/keys$/, '下游密钥'],
   [/^\/logs$/, '调用日志'],
+  [/^\/system-logs$/, '系统日志'],
   [/^\/settings$/, '设置'],
 ];
 

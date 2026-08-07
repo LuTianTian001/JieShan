@@ -66,10 +66,10 @@ func (s *Store) CreateRevealableDownstreamKey(
 	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO downstream_keys(
 name,key_prefix,key_digest,encrypted_secret,reveal_version,routing_profile_id,enabled,quota_nano_usd,
-hourly_quota_nano_usd,billing_multiplier_bps,rpm_limit,expires_at,revision,created_at,updated_at)
-VALUES (?,?,?,NULL,0,?,?,?,?,?,?,?,1,?,?)`, strings.TrimSpace(input.Name), strings.TrimSpace(input.KeyPrefix), input.KeyDigest,
+hourly_quota_nano_usd,billing_multiplier_bps,expires_at,revision,created_at,updated_at)
+VALUES (?,?,?,NULL,0,?,?,?,?,?,?,1,?,?)`, strings.TrimSpace(input.Name), strings.TrimSpace(input.KeyPrefix), input.KeyDigest,
 		profileID, boolInt(input.Enabled), input.QuotaNanoUSD, input.HourlyQuotaNanoUSD, billingMultiplierBPS,
-		0, input.ExpiresAt, now, now)
+		input.ExpiresAt, now, now)
 	if err != nil {
 		return DownstreamKey{}, normalizeDownstreamKeyConflict(err)
 	}
@@ -215,7 +215,7 @@ func (s *Store) UpdateDownstreamKey(ctx context.Context, id int64, input Downstr
 	now := NowMS()
 	result, err := tx.ExecContext(ctx, `UPDATE downstream_keys SET
 name=?,routing_profile_id=?,enabled=?,quota_nano_usd=?,hourly_quota_nano_usd=?,billing_multiplier_bps=?,
-rpm_limit=0,expires_at=?,revision=revision+1,updated_at=?
+expires_at=?,revision=revision+1,updated_at=?
 WHERE id=? AND revision=?`, input.Name, profileID, boolInt(input.Enabled), input.QuotaNanoUSD,
 		input.HourlyQuotaNanoUSD, input.BillingMultiplierBPS, input.ExpiresAt, now, id, input.ExpectedRevision)
 	if err != nil {
@@ -297,7 +297,7 @@ COALESCE((SELECT h.used_nano_usd FROM downstream_key_hourly_usage h
 COALESCE((SELECT h.reserved_nano_usd FROM downstream_key_hourly_usage h
   WHERE h.downstream_key_id=k.id
     AND h.window_started_at=(CAST(strftime('%s','now') AS INTEGER)/3600)*3600000),0),
-(CAST(strftime('%s','now') AS INTEGER)/3600)*3600000,k.billing_multiplier_bps,k.rpm_limit,
+(CAST(strftime('%s','now') AS INTEGER)/3600)*3600000,k.billing_multiplier_bps,
 k.expires_at,k.last_used_at,k.revision,k.created_at,k.updated_at`
 
 const downstreamKeyMetadataFrom = `FROM downstream_keys k
@@ -348,7 +348,7 @@ func downstreamKeyScanDestinations(item *DownstreamKey, state *downstreamKeyScan
 		&item.RoutingProfileID, &item.RoutingProfileName, &state.usesDefault, &state.enabled,
 		&state.quota, &item.UsedNanoUSD, &item.ReservedNanoUSD, &state.hourlyQuota,
 		&item.UsedThisHourNanoUSD, &item.ReservedThisHourNanoUSD, &item.HourlyWindowStartedAt,
-		&item.BillingMultiplierBPS, &item.RPMLimit, &state.expiresAt,
+		&item.BillingMultiplierBPS, &state.expiresAt,
 		&state.lastUsedAt, &item.Revision, &item.CreatedAt, &item.UpdatedAt,
 	}
 }

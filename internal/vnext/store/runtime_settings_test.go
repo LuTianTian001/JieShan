@@ -30,7 +30,8 @@ func TestRuntimeSettingsCASPropagatesProbeIntervalAndSurvivesRestart(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if initial.Revision != 1 || initial.FailureThreshold != 2 || initial.ProbeInterval != 5*time.Minute ||
+	if initial.Revision != 1 || initial.FailureThreshold != 2 || initial.FailureWindow != 5*time.Minute ||
+		initial.Cooldown != 15*time.Minute || initial.ProbeInterval != 15*time.Minute ||
 		initial.FirstOutputTimeout != 15*time.Second || initial.StreamIdleTimeout != time.Minute ||
 		initial.RequestTimeout != 5*time.Minute || initial.MaxAttempts != 4 || initial.LogRetentionDays != 30 {
 		t.Fatalf("initial settings = %+v", initial)
@@ -50,7 +51,7 @@ public_name,official_price_sku,enabled,revision,created_at,updated_at) VALUES (?
 	if err != nil {
 		t.Fatal(err)
 	}
-	if monitor.Interval != 5*time.Minute {
+	if monitor.Interval != 15*time.Minute {
 		t.Fatalf("monitor default interval = %v", monitor.Interval)
 	}
 

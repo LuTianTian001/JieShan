@@ -1,15 +1,12 @@
 import {
-  CheckCircle2,
   ChevronDown,
   CircleDollarSign,
-  Clock3,
-  Laptop,
   RefreshCw,
   Search,
   ShieldCheck,
   TriangleAlert,
 } from 'lucide-react';
-import { Fragment, useEffect, useRef, useState, type FormEvent } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { useToast } from '../../components/Toast';
 import {
   Badge,
@@ -27,7 +24,6 @@ import { api, type AccountSecretInput } from '../../lib/api';
 import { formatDateTime, formatTokens } from '../../lib/format';
 import type { Site, SiteAccountConnection, SiteBalance, SiteUsageRecord } from '../../lib/types';
 
-type LoginStage = 'idle' | 'opening' | 'waiting' | 'connected';
 const prototypeMode = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('prototype') === '1';
 
 function usageStatusLabel(value: string): string {
@@ -159,10 +155,7 @@ export function SiteAccountSettings({
 }) {
   const toast = useToast();
   const [origin, setOrigin] = useState(account?.origin || site.dashboardUrl || '');
-  const [detected, setDetected] = useState(() => identifyPanel(account?.origin || site.dashboardUrl || ''));
-  const [detecting, setDetecting] = useState(false);
-  const [mode, setMode] = useState<'edge' | 'token'>('edge');
-  const [stage, setStage] = useState<LoginStage>(account?.secretConfigured ? 'connected' : 'idle');
+  const detected = useMemo(() => identifyPanel(origin), [origin]);
   const [accessToken, setAccessToken] = useState('');
   const [refreshToken, setRefreshToken] = useState('');
   const [expiresAt, setExpiresAt] = useState('');
@@ -172,18 +165,8 @@ export function SiteAccountSettings({
 
   useEffect(() => {
     setOrigin(account?.origin || site.dashboardUrl || '');
-    setDetected(identifyPanel(account?.origin || site.dashboardUrl || ''));
-    setStage(account?.secretConfigured ? 'connected' : 'idle');
     setEnabled(account?.enabled ?? true);
   }, [account, site.dashboardUrl]);
-
-  const detect = async () => {
-    setDetecting(true);
-    await new Promise((resolve) => window.setTimeout(resolve, 520));
-    setDetected(identifyPanel(origin));
-    setDetecting(false);
-    toast.show('已自动识别底层面板体系', 'success');
-  };
 
   const saveConnection = async (secrets: AccountSecretInput) => {
     if (!origin.trim()) {
@@ -195,7 +178,6 @@ export function SiteAccountSettings({
     try {
       await persistAccountConnection(site, account, origin.trim(), detected.adapterKind, enabled, secrets);
       await onSaved();
-      setStage('connected');
       setAccessToken('');
       setRefreshToken('');
       toast.show('站点账户已连接', 'success');
@@ -204,13 +186,6 @@ export function SiteAccountSettings({
     } finally {
       setSaving(false);
     }
-  };
-
-  const startEdgeLogin = async () => {
-    setStage('opening');
-    setError('');
-    await new Promise((resolve) => window.setTimeout(resolve, 620));
-    setStage('waiting');
   };
 
   const submitTokens = async (event: FormEvent) => {
@@ -232,46 +207,25 @@ export function SiteAccountSettings({
       <div className="account-detection-card">
         <span className="account-detection-icon"><ShieldCheck size={19} /></span>
         <div>
-          <span>自动识别结果</span>
+          <span>地址兼容性推断</span>
           <strong>{detected.label}</strong>
           <small>{detected.capabilities.join(' · ')}</small>
         </div>
-        <Button size="sm" icon={RefreshCw} busy={detecting} onClick={() => void detect()}>重新检测</Button>
       </div>
 
-      <Field label="站点地址" required hint="修改地址后重新检测，不需要手动猜面板类型。">
+      <Field label="站点地址" required hint="系统根据地址选择兼容适配器，保存时由后端验证真实凭据。">
         <input className="input code-input" type="url" value={origin} onChange={(event) => setOrigin(event.target.value)} />
       </Field>
 
-      <div className="segmented account-login-mode" role="group" aria-label="站点账户连接方式">
-        <button type="button" className={mode === 'edge' ? 'is-active' : ''} onClick={() => setMode('edge')}>在 Edge 中登录</button>
-        <button type="button" className={mode === 'token' ? 'is-active' : ''} onClick={() => setMode('token')}>手动 Token</button>
-      </div>
-
-      {mode === 'edge' ? <div className="edge-login-card">
-        <span className={`edge-login-status is-${stage}`}>
-          {stage === 'connected' ? <CheckCircle2 size={20} /> : stage === 'waiting' ? <Clock3 size={20} /> : <Laptop size={20} />}
-        </span>
-        <div>
-          <strong>{stage === 'connected' ? '站点账户已连接' : stage === 'waiting' ? '演示：等待 Edge 回调' : stage === 'opening' ? '演示：准备 Edge 登录' : 'Edge 登录演示（未接入回调）'}</strong>
-          <p>{stage === 'connected'
-            ? `${account?.siteName || site.name} · ${account?.secretConfigured ? '令牌已加密保存' : '等待令牌'}`
-            : stage === 'waiting'
-              ? '真实回调尚未接入，不会导入令牌；请切换到“手动 Token”保存真实凭据。'
-              : '当前仅展示交互流程，不会打开 Edge 或保存伪造令牌；请使用“手动 Token”完成连接。'}</p>
-        </div>
-        {stage === 'waiting'
-          ? <Button variant="secondary" disabled>等待真实回调</Button>
-          : <Button variant={account ? 'secondary' : 'primary'} busy={stage === 'opening'} onClick={() => void startEdgeLogin()}>{account ? '重新开始演示' : '开始 Edge 演示'}</Button>}
-      </div> : <form className="form-stack" onSubmit={submitTokens}>
-        <InlineNotice>只在 Edge 登录助手不可用时使用。已有连接时留空表示不更换对应令牌。</InlineNotice>
+      <form className="form-stack" onSubmit={submitTokens}>
+        <InlineNotice>保存真实站点令牌；已有连接时留空表示不更换对应令牌。</InlineNotice>
         <Field label="Access Token" required={!account}><textarea className="textarea code-input" rows={3} value={accessToken} onChange={(event) => setAccessToken(event.target.value)} autoComplete="off" /></Field>
         <Field label="Refresh Token" hint="Sub2API 兼容面板填写后可自动续期。"><textarea className="textarea code-input" rows={2} value={refreshToken} onChange={(event) => setRefreshToken(event.target.value)} autoComplete="off" /></Field>
         <Field label="Token 到期时间"><input className="input" type="datetime-local" value={expiresAt} onChange={(event) => setExpiresAt(event.target.value)} /></Field>
+        <Switch checked={enabled} label="自动刷新站点账户的余额、上游日志和会话令牌" onChange={setEnabled} />
         <Button variant="primary" busy={saving} type="submit">保存站点账户</Button>
-      </form>}
+      </form>
 
-      <Switch checked={enabled} label="自动刷新站点账户的余额、上游日志和会话令牌" onChange={setEnabled} />
       {account?.lastErrorCode && <InlineNotice tone="warning"><TriangleAlert size={14} />最近连接异常：{account.lastErrorCode} · {formatDateTime(account.lastErrorAt)}</InlineNotice>}
       {error && <p className="form-error">{error}</p>}
     </div>

@@ -909,7 +909,7 @@ func (applier *migrationApplier) insertDownstreamKeys() error {
 name,key_prefix,key_digest,encrypted_secret,reveal_version,routing_profile_id,enabled,quota_nano_usd,
 used_nano_usd,reserved_nano_usd,rpm_limit,expires_at,last_used_at,revision,created_at,updated_at)
 VALUES (?,?,?,NULL,0,?,?,?,?,?,?,?,?,1,?,?)`, name, strings.TrimSpace(source.prefix), source.digest,
-			storedProfile, boolIntMigration(source.enabled), quota, used, reserved, maxInt(source.rpmLimit, 0),
+			storedProfile, boolIntMigration(source.enabled), quota, used, reserved, 0,
 			source.expiresAt, source.lastUsedAt, nonNegativeTime(source.createdAt), nonNegativeTime(source.updatedAt)); err != nil {
 			return fmt.Errorf("migrate downstream key %d: %w", source.id, err)
 		}
@@ -1570,11 +1570,4 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func maxInt(left, right int) int {
-	if left > right {
-		return left
-	}
-	return right
 }

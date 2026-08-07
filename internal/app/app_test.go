@@ -256,6 +256,7 @@ func testConfig(dataDir, databasePath, webDir string) config.Config {
 		Cooldown:                      time.Minute,
 		HalfOpenLease:                 10 * time.Second,
 		CredentialCooldown:            time.Minute,
+		ProbeInterval:                 time.Minute,
 		ProbePollInterval:             time.Second,
 		ProbeLeaseDuration:            time.Minute,
 		ProbeTimeout:                  time.Second,

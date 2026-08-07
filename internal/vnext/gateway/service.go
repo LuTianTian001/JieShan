@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/LuTianTian001/JieShan/internal/vnext/capacity"
 	"github.com/LuTianTian001/JieShan/internal/vnext/protocol"
 	"github.com/LuTianTian001/JieShan/internal/vnext/resolver"
 	"github.com/LuTianTian001/JieShan/internal/vnext/routing"
@@ -49,6 +50,11 @@ type AdapterRegistry interface {
 type HealthRepository interface {
 	AcquireTargetAttempt(context.Context, int64, routing.Revision, routing.HealthPolicy, time.Time) (vnextstore.TargetAttemptPermit, error)
 	ApplyTargetHealthEvent(context.Context, int64, routing.HealthPolicy, routing.HealthEvent) (vnextstore.TargetHealthSnapshot, routing.ApplyResult, error)
+}
+
+type CapacityManager interface {
+	capacity.Acquirer
+	ReportThrottle(capacity.ThrottleSignal) error
 }
 
 type SecretMaterial struct {
@@ -96,7 +102,7 @@ type Options struct {
 	RequestTimeout          time.Duration
 	MaxAttempts             int
 	PolicyProvider          RuntimePolicyProvider
-	RateLimiter             RateLimiter
+	Capacity                CapacityManager
 	MaxResponseBytes        int64
 	MaxPrecommitStreamBytes int64
 	DefaultMaxOutputTokens  int64
@@ -115,7 +121,7 @@ type Service struct {
 	planner                ReservationPlanner
 	client                 HTTPDoer
 	policyProvider         RuntimePolicyProvider
-	rateLimiter            RateLimiter
+	capacity               CapacityManager
 	maxBody                int64
 	maxBuffer              int64
 	defaultMaxOutputTokens int64
@@ -135,9 +141,9 @@ func New(
 	client HTTPDoer,
 	options Options,
 ) (*Service, error) {
-	if routeResolver == nil || registry == nil || health == nil || secrets == nil || effects == nil ||
+	if routeResolver == nil || registry == nil || health == nil || secrets == nil || effects == nil || options.Capacity == nil ||
 		accounting == nil || prices == nil || planner == nil || client == nil {
-		return nil, errors.New("gateway resolver, registry, health store, secret provider, credential effects, accounting, pricing, reservation planner, and client are required")
+		return nil, errors.New("gateway resolver, registry, health store, capacity manager, secret provider, credential effects, accounting, pricing, reservation planner, and client are required")
 	}
 	initialPolicy := normalizeRuntimePolicy(RuntimePolicy{
 		HealthPolicy: options.HealthPolicy, FirstOutputTimeout: options.FirstOutputTimeout,
@@ -146,9 +152,6 @@ func New(
 	})
 	if options.PolicyProvider == nil {
 		options.PolicyProvider = StaticRuntimePolicyProvider{Policy: initialPolicy}
-	}
-	if options.RateLimiter == nil {
-		options.RateLimiter = NewMemoryRateLimiter()
 	}
 	if options.MaxResponseBytes <= 0 {
 		options.MaxResponseBytes = defaultMaxResponseBytes
@@ -171,7 +174,7 @@ func New(
 	return &Service{
 		resolver: routeResolver, registry: registry, health: health, secrets: secrets,
 		effects: effects, accounting: accounting, prices: prices, planner: planner,
-		client: client, policyProvider: options.PolicyProvider, rateLimiter: options.RateLimiter,
+		client: client, policyProvider: options.PolicyProvider, capacity: options.Capacity,
 		maxBody: options.MaxResponseBytes, maxBuffer: options.MaxPrecommitStreamBytes,
 		defaultMaxOutputTokens: options.DefaultMaxOutputTokens,
 		accountingTimeout:      options.AccountingTimeout, now: options.Now,
@@ -278,25 +281,42 @@ func (service *Service) Execute(ctx context.Context, input Input, sink StreamSin
 	}
 	result.DownstreamKeyID = resolution.DownstreamKeyID
 	startedAt := service.now().UTC()
-	decision, err := service.rateLimiter.Allow(
-		requestCtx,
-		resolution.DownstreamKeyID,
-		resolution.DownstreamKeyRevision,
-		resolution.DownstreamKeyRPMLimit,
-		startedAt,
-	)
-	if err != nil {
-		if timeoutErr := requestContextError(requestCtx); timeoutErr != nil {
-			return result, timeoutErr
-		}
-		return result, fmt.Errorf("%w: enforce downstream RPM", ErrRuntimeUnavailable)
-	}
-	if !decision.Allowed {
-		return result, &RateLimitError{RetryAfter: decision.RetryAfter}
-	}
 	routeCandidates, err := requestRouteCandidateSnapshots(resolution, startedAt)
 	if err != nil {
 		return result, fmt.Errorf("%w: snapshot effective route", ErrRuntimeUnavailable)
+	}
+	cursor := resolution.NewCursor(startedAt)
+	candidate, ok := cursor.First()
+	if !ok {
+		return result, ErrNoAvailableUpstream
+	}
+	acquireCapacity := func() (*capacity.Permit, error) {
+		admissionCandidates, candidateErr := capacityCandidates(resolution, cursor.RemainingTargets())
+		if candidateErr != nil {
+			return nil, fmt.Errorf("%w: build capacity candidates", ErrRuntimeUnavailable)
+		}
+		capacityPermit, capacityErr := service.capacity.Acquire(requestCtx, capacity.Request{
+			KeyID: capacity.KeyID(resolution.DownstreamKeyID), Candidates: admissionCandidates,
+		})
+		if capacityErr != nil {
+			if timeoutErr := requestContextError(requestCtx); timeoutErr != nil {
+				return nil, timeoutErr
+			}
+			return nil, capacityErr
+		}
+		capacityPermit.ReleaseOnDone(requestCtx)
+		for candidate.Target.ID != routing.TargetID(capacityPermit.TargetID) {
+			candidate, ok = cursor.SkipTarget()
+			if !ok {
+				capacityPermit.Release()
+				return nil, fmt.Errorf("%w: capacity selected an ineligible target", ErrRuntimeUnavailable)
+			}
+		}
+		return capacityPermit, nil
+	}
+	firstCapacityPermit, err := acquireCapacity()
+	if err != nil {
+		return result, err
 	}
 	accountingState, err := service.startAccounting(
 		requestCtx,
@@ -314,6 +334,7 @@ func (service *Service) Execute(ctx context.Context, input Input, sink StreamSin
 		startedAt,
 	)
 	if err != nil {
+		firstCapacityPermit.Release()
 		return result, err
 	}
 	result.PriceCatalogVersion = accountingState.quote.CatalogVersion
@@ -350,15 +371,23 @@ func (service *Service) Execute(ctx context.Context, input Input, sink StreamSin
 		return nil
 	}
 
-	cursor := resolution.NewCursor(startedAt)
-	candidate, ok := cursor.First()
 	attemptsStarted := 0
 	for ok {
 		if attemptsStarted >= policy.MaxAttempts {
+			firstCapacityPermit.Release()
 			return result, ErrNoAvailableUpstream
+		}
+		capacityPermit := firstCapacityPermit
+		firstCapacityPermit = nil
+		if capacityPermit == nil {
+			capacityPermit, err = acquireCapacity()
+			if err != nil {
+				return result, err
+			}
 		}
 		metadata, exists := resolution.Endpoints[candidate.Target.ID]
 		if !exists {
+			capacityPermit.Release()
 			return result, fmt.Errorf("%w: resolved endpoint metadata is missing", ErrRuntimeUnavailable)
 		}
 		attempt := Attempt{
@@ -380,6 +409,7 @@ func (service *Service) Execute(ctx context.Context, input Input, sink StreamSin
 			attempt.StartedAt,
 		)
 		if acquireErr != nil {
+			capacityPermit.Release()
 			attempt.FinishedAt = service.now().UTC()
 			attempt.Outcome = "state_error"
 			attempt.StateUpdateFailed = true
@@ -388,6 +418,7 @@ func (service *Service) Execute(ctx context.Context, input Input, sink StreamSin
 		}
 		attempt.PermitMode = permit.Permit.Mode
 		if !permit.Permit.Allowed {
+			capacityPermit.Release()
 			attempt.FinishedAt = service.now().UTC()
 			attempt.Outcome = "skipped"
 			attempt.ErrorCode = string(permit.Permit.Reason)
@@ -402,6 +433,7 @@ func (service *Service) Execute(ctx context.Context, input Input, sink StreamSin
 
 		material, materialErr := service.secrets.Materialize(requestCtx, metadata, candidate.Credential.ID)
 		if materialErr != nil || strings.TrimSpace(material.Credential) == "" {
+			capacityPermit.Release()
 			failure := routing.Failure{Kind: routing.FailureCredentialAuth}
 			attempt.ErrorCode = "credential_unavailable"
 			attempt.ErrorClass = string(routing.FailureCredentialAuth)
@@ -416,6 +448,7 @@ func (service *Service) Execute(ctx context.Context, input Input, sink StreamSin
 		components, componentsErr := service.registry.Components(metadata.Protocol, metadata.Surface)
 		if componentsErr != nil || components.RequestEncoder == nil || components.ResponseDecoder == nil ||
 			components.StreamDecoder == nil || components.UsageExtractor == nil || components.ErrorDecoder == nil {
+			capacityPermit.Release()
 			failure := routing.Failure{Kind: routing.FailureTargetMisconfigured}
 			attempt.ErrorCode = "adapter_unavailable"
 			attempt.ErrorClass = string(routing.FailureTargetMisconfigured)
@@ -436,6 +469,7 @@ func (service *Service) Execute(ctx context.Context, input Input, sink StreamSin
 			Auth:     protocol.AuthInput{Scheme: metadata.AuthScheme, Secret: material.Credential},
 		})
 		if encodeErr != nil {
+			capacityPermit.Release()
 			attempt.FinishedAt = service.now().UTC()
 			attempt.Outcome = "rejected"
 			attempt.FailureKind = routing.FailureClientInvalid
@@ -455,6 +489,7 @@ func (service *Service) Execute(ctx context.Context, input Input, sink StreamSin
 			requestErr = mergeEndpointHeaders(request.Header, material.Headers)
 		}
 		if requestErr != nil {
+			capacityPermit.Release()
 			watchdog.Stop()
 			cancelAttempt(nil)
 			failure := routing.Failure{Kind: routing.FailureTargetMisconfigured}
@@ -473,6 +508,7 @@ func (service *Service) Execute(ctx context.Context, input Input, sink StreamSin
 			if response != nil && response.Body != nil {
 				_ = response.Body.Close()
 			}
+			capacityPermit.Release()
 			failure, errorCode, terminalErr, classified := contextFailure(attemptCtx, false)
 			watchdog.Stop()
 			cancelAttempt(nil)
@@ -495,6 +531,7 @@ func (service *Service) Execute(ctx context.Context, input Input, sink StreamSin
 			candidate, ok = cursor.Advance(failure)
 			continue
 		}
+		response.Body = capacityPermit.WrapReadCloser(response.Body)
 
 		var executionErr error
 		if input.Stream {
@@ -510,6 +547,14 @@ func (service *Service) Execute(ctx context.Context, input Input, sink StreamSin
 		if executionErr == nil {
 			return result, nil
 		}
+		var capacityRetry *capacityRetryError
+		if errors.As(executionErr, &capacityRetry) {
+			if timeoutErr := requestContextError(requestCtx); timeoutErr != nil {
+				return result, timeoutErr
+			}
+			candidate, ok = cursor.SkipTarget()
+			continue
+		}
 		var retry *retryError
 		if !errors.As(executionErr, &retry) {
 			return result, executionErr
@@ -520,6 +565,23 @@ func (service *Service) Execute(ctx context.Context, input Input, sink StreamSin
 		candidate, ok = cursor.Advance(retry.failure)
 	}
 	return result, ErrNoAvailableUpstream
+}
+
+func capacityCandidates(resolution resolver.Resolution, candidates []routing.Candidate) ([]capacity.Candidate, error) {
+	result := make([]capacity.Candidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		metadata, exists := resolution.Endpoints[candidate.Target.ID]
+		if !exists || metadata.SiteID <= 0 {
+			return nil, errors.New("eligible target metadata is unavailable")
+		}
+		result = append(result, capacity.Candidate{
+			TargetID: capacity.TargetID(candidate.Target.ID), SiteID: capacity.SiteID(metadata.SiteID),
+		})
+	}
+	if len(result) == 0 {
+		return nil, errors.New("no eligible target remains")
+	}
+	return result, nil
 }
 
 func validateInput(input Input, sink StreamSink) error {

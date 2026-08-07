@@ -206,7 +206,7 @@ targets when available:
 5. Confirm one independent failure marks the first target suspect but does not
    cool it under the default policy.
 6. Confirm the second independent failure inside five minutes opens a
-   five-minute cooldown.
+   fifteen-minute cooldown.
 7. Confirm the target returns through a half-open trial after cooldown.
 8. Confirm the request log records effective and source routing profiles,
    ordered attempts, timings, switch reason, token usage, and price snapshot.

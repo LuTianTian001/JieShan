@@ -1,5 +1,6 @@
 import type {
   AuthScheme,
+  BuiltinPriceCatalogResult,
   CatalogState,
   CreateDownstreamKeyInput,
   CreateRouteInput,
@@ -33,7 +34,13 @@ import type {
   SiteAccountConnection,
   SiteCredential,
   SiteEndpoint,
+  SitePlatformDetection,
+  SiteRuntimeStatus,
   SiteUsagePage,
+  SystemHealthOverview,
+  SystemLogPage,
+  TokenJsonImportPreview,
+  TokenJsonImportResult,
   UpdateDownstreamKeyInput,
   UpdateRouteInput,
   UpdateSiteInput,
@@ -51,6 +58,7 @@ const SITE_ACCOUNTS_PREFIX = '/api/vnext/site-accounts';
 const PRICING_PREFIX = '/api/vnext/pricing';
 const MONITOR_PREFIX = import.meta.env.VITE_JIESHAN_MONITOR_PREFIX || '/api/vnext/monitor';
 const LOGS_PREFIX = import.meta.env.VITE_JIESHAN_LOGS_PREFIX || '/api/vnext/request-logs';
+const SYSTEM_LOGS_PREFIX = '/api/vnext/system-logs';
 const SETTINGS_PREFIX = '/api/vnext/settings';
 const CSRF_COOKIE_NAME = 'jieshan_admin_csrf';
 const CSRF_HEADER_NAME = 'X-CSRF-Token';
@@ -226,12 +234,46 @@ export interface GatewayLogFilter {
   to?: number;
 }
 
+export interface SystemLogFilter {
+  before?: number;
+  limit?: number;
+  level?: string;
+  module?: string;
+  search?: string;
+  requestId?: string;
+  taskId?: string;
+}
+
 type GatewayLogSummaryFilter = Omit<GatewayLogFilter, 'cursor' | 'limit'>;
+
+function systemLogQuery(filter: SystemLogFilter): string {
+  const query = new URLSearchParams();
+  if (filter.before) query.set('before', String(filter.before));
+  if (filter.limit) query.set('limit', String(filter.limit));
+  if (filter.level) query.set('level', filter.level);
+  if (filter.module?.trim()) query.set('module', filter.module.trim());
+  if (filter.search?.trim()) query.set('search', filter.search.trim());
+  if (filter.requestId?.trim()) query.set('requestId', filter.requestId.trim());
+  if (filter.taskId?.trim()) query.set('taskId', filter.taskId.trim());
+  return query.size ? `?${query.toString()}` : '';
+}
 
 interface AuthStatusResponse {
   authenticated: boolean;
   username?: string;
   expires_at?: number;
+}
+
+interface CapacitySnapshotResponse {
+  updatedAt: number;
+  queuedRequests: number;
+  sites: Array<{
+    siteId: number;
+    inflightRequests: number;
+    maxConcurrency: number;
+    queuedRequests: number;
+    throttledUntil?: string;
+  }>;
 }
 
 interface RequestLogResponse {
@@ -550,6 +592,13 @@ export const api = {
     return requestJSON<void>(`${SESSION_PREFIX}/logout`, { method: 'POST' });
   },
 
+  changeAdminPassword(currentPassword: string, newPassword: string, confirmPassword: string): Promise<void> {
+    return requestJSON<void>(
+      `${SESSION_PREFIX}/password`,
+      jsonInit('POST', { currentPassword, newPassword, confirmPassword }),
+    );
+  },
+
   async listSites(): Promise<Site[]> {
     return (await requestJSON<{ items: Site[] }>(inventory('/sites'))).items;
   },
@@ -564,6 +613,50 @@ export const api = {
 
   async updateSite(siteId: number, revision: number, input: UpdateSiteInput): Promise<Site> {
     return (await requestJSON<{ item: Site }>(inventory(`/sites/${siteId}`), jsonInit('PATCH', input, revision))).item;
+  },
+
+  deleteSite(siteId: number, revision: number): Promise<void> {
+    return requestJSON<void>(inventory(`/sites/${siteId}`), revisionInit('DELETE', revision));
+  },
+
+  sitePlatformDetection(siteId: number): Promise<SitePlatformDetection> {
+    return requestJSON<SitePlatformDetection>(inventory(`/sites/${siteId}/platform-detection`));
+  },
+
+  siteRuntimeStatus(siteId: number): Promise<SiteRuntimeStatus> {
+    return requestJSON<CapacitySnapshotResponse>('/api/vnext/capacity').then((snapshot) => {
+      const site = snapshot.sites.find((item) => item.siteId === siteId);
+      if (!site) throw new ApiUnavailableError('当前站点没有运行中的容量状态', 503, 'site_capacity_unavailable');
+      return {
+        siteId: site.siteId,
+        inflightRequests: site.inflightRequests,
+        maxConcurrency: site.maxConcurrency,
+        queuedRequests: site.queuedRequests,
+        updatedAt: snapshot.updatedAt,
+        throttledUntil: site.throttledUntil || null,
+      };
+    });
+  },
+
+  previewTokenJsonImport(siteId: number, rawJson: string): Promise<TokenJsonImportPreview> {
+    return requestJSON<TokenJsonImportPreview>(
+      inventory(`/sites/${siteId}/token-json/preview`),
+      jsonInit('POST', { rawJson }),
+    );
+  },
+
+  importTokenJsonAccounts(siteId: number, previewId: string, indices: number[]): Promise<TokenJsonImportResult> {
+    const normalizedPreviewId = previewId.trim();
+    const normalizedIndices = [...indices].sort((left, right) => left - right);
+    if (!normalizedPreviewId || normalizedIndices.length === 0 ||
+      normalizedIndices.some((index) => !Number.isInteger(index) || index < 0) ||
+      new Set(normalizedIndices).size !== normalizedIndices.length) {
+      throw new ApiError('请选择有效且不重复的 Token JSON 账号。', 400, 'invalid_request');
+    }
+    return requestJSON<TokenJsonImportResult>(
+      inventory(`/sites/${siteId}/token-json/import`),
+      jsonInit('POST', { previewId: normalizedPreviewId, indices: normalizedIndices }),
+    );
   },
 
   async listEndpoints(siteId: number): Promise<SiteEndpoint[]> {
@@ -796,6 +889,10 @@ export const api = {
     return requestJSON<PriceCatalogList>(`${PRICING_PREFIX}/catalogs`);
   },
 
+  ensureBuiltinPriceCatalog(): Promise<BuiltinPriceCatalogResult> {
+    return requestJSON<BuiltinPriceCatalogResult>(`${PRICING_PREFIX}/builtin/ensure`, { method: 'POST' });
+  },
+
   async getPriceCatalog(version: string): Promise<PriceCatalog> {
     return (await requestJSON<{ catalog: PriceCatalog }>(
       `${PRICING_PREFIX}/catalogs/${encodeURIComponent(version)}`,
@@ -852,6 +949,13 @@ export const api = {
     await requestJSON<unknown>(`${MONITOR_PREFIX}/models/${publishedModelId}/probe`, { method: 'POST' });
   },
 
+  async probeTarget(publishedModelId: number, providerModelTargetId: number): Promise<void> {
+    await requestJSON<unknown>(
+      `${MONITOR_PREFIX}/models/${publishedModelId}/targets/${providerModelTargetId}/probe`,
+      { method: 'POST' },
+    );
+  },
+
   monitorTargetHistory(publishedModelId: number, providerModelTargetId: number, limit = 200): Promise<MonitorTargetHistory> {
     const query = new URLSearchParams({ limit: String(limit) });
     return requestJSON<MonitorTargetHistory>(
@@ -884,8 +988,16 @@ export const api = {
     );
   },
 
+  systemLogs(filter: SystemLogFilter = {}): Promise<SystemLogPage> {
+    return requestJSON<SystemLogPage>(`${SYSTEM_LOGS_PREFIX}${systemLogQuery(filter)}`);
+  },
+
   settings(): Promise<GatewaySettings> {
     return requestJSON<GatewaySettings>(SETTINGS_PREFIX);
+  },
+
+  systemHealth(): Promise<SystemHealthOverview> {
+    return requestJSON<SystemHealthOverview>(`${SETTINGS_PREFIX}/runtime-overview`);
   },
 
   updateSettings(revision: number, input: Omit<GatewaySettings, 'revision'>): Promise<GatewaySettings> {

@@ -3,6 +3,7 @@ package adminauth
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -29,5 +30,14 @@ func TestArgon2idHashRoundTrip(t *testing.T) {
 	valid, err = verifyPassword(hash, "a different long password")
 	if err != nil || valid {
 		t.Fatalf("valid=%v err=%v", valid, err)
+	}
+}
+
+func TestNewPasswordPolicyCountsUnicodeCharacters(t *testing.T) {
+	if err := validateNewPassword(strings.Repeat("界", 11)); !errors.Is(err, ErrPasswordTooShort) {
+		t.Fatalf("11-character password error = %v", err)
+	}
+	if err := validateNewPassword(strings.Repeat("界", 12)); err != nil {
+		t.Fatalf("12-character password error = %v", err)
 	}
 }

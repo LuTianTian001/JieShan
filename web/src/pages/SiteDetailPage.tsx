@@ -3,6 +3,8 @@ import {
   ChevronDown,
   Copy,
   ExternalLink,
+  FileJson,
+  Gauge,
   KeyRound,
   Layers3,
   Pencil,
@@ -10,14 +12,16 @@ import {
   RefreshCw,
   Search,
   Settings2,
+  Trash2,
 } from 'lucide-react';
 import { useEffect, useMemo, useState, type FormEvent, type MouseEvent } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useToast } from '../components/Toast';
 import {
   Badge,
   Button,
   Dialog,
+  Disclosure,
   EmptyState,
   ErrorState,
   Field,
@@ -44,10 +48,13 @@ import type {
   SiteAccountConnection,
   SiteCredential,
   SiteEndpoint,
+  SiteRuntimeStatus,
 } from '../lib/types';
 import { CredentialDialog, type CredentialEditorInput } from './sites/CredentialDialog';
 import { ModelDiscoveryDialog } from './sites/ModelDiscoveryDialog';
+import { PlatformDetectionPanel } from './sites/PlatformDetectionPanel';
 import { SiteAccountSettings, SiteBalanceSummary, SiteUsagePanel } from './sites/SiteAccountPanel';
+import { TokenJsonImportDialog } from './sites/TokenJsonImportDialog';
 import './sites/sitePrototype.css';
 import '../styles/overview-sites-polish.css';
 
@@ -132,24 +139,28 @@ function SiteSettingsDialog({
   open,
   site,
   account,
+  runtime,
   saving,
   onClose,
   onSubmit,
   onRefreshAccount,
+  onDelete,
 }: {
   open: boolean;
   site: Site;
   account: SiteAccountConnection | null;
+  runtime: SiteRuntimeStatus | null;
   saving: boolean;
   onClose: () => void;
-  onSubmit: (input: { name: string; dashboardUrl: string; enabled: boolean }) => Promise<void>;
+  onSubmit: (input: { name: string; dashboardUrl: string; enabled: boolean; maxConcurrency: number }) => Promise<void>;
   onRefreshAccount: () => Promise<void>;
+  onDelete: () => void;
 }) {
-  const toast = useToast();
   const [tab, setTab] = useState<'basic' | 'account'>('basic');
   const [name, setName] = useState(site.name);
   const [dashboardUrl, setDashboardUrl] = useState(site.dashboardUrl);
   const [enabled, setEnabled] = useState(site.enabled);
+  const [maxConcurrency, setMaxConcurrency] = useState(site.maxConcurrency || 4);
 
   useEffect(() => {
     if (!open) return;
@@ -157,12 +168,13 @@ function SiteSettingsDialog({
     setName(site.name);
     setDashboardUrl(site.dashboardUrl);
     setEnabled(site.enabled);
+    setMaxConcurrency(site.maxConcurrency || 4);
   }, [open, site]);
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (!name.trim()) return;
-    void onSubmit({ name: name.trim(), dashboardUrl: dashboardUrl.trim(), enabled });
+    void onSubmit({ name: name.trim(), dashboardUrl: dashboardUrl.trim(), enabled, maxConcurrency });
   };
 
   return (
@@ -179,7 +191,19 @@ function SiteSettingsDialog({
         <Field label="站点名称" required><input className="input" autoFocus value={name} onChange={(event) => setName(event.target.value)} /></Field>
         <Field label="站点地址" required hint="用于打开站点，也作为站点账户自动识别地址。"><input className="input code-input" type="url" value={dashboardUrl} onChange={(event) => setDashboardUrl(event.target.value)} /></Field>
         <Switch checked={enabled} label="允许这个站点参与模型路由" onChange={setEnabled} />
-        <div className="danger-zone-inline"><div><strong>删除站点</strong><span>原型阶段只展示操作位置，不执行真实删除。</span></div><Button onClick={() => toast.show('高保真原型暂不执行站点删除', 'info')}>删除站点</Button></div>
+        <Disclosure summary={<span className="settings-disclosure-title"><Gauge size={17} /><span><strong>并发与排队</strong><small>站点级并发上限和实时只读状态</small></span></span>}>
+          <div className="site-concurrency-settings">
+            <Field label="最大同时请求数" hint="当前站点满载时先尝试下一家；全部上游满载后才进入公平队列。">
+              <div className="unit-input"><input className="input" type="number" min={1} max={10_000} value={maxConcurrency} onChange={(event) => setMaxConcurrency(Math.max(1, Number(event.target.value) || 1))} /><span>请求</span></div>
+            </Field>
+            <div className="site-runtime-readout" aria-label="站点实时并发状态">
+              <div><span>处理中</span><strong>{runtime?.inflightRequests ?? '-'}</strong></div>
+              <div><span>同时请求上限</span><strong>{runtime?.maxConcurrency ?? maxConcurrency}</strong></div>
+              <div><span>排队</span><strong>{runtime?.queuedRequests ?? '-'}</strong></div>
+            </div>
+          </div>
+        </Disclosure>
+        <div className="danger-zone-inline"><div><strong>删除站点</strong><span>同时清理这个站点的 API Key、模型来源、余额连接和运行状态。</span></div><Button variant="danger" icon={Trash2} onClick={onDelete}>删除站点</Button></div>
       </form> : <SiteAccountSettings site={site} account={account} onSaved={onRefreshAccount} />}
     </Dialog>
   );
@@ -187,13 +211,18 @@ function SiteSettingsDialog({
 
 export function SiteDetailPage() {
   const siteId = Number(useParams().siteId);
+  const navigate = useNavigate();
   const toast = useToast();
   const siteResource = useResource(() => api.getSite(siteId), [siteId]);
   const inventory = useResource(() => loadInventory(siteId), [siteId]);
   const accountResource = useResource(() => api.getSiteAccount(siteId), [siteId]);
+  const platformResource = useResource(() => api.sitePlatformDetection(siteId), [siteId]);
+  const runtimeResource = useResource(() => api.siteRuntimeStatus(siteId), [siteId]);
   const [tab, setTab] = useState<'keys' | 'models' | 'usage'>('keys');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [siteSaving, setSiteSaving] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [siteDeleting, setSiteDeleting] = useState(false);
   const [keyDialogOpen, setKeyDialogOpen] = useState(false);
   const [keySaving, setKeySaving] = useState(false);
   const [editingKey, setEditingKey] = useState<KeyView | null>(null);
@@ -203,6 +232,7 @@ export function SiteDetailPage() {
   const [keyQuery, setKeyQuery] = useState('');
   const [keyStatus, setKeyStatus] = useState<'all' | 'enabled' | 'disabled'>('all');
   const [modelQuery, setModelQuery] = useState('');
+  const [tokenImportOpen, setTokenImportOpen] = useState(false);
 
   const keyViews = useMemo(() => keyViewsFromInventory(inventory.data), [inventory.data]);
   const visibleKeys = useMemo(() => {
@@ -242,11 +272,12 @@ export function SiteDetailPage() {
   const uniqueModelCount = new Set(keyViews.flatMap((item) => item.modelNames)).size;
   const latestUpdate = Math.max(site.updatedAt, ...keyViews.map((item) => item.credential.runtimeUpdatedAt || item.credential.updatedAt));
 
-  const saveSite = async (input: { name: string; dashboardUrl: string; enabled: boolean }) => {
+  const saveSite = async (input: { name: string; dashboardUrl: string; enabled: boolean; maxConcurrency: number }) => {
     setSiteSaving(true);
     try {
       const updated = await api.updateSite(site.id, site.revision, { ...input, dashboardUrl: input.dashboardUrl || null });
       siteResource.setData(updated);
+      void runtimeResource.refresh();
       setSettingsOpen(false);
       toast.show('站点设置已保存', 'success');
     } catch (reason) {
@@ -254,6 +285,20 @@ export function SiteDetailPage() {
       void siteResource.refresh();
     } finally {
       setSiteSaving(false);
+    }
+  };
+
+  const deleteSite = async () => {
+    setSiteDeleting(true);
+    try {
+      await api.deleteSite(site.id, site.revision);
+      toast.show(`站点“${site.name}”已删除`, 'success');
+      navigate('/sites', { replace: true });
+    } catch (reason) {
+      toast.show(reason instanceof Error ? reason.message : '删除站点失败', 'error');
+      void siteResource.refresh();
+    } finally {
+      setSiteDeleting(false);
     }
   };
 
@@ -348,6 +393,11 @@ export function SiteDetailPage() {
     }
   };
 
+  const refreshAfterTokenImport = async () => {
+    await inventory.refresh();
+    setTab('keys');
+  };
+
   const toggleKeyExpanded = (id: number) => {
     setExpandedKeyIds((current) => {
       const next = new Set(current);
@@ -382,6 +432,13 @@ export function SiteDetailPage() {
         <div className="site-overview-metric"><RefreshCw size={17} /><span>最近更新</span><strong>{formatDateTime(latestUpdate, true)}</strong></div>
       </div>
 
+      <PlatformDetectionPanel
+        detection={platformResource.data}
+        loading={platformResource.loading}
+        error={platformResource.error}
+        onRetry={() => void platformResource.refresh()}
+      />
+
       <Tabs label="站点详情视图" value={tab} onChange={setTab} items={[
         { value: 'keys', label: 'API Key', count: keyViews.length },
         { value: 'models', label: '模型', count: uniqueModelCount },
@@ -389,7 +446,7 @@ export function SiteDetailPage() {
       ]} />
 
       {tab === 'keys' && <Panel className="site-key-panel">
-        <div className="site-section-heading"><div><h2>上游 API Key</h2><p>每把 Key 直接维护自己的 API 类型、地址和模型列表。</p></div><Button icon={Plus} size="sm" onClick={() => { setEditingKey(null); setKeyDialogOpen(true); }}>添加 API Key</Button></div>
+        <div className="site-section-heading"><div><h2>上游 API Key</h2><p>每把 Key 直接维护自己的 API 类型、地址和模型列表。</p></div><div className="site-section-actions"><Button icon={FileJson} size="sm" onClick={() => setTokenImportOpen(true)}>导入 Token JSON</Button><Button icon={Plus} size="sm" onClick={() => { setEditingKey(null); setKeyDialogOpen(true); }}>添加 API Key</Button></div></div>
         {keyViews.length > 0 && <FilterBar trailing={<span className="result-count">{visibleKeys.length} / {keyViews.length} 个 Key</span>}>
           <SearchField value={keyQuery} onChange={setKeyQuery} placeholder="搜索名称、API 地址或模型" />
           <div className="segmented" role="group" aria-label="API Key 状态">{([['all', '全部'], ['enabled', '已启用'], ['disabled', '已停用']] as const).map(([value, label]) => <button type="button" className={keyStatus === value ? 'is-active' : ''} onClick={() => setKeyStatus(value)} key={value}>{label}</button>)}</div>
@@ -447,7 +504,16 @@ export function SiteDetailPage() {
 
       {tab === 'usage' && <SiteUsagePanel site={site} account={account} accountLoading={accountResource.loading} onRefreshAccount={accountResource.refresh} onOpenSettings={() => setSettingsOpen(true)} />}
 
-      <SiteSettingsDialog open={settingsOpen} site={site} account={account} saving={siteSaving} onClose={() => setSettingsOpen(false)} onSubmit={saveSite} onRefreshAccount={accountResource.refresh} />
+      <SiteSettingsDialog open={settingsOpen} site={site} account={account} runtime={runtimeResource.data} saving={siteSaving} onClose={() => setSettingsOpen(false)} onSubmit={saveSite} onRefreshAccount={accountResource.refresh} onDelete={() => { setSettingsOpen(false); setDeleteOpen(true); }} />
+      <Dialog
+        open={deleteOpen}
+        title="删除上游站点"
+        description={`确认删除“${site.name}”？`}
+        onClose={() => { if (!siteDeleting) setDeleteOpen(false); }}
+        footer={<><Button disabled={siteDeleting} onClick={() => setDeleteOpen(false)}>取消</Button><Button variant="danger" icon={Trash2} busy={siteDeleting} onClick={() => void deleteSite()}>确认删除</Button></>}
+      >
+        <InlineNotice tone="danger">删除后，该站点不会再参与路由；它的上游配置、余额快照和站点使用记录也会一并清理。下游调用日志会保留历史快照。</InlineNotice>
+      </Dialog>
       <CredentialDialog
         open={keyDialogOpen}
         saving={keySaving}
@@ -458,6 +524,7 @@ export function SiteDetailPage() {
         onSubmit={saveCredential}
       />
       <ModelDiscoveryDialog open={Boolean(discoveryKey)} siteId={site.id} credential={discoveryKey?.credential || null} endpoint={discoveryKey?.endpoint || null} onClose={() => setDiscoveryKey(null)} onImported={inventory.refresh} />
+      <TokenJsonImportDialog open={tokenImportOpen} siteId={site.id} onClose={() => setTokenImportOpen(false)} onImported={refreshAfterTokenImport} />
     </div>
   );
 }

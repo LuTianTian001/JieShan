@@ -152,10 +152,19 @@ type ImportResult struct {
 type BuiltinBootstrapResult struct {
 	CatalogVersion string       `json:"catalog_version"`
 	CatalogDigest  string       `json:"catalog_digest"`
+	Outcome        string       `json:"outcome"`
 	Imported       bool         `json:"imported"`
 	Activated      bool         `json:"activated"`
 	State          CatalogState `json:"state"`
 }
+
+const (
+	BuiltinOutcomeAlreadyCurrent    = "already_current"
+	BuiltinOutcomeInstalled         = "installed"
+	BuiltinOutcomeUpgraded          = "upgraded"
+	BuiltinOutcomeActivatedExisting = "activated_existing"
+	BuiltinOutcomeOperatorPreserved = "operator_catalog_preserved"
+)
 
 // EnsureBuiltinOfficialCatalog makes a brand-new store immediately usable and
 // advances an active older JieShan snapshot to the bundled correction. An
@@ -178,6 +187,7 @@ func (service *Service) EnsureBuiltinOfficialCatalog(ctx context.Context) (Built
 	upgradeFromVersion := ""
 	if state.ActiveVersion != "" {
 		if state.ActiveVersion == candidate.Version {
+			result.Outcome = BuiltinOutcomeAlreadyCurrent
 			return result, nil
 		}
 		active, loadErr := service.repository.GetPriceCatalog(ctx, state.ActiveVersion)
@@ -185,6 +195,7 @@ func (service *Service) EnsureBuiltinOfficialCatalog(ctx context.Context) (Built
 			return BuiltinBootstrapResult{}, loadErr
 		}
 		if !olderBuiltinCatalog(active, candidate) {
+			result.Outcome = BuiltinOutcomeOperatorPreserved
 			return result, nil
 		}
 		upgradingBuiltin = true
@@ -194,6 +205,7 @@ func (service *Service) EnsureBuiltinOfficialCatalog(ctx context.Context) (Built
 	for _, item := range items {
 		if item.Version != candidate.Version {
 			if !upgradingBuiltin {
+				result.Outcome = BuiltinOutcomeOperatorPreserved
 				return result, nil
 			}
 			continue
@@ -217,6 +229,11 @@ func (service *Service) EnsureBuiltinOfficialCatalog(ctx context.Context) (Built
 	}
 	if state.ActiveVersion != "" && state.ActiveVersion != upgradeFromVersion {
 		result.State = state
+		if state.ActiveVersion == candidate.Version {
+			result.Outcome = BuiltinOutcomeAlreadyCurrent
+		} else {
+			result.Outcome = BuiltinOutcomeOperatorPreserved
+		}
 		return result, nil
 	}
 	state, err = service.Activate(ctx, candidate.Version, state.Revision)
@@ -227,6 +244,11 @@ func (service *Service) EnsureBuiltinOfficialCatalog(ctx context.Context) (Built
 		}
 		result.State = current
 		if current.ActiveVersion != "" {
+			if current.ActiveVersion == candidate.Version {
+				result.Outcome = BuiltinOutcomeAlreadyCurrent
+			} else {
+				result.Outcome = BuiltinOutcomeOperatorPreserved
+			}
 			return result, nil
 		}
 		return BuiltinBootstrapResult{}, fmt.Errorf("activate built-in official catalog: %w", err)
@@ -236,6 +258,14 @@ func (service *Service) EnsureBuiltinOfficialCatalog(ctx context.Context) (Built
 	}
 	result.Activated = true
 	result.State = state
+	switch {
+	case upgradingBuiltin:
+		result.Outcome = BuiltinOutcomeUpgraded
+	case result.Imported:
+		result.Outcome = BuiltinOutcomeInstalled
+	default:
+		result.Outcome = BuiltinOutcomeActivatedExisting
+	}
 	return result, nil
 }
 

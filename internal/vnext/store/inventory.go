@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	vnextprotocol "github.com/LuTianTian001/JieShan/internal/vnext/protocol"
 )
@@ -22,24 +23,45 @@ type inventoryExecer interface {
 func (s *Store) CreateSite(ctx context.Context, input SiteWrite) (int64, error) {
 	input.Name = strings.TrimSpace(input.Name)
 	input.DashboardURL = strings.TrimRight(strings.TrimSpace(input.DashboardURL), "/")
+	if input.MaxInFlight == 0 {
+		input.MaxInFlight = DefaultSiteMaxInFlight
+	}
 	if input.Name == "" {
 		return 0, errors.New("site name is required")
 	}
+	if input.MaxInFlight <= 0 {
+		return 0, errors.New("site maximum in-flight must be positive")
+	}
 	now := NowMS()
-	result, err := s.DB.ExecContext(ctx, `INSERT INTO sites(name,dashboard_url,enabled,revision,created_at,updated_at)
-VALUES (?,?,?,1,?,?)`, input.Name, nullableString(input.DashboardURL), boolInt(input.Enabled), now, now)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT INTO sites(name,dashboard_url,enabled,max_in_flight,revision,created_at,updated_at)
+VALUES (?,?,?,?,1,?,?)`, input.Name, nullableString(input.DashboardURL), boolInt(input.Enabled), input.MaxInFlight, now, now)
 	if err != nil {
 		return 0, normalizeInventoryConflict(err)
 	}
-	return result.LastInsertId()
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := s.EnqueueConfigRevisionTx(ctx, tx, "site_created", time.UnixMilli(now)); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 func (s *Store) GetSite(ctx context.Context, id int64) (Site, error) {
 	var item Site
 	var dashboard sql.NullString
 	var enabled int
-	err := s.DB.QueryRowContext(ctx, `SELECT id,name,dashboard_url,enabled,revision,created_at,updated_at FROM sites WHERE id=?`, id).
-		Scan(&item.ID, &item.Name, &dashboard, &enabled, &item.Revision, &item.CreatedAt, &item.UpdatedAt)
+	err := s.DB.QueryRowContext(ctx, `SELECT id,name,dashboard_url,enabled,max_in_flight,revision,created_at,updated_at FROM sites WHERE id=?`, id).
+		Scan(&item.ID, &item.Name, &dashboard, &enabled, &item.MaxInFlight, &item.Revision, &item.CreatedAt, &item.UpdatedAt)
 	item.DashboardURL = dashboard.String
 	item.Enabled = enabled == 1
 	return item, err

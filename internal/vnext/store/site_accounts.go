@@ -8,7 +8,10 @@ import (
 	"strings"
 )
 
-var ErrSiteAccountUnavailable = errors.New("site account connection is unavailable")
+var (
+	ErrSiteAccountUnavailable = errors.New("site account connection is unavailable")
+	ErrSiteUsageSyncConflict  = errors.New("site usage sync window changed")
+)
 
 type SiteAccountConnection struct {
 	ID                   int64
@@ -130,6 +133,27 @@ type SiteUsageSaveResult struct {
 	Deduplicated int
 }
 
+type SiteUsageSyncState struct {
+	SiteID     int64
+	ThroughAt  *int64
+	HasPending bool
+}
+
+type SiteUsageSyncWindow struct {
+	ID     int64
+	SiteID int64
+	FromAt int64
+	ToAt   int64
+	Cursor string
+}
+
+type SiteUsageSyncProgress struct {
+	WindowID       int64
+	ExpectedCursor string
+	NextCursor     string
+	HasMore        bool
+}
+
 type SiteUsageListFilter struct {
 	Limit            int
 	BeforeOccurredAt *int64
@@ -224,6 +248,103 @@ func (s *Store) ListSiteAccountConnections(ctx context.Context) ([]SiteAccountCo
 	return items, rows.Err()
 }
 
+func (s *Store) ListSiteUsageSyncStates(ctx context.Context) ([]SiteUsageSyncState, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT a.site_id,a.usage_sync_through_at,
+EXISTS(SELECT 1 FROM site_usage_sync_windows w WHERE w.site_account_connection_id=a.id)
+FROM site_account_connections a ORDER BY a.site_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]SiteUsageSyncState, 0)
+	for rows.Next() {
+		var item SiteUsageSyncState
+		var through sql.NullInt64
+		var pending int
+		if err := rows.Scan(&item.SiteID, &through, &pending); err != nil {
+			return nil, err
+		}
+		item.ThroughAt = nullableInt64(through)
+		item.HasPending = pending == 1
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// PlanSiteUsageSyncWindow atomically advances the source watermark and leaves
+// a durable query window behind. A crash after planning therefore cannot lose
+// the interval that was marked as covered.
+func (s *Store) PlanSiteUsageSyncWindow(
+	ctx context.Context,
+	siteID, throughAt, initialLookbackMS, overlapMS int64,
+) (bool, error) {
+	if siteID <= 0 || throughAt <= 0 || initialLookbackMS <= 0 || overlapMS < 0 {
+		return false, errors.New("valid site usage sync planning input is required")
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var connectionID int64
+	var current, legacyRefresh sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT id,usage_sync_through_at,last_usage_refresh_at
+FROM site_account_connections WHERE site_id=?`, siteID).Scan(&connectionID, &current, &legacyRefresh); err != nil {
+		return false, err
+	}
+	if current.Valid && current.Int64 >= throughAt {
+		return false, nil
+	}
+	fromAt := throughAt - initialLookbackMS
+	if current.Valid {
+		fromAt = current.Int64 - overlapMS
+	} else if legacyRefresh.Valid && legacyRefresh.Int64-overlapMS < fromAt {
+		fromAt = legacyRefresh.Int64 - overlapMS
+	}
+	if fromAt <= 0 {
+		fromAt = 1
+	}
+	now := NowMS()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO site_usage_sync_windows(
+site_account_connection_id,site_id,window_from_at,window_to_at,cursor,created_at,updated_at)
+VALUES (?,?,?,?, '',?,?)`, connectionID, siteID, fromAt, throughAt, now, now); err != nil {
+		return false, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE site_account_connections SET usage_sync_through_at=?,updated_at=?
+WHERE id=? AND site_id=?`, throughAt, now, connectionID, siteID)
+	if err != nil {
+		return false, err
+	}
+	if changed, changedErr := result.RowsAffected(); changedErr != nil || changed != 1 {
+		if changedErr != nil {
+			return false, changedErr
+		}
+		return false, sql.ErrNoRows
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) NextSiteUsageSyncWindow(ctx context.Context, siteID int64) (SiteUsageSyncWindow, bool, error) {
+	if siteID <= 0 {
+		return SiteUsageSyncWindow{}, false, sql.ErrNoRows
+	}
+	var item SiteUsageSyncWindow
+	err := s.DB.QueryRowContext(ctx, `SELECT id,site_id,window_from_at,window_to_at,cursor
+FROM site_usage_sync_windows WHERE site_id=? ORDER BY id LIMIT 1`, siteID).Scan(
+		&item.ID, &item.SiteID, &item.FromAt, &item.ToAt, &item.Cursor,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SiteUsageSyncWindow{}, false, nil
+	}
+	if err != nil {
+		return SiteUsageSyncWindow{}, false, err
+	}
+	return item, true, nil
+}
+
 func (s *Store) GetSiteAccountConnection(ctx context.Context, siteID int64) (SiteAccountConnection, error) {
 	if siteID <= 0 {
 		return SiteAccountConnection{}, sql.ErrNoRows
@@ -271,16 +392,53 @@ func (s *Store) UpdateSiteAccountConnection(ctx context.Context, siteID int64, i
 	if input.ExpectedRevision <= 0 || input.AdapterKind == "" || input.Origin == "" {
 		return SiteAccountConnection{}, errors.New("expected revision, adapter, and origin are required")
 	}
-	result, err := s.DB.ExecContext(ctx, `UPDATE site_account_connections SET
-adapter_kind=?,origin=?,enabled=?,revision=revision+1,updated_at=? WHERE site_id=? AND revision=?`,
-		input.AdapterKind, input.Origin, boolInt(input.Enabled), NowMS(), siteID, input.ExpectedRevision)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return SiteAccountConnection{}, err
+	}
+	defer tx.Rollback()
+	var connectionID, revision int64
+	var currentAdapter, currentOrigin string
+	if err := tx.QueryRowContext(ctx, `SELECT id,adapter_kind,origin,revision
+FROM site_account_connections WHERE site_id=?`, siteID).Scan(&connectionID, &currentAdapter, &currentOrigin, &revision); err != nil {
+		return SiteAccountConnection{}, err
+	}
+	if revision != input.ExpectedRevision {
+		return SiteAccountConnection{}, ErrRevisionConflict
+	}
+	sourceChanged := currentAdapter != input.AdapterKind || currentOrigin != input.Origin
+	usageSyncThrough := "usage_sync_through_at"
+	if sourceChanged {
+		usageSyncThrough = "NULL"
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE site_account_connections SET
+adapter_kind=?,origin=?,enabled=?,usage_sync_through_at=`+usageSyncThrough+`,revision=revision+1,updated_at=?
+WHERE id=? AND site_id=? AND revision=?`, input.AdapterKind, input.Origin, boolInt(input.Enabled), NowMS(),
+		connectionID, siteID, input.ExpectedRevision)
 	if err != nil {
 		return SiteAccountConnection{}, normalizeInventoryConflict(err)
 	}
-	if err := requireSiteAccountRevisionChange(ctx, s.DB, result, siteID); err != nil {
+	changed, err := result.RowsAffected()
+	if err != nil {
 		return SiteAccountConnection{}, err
 	}
-	return s.GetSiteAccountConnection(ctx, siteID)
+	if changed != 1 {
+		return SiteAccountConnection{}, ErrRevisionConflict
+	}
+	if sourceChanged {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM site_usage_sync_windows
+WHERE site_account_connection_id=? AND site_id=?`, connectionID, siteID); err != nil {
+			return SiteAccountConnection{}, err
+		}
+	}
+	item, err := scanSiteAccountConnection(tx.QueryRowContext(ctx, siteAccountSelect+` WHERE a.id=? AND a.site_id=?`, connectionID, siteID))
+	if err != nil {
+		return SiteAccountConnection{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SiteAccountConnection{}, err
+	}
+	return item, nil
 }
 
 func (s *Store) ReplaceSealedSiteAccountSecret(
@@ -429,12 +587,42 @@ func (s *Store) SaveSiteUsageRecords(
 	records []SiteUsageRecordWrite,
 	fetchedAt int64,
 ) (SiteUsageSaveResult, error) {
+	return s.saveSiteUsageRecords(ctx, siteID, adapterKind, records, fetchedAt, nil)
+}
+
+func (s *Store) SaveSiteUsageWindowPage(
+	ctx context.Context,
+	siteID int64,
+	adapterKind string,
+	records []SiteUsageRecordWrite,
+	fetchedAt int64,
+	progress SiteUsageSyncProgress,
+) (SiteUsageSaveResult, error) {
+	return s.saveSiteUsageRecords(ctx, siteID, adapterKind, records, fetchedAt, &progress)
+}
+
+func (s *Store) saveSiteUsageRecords(
+	ctx context.Context,
+	siteID int64,
+	adapterKind string,
+	records []SiteUsageRecordWrite,
+	fetchedAt int64,
+	progress *SiteUsageSyncProgress,
+) (SiteUsageSaveResult, error) {
 	adapterKind = strings.ToLower(strings.TrimSpace(adapterKind))
 	if siteID <= 0 || adapterKind == "" || fetchedAt <= 0 {
 		return SiteUsageSaveResult{}, errors.New("site, adapter, and fetch time are required")
 	}
 	if len(records) > 500 {
 		return SiteUsageSaveResult{}, errors.New("site usage page exceeds 500 records")
+	}
+	if progress != nil {
+		if progress.WindowID <= 0 {
+			return SiteUsageSaveResult{}, errors.New("site usage sync window ID is required")
+		}
+		if progress.HasMore && (strings.TrimSpace(progress.NextCursor) == "" || progress.NextCursor == progress.ExpectedCursor) {
+			return SiteUsageSaveResult{}, errors.New("site usage sync cursor must advance")
+		}
 	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -444,6 +632,18 @@ func (s *Store) SaveSiteUsageRecords(
 	var connectionID int64
 	if err := tx.QueryRowContext(ctx, `SELECT id FROM site_account_connections WHERE site_id=? AND adapter_kind=?`, siteID, adapterKind).Scan(&connectionID); err != nil {
 		return SiteUsageSaveResult{}, err
+	}
+	if progress != nil {
+		var windowID int64
+		err := tx.QueryRowContext(ctx, `SELECT id FROM site_usage_sync_windows
+WHERE id=? AND site_account_connection_id=? AND site_id=? AND cursor=?`,
+			progress.WindowID, connectionID, siteID, progress.ExpectedCursor).Scan(&windowID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return SiteUsageSaveResult{}, ErrSiteUsageSyncConflict
+		}
+		if err != nil {
+			return SiteUsageSaveResult{}, err
+		}
 	}
 	now := NowMS()
 	result := SiteUsageSaveResult{}
@@ -474,6 +674,9 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, connectionID, siteID,
 			result.Inserted++
 		} else {
 			result.Deduplicated++
+			if err := refreshSiteUsageRecordTx(ctx, tx, connectionID, record, fetchedAt); err != nil {
+				return SiteUsageSaveResult{}, err
+			}
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE site_account_connections SET
@@ -481,10 +684,62 @@ last_usage_refresh_at=?,last_error_operation=NULL,last_error_code=NULL,last_erro
 		fetchedAt, now, connectionID, siteID); err != nil {
 		return SiteUsageSaveResult{}, err
 	}
+	if progress != nil {
+		var stateResult sql.Result
+		if progress.HasMore {
+			stateResult, err = tx.ExecContext(ctx, `UPDATE site_usage_sync_windows SET cursor=?,updated_at=?
+WHERE id=? AND site_account_connection_id=? AND site_id=? AND cursor=?`, progress.NextCursor, now,
+				progress.WindowID, connectionID, siteID, progress.ExpectedCursor)
+		} else {
+			stateResult, err = tx.ExecContext(ctx, `DELETE FROM site_usage_sync_windows
+WHERE id=? AND site_account_connection_id=? AND site_id=? AND cursor=?`, progress.WindowID,
+				connectionID, siteID, progress.ExpectedCursor)
+		}
+		if err != nil {
+			return SiteUsageSaveResult{}, err
+		}
+		changed, changedErr := stateResult.RowsAffected()
+		if changedErr != nil {
+			return SiteUsageSaveResult{}, changedErr
+		}
+		if changed != 1 {
+			return SiteUsageSaveResult{}, ErrSiteUsageSyncConflict
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return SiteUsageSaveResult{}, err
 	}
 	return result, nil
+}
+
+// refreshSiteUsageRecordTx lets an overlapping reconciliation window enrich a
+// previously observed upstream row. Empty fields never erase known facts, and
+// an older fetch cannot overwrite a newer snapshot of the same remote record.
+func refreshSiteUsageRecordTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	connectionID int64,
+	record SiteUsageRecordWrite,
+	fetchedAt int64,
+) error {
+	_, err := tx.ExecContext(ctx, `UPDATE site_usage_records SET
+remote_id=COALESCE(?,remote_id),request_id=COALESCE(?,request_id),upstream_request_id=COALESCE(?,upstream_request_id),
+occurred_at=?,model=COALESCE(?,model),upstream_model=COALESCE(?,upstream_model),status=COALESCE(?,status),
+http_status=COALESCE(?,http_status),input_tokens=COALESCE(?,input_tokens),output_tokens=COALESCE(?,output_tokens),
+cache_read_tokens=COALESCE(?,cache_read_tokens),cache_write_tokens=COALESCE(?,cache_write_tokens),
+reasoning_tokens=COALESCE(?,reasoning_tokens),total_tokens=COALESCE(?,total_tokens),
+charge_value=COALESCE(?,charge_value),charge_unit=COALESCE(?,charge_unit),duration_ms=COALESCE(?,duration_ms),
+api_key_name=COALESCE(?,api_key_name),source_fetched_at=?
+WHERE site_account_connection_id=? AND dedup_key=? AND source_fetched_at<=?`,
+		nullableString(strings.TrimSpace(record.RemoteID)), nullableString(strings.TrimSpace(record.RequestID)),
+		nullableString(strings.TrimSpace(record.UpstreamRequestID)), record.OccurredAt,
+		nullableString(strings.TrimSpace(record.Model)), nullableString(strings.TrimSpace(record.UpstreamModel)),
+		nullableString(strings.TrimSpace(record.Status)), record.HTTPStatus, record.InputTokens, record.OutputTokens,
+		record.CacheReadTokens, record.CacheWriteTokens, record.ReasoningTokens, record.TotalTokens,
+		nullableStringPointer(record.ChargeValue), nullableStringPointer(record.ChargeUnit), record.DurationMS,
+		nullableString(strings.TrimSpace(record.APIKeyName)), fetchedAt, connectionID,
+		strings.TrimSpace(record.DedupKey), fetchedAt)
+	return err
 }
 
 func (s *Store) ListSiteUsageRecords(ctx context.Context, siteID int64, filter SiteUsageListFilter) (SiteUsagePage, error) {

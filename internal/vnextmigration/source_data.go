@@ -148,13 +148,15 @@ type migrationDownstreamKey struct {
 	quotaMicroUSD    *int64
 	usedMicroUSD     int64
 	reservedMicroUSD int64
-	rpmLimit         int
-	allowedModelsRaw string
-	profileID        *int64
-	expiresAt        *int64
-	lastUsedAt       *int64
-	createdAt        int64
-	updatedAt        int64
+	// deprecatedRPMLimit is read only because supported legacy schemas require
+	// the column. VNext migration deliberately discards its value.
+	deprecatedRPMLimit int
+	allowedModelsRaw   string
+	profileID          *int64
+	expiresAt          *int64
+	lastUsedAt         *int64
+	createdAt          int64
+	updatedAt          int64
 }
 
 type migrationAccount struct {
@@ -599,7 +601,7 @@ rpm_limit,%s,%s,%s,%s,created_at,updated_at FROM downstream_keys ORDER BY id`, a
 		var enabled int
 		var quota, profileID, expiresAt, lastUsedAt sql.NullInt64
 		if err := rows.Scan(&item.id, &item.name, &item.prefix, &item.digest, &enabled, &quota,
-			&item.usedMicroUSD, &item.reservedMicroUSD, &item.rpmLimit, &item.allowedModelsRaw,
+			&item.usedMicroUSD, &item.reservedMicroUSD, &item.deprecatedRPMLimit, &item.allowedModelsRaw,
 			&profileID, &expiresAt, &lastUsedAt, &item.createdAt, &item.updatedAt); err != nil {
 			return fmt.Errorf("scan migration downstream key: %w", err)
 		}
@@ -901,7 +903,7 @@ func loadMigrationRuntimeSettings(ctx context.Context, tx *sql.Tx, schema schema
 	if !schema.hasTable("app_settings") {
 		return nil
 	}
-	firstOutput := "30"
+	firstOutput := "15"
 	if schema.hasColumn("app_settings", "first_output_timeout_seconds") {
 		firstOutput = "first_output_timeout_seconds"
 	}

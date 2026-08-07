@@ -136,7 +136,10 @@ func (service *Service) MonitoringSnapshot() monitoring.RuntimePolicy {
 	}
 	record := service.Current()
 	policy := service.gatewayPolicy(record)
-	return monitoring.RuntimePolicy{HealthPolicy: policy.HealthPolicy, ProbeInterval: record.ProbeInterval}
+	return monitoring.RuntimePolicy{
+		HealthPolicy: policy.HealthPolicy, ProbeInterval: record.ProbeInterval,
+		FirstOutputTimeout: policy.FirstOutputTimeout,
+	}
 }
 
 func (service *Service) publish(record vnextstore.RuntimeSettings) {

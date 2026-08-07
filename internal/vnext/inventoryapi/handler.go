@@ -1,20 +1,35 @@
 package inventoryapi
 
 import (
+	"errors"
 	"net/http"
 )
 
 const apiPrefix = "/api/vnext/inventory"
 
 type Handler struct {
-	repository Repository
+	repository        Repository
+	platformDetector  PlatformDetector
+	tokenJSONPreviews *tokenJSONPreviewStore
 }
 
 func New(repository Repository) (*Handler, error) {
 	if repository == nil {
 		return nil, errNilRepository
 	}
-	return &Handler{repository: repository}, nil
+	return &Handler{repository: repository, tokenJSONPreviews: newTokenJSONPreviewStore()}, nil
+}
+
+func NewWithPlatformDetector(repository Repository, detector PlatformDetector) (*Handler, error) {
+	handler, err := New(repository)
+	if err != nil {
+		return nil, err
+	}
+	if detector == nil {
+		return nil, errors.New("platform detector is required")
+	}
+	handler.platformDetector = detector
+	return handler, nil
 }
 
 func (handler *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -73,8 +88,10 @@ func (handler *Handler) handleSites(w http.ResponseWriter, r *http.Request, segm
 			handler.getSite(w, r, siteID)
 		case http.MethodPatch:
 			handler.updateSite(w, r, siteID)
+		case http.MethodDelete:
+			handler.deleteSite(w, r, siteID)
 		default:
-			methodNotAllowed(w, http.MethodGet, http.MethodPatch)
+			methodNotAllowed(w, http.MethodGet, http.MethodPatch, http.MethodDelete)
 		}
 		return
 	}
@@ -83,6 +100,33 @@ func (handler *Handler) handleSites(w http.ResponseWriter, r *http.Request, segm
 		handler.handleEndpoints(w, r, siteID, segments[2:])
 	case "credentials":
 		handler.handleCredentials(w, r, siteID, segments[2:])
+	case "platform-detection":
+		if len(segments) != 2 {
+			writeError(w, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		handler.getPlatformDetection(w, r, siteID)
+	case "token-json":
+		if len(segments) != 3 {
+			writeError(w, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		switch segments[2] {
+		case "preview":
+			handler.previewTokenJSON(w, r, siteID)
+		case "import":
+			handler.importTokenJSON(w, r, siteID)
+		default:
+			writeError(w, http.StatusNotFound, "not_found", "resource not found")
+		}
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "resource not found")
 	}

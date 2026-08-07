@@ -45,6 +45,7 @@ type Config struct {
 	StreamIdleTimeout  time.Duration
 	RequestTimeout     time.Duration
 	MaxAttempts        int
+	ProbeInterval      time.Duration
 
 	ProbePollInterval         time.Duration
 	ProbeLeaseDuration        time.Duration
@@ -90,13 +91,14 @@ func Load() (Config, error) {
 
 		FailureThreshold:   envInt("JIESHAN_FAILURE_THRESHOLD", 2),
 		FailureWindow:      envDuration("JIESHAN_FAILURE_WINDOW", 5*time.Minute),
-		Cooldown:           envDuration("JIESHAN_COOLDOWN", 5*time.Minute),
+		Cooldown:           envDuration("JIESHAN_COOLDOWN", 15*time.Minute),
 		HalfOpenLease:      envDuration("JIESHAN_HALF_OPEN_LEASE", 30*time.Second),
 		CredentialCooldown: envDuration("JIESHAN_CREDENTIAL_COOLDOWN", 5*time.Minute),
 		FirstOutputTimeout: envDuration("JIESHAN_FIRST_OUTPUT_TIMEOUT", 15*time.Second),
 		StreamIdleTimeout:  envDuration("JIESHAN_STREAM_IDLE_TIMEOUT", 60*time.Second),
 		RequestTimeout:     envDuration("JIESHAN_REQUEST_TIMEOUT", 5*time.Minute),
 		MaxAttempts:        envInt("JIESHAN_MAX_ATTEMPTS", 4),
+		ProbeInterval:      envDuration("JIESHAN_PROBE_INTERVAL", 15*time.Minute),
 
 		ProbePollInterval:         envDuration("JIESHAN_PROBE_POLL_INTERVAL", 5*time.Second),
 		ProbeLeaseDuration:        envDuration("JIESHAN_PROBE_LEASE_DURATION", 5*time.Minute),
@@ -150,6 +152,7 @@ func (cfg Config) validate() error {
 		"JIESHAN_FIRST_OUTPUT_TIMEOUT": cfg.FirstOutputTimeout,
 		"JIESHAN_STREAM_IDLE_TIMEOUT":  cfg.StreamIdleTimeout,
 		"JIESHAN_REQUEST_TIMEOUT":      cfg.RequestTimeout,
+		"JIESHAN_PROBE_INTERVAL":       cfg.ProbeInterval,
 		"JIESHAN_PROBE_POLL_INTERVAL":  cfg.ProbePollInterval,
 		"JIESHAN_PROBE_LEASE_DURATION": cfg.ProbeLeaseDuration,
 		"JIESHAN_PROBE_TIMEOUT":        cfg.ProbeTimeout,

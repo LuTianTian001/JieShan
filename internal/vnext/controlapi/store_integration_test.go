@@ -67,7 +67,7 @@ func TestStoreHandlerKeyLifecycleAndExplicitModelProjection(t *testing.T) {
 	if strings.Contains(response.Body.String(), created.Secret) {
 		t.Fatal("list returned the one-time raw key")
 	}
-	for _, forbidden := range []string{"keyDigest", "encryptedSecret", "allowedModels", `"rpm"`} {
+	for _, forbidden := range []string{"keyDigest", "encryptedSecret", "allowedModels"} {
 		if strings.Contains(response.Body.String(), forbidden) {
 			t.Fatalf("list leaked legacy or secret field %q: %s", forbidden, response.Body.String())
 		}
@@ -128,8 +128,6 @@ func TestStoreHandlerKeyLifecycleAndExplicitModelProjection(t *testing.T) {
 	response = performRequest(handler, http.MethodPatch, apiPrefix+"/999999", `{"enabled":true}`, `"1"`)
 	assertError(t, response, http.StatusNotFound, "not_found")
 	response = performRequest(handler, http.MethodPatch, apiPrefix+"/"+itoa(created.Item.ID), `{"allowedModels":[]}`, `"2"`)
-	assertError(t, response, http.StatusBadRequest, "invalid_request")
-	response = performRequest(handler, http.MethodPatch, apiPrefix+"/"+itoa(created.Item.ID), `{"rpm":12}`, `"2"`)
 	assertError(t, response, http.StatusBadRequest, "invalid_request")
 	takenRaw := "js_taken000_secret"
 	if _, err := store.ImportDigestOnlyDownstreamKey(ctx, vnextstore.DownstreamKeyWrite{
@@ -318,7 +316,7 @@ func TestStoreDownstreamKeyUpdateRequiresCASAndLeavesGlobalModelUntouched(t *tes
 		ExpectedRevision: 1, Name: "Updated", Enabled: false,
 		HourlyQuotaNanoUSD: int64Pointer(1_000), BillingMultiplierBPS: 15_000,
 	})
-	if err != nil || item.Revision != 2 || item.Name != "Updated" || item.Enabled || item.RPMLimit != 0 ||
+	if err != nil || item.Revision != 2 || item.Name != "Updated" || item.Enabled ||
 		item.HourlyQuotaNanoUSD == nil || *item.HourlyQuotaNanoUSD != 1_000 || item.BillingMultiplierBPS != 15_000 {
 		t.Fatalf("UpdateDownstreamKey() = %+v, %v", item, err)
 	}

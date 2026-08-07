@@ -33,12 +33,14 @@ func composeHTTPHandler(
 	siteAccounts http.Handler,
 	pricing http.Handler,
 	requestLogs http.Handler,
+	systemLogs http.Handler,
+	capacitySnapshot http.Handler,
 	monitor http.Handler,
 	settings http.Handler,
 ) (http.Handler, error) {
 	if nilLike(adminMiddleware) || nilLike(auth) || database == nil || nilLike(dataPlane) || nilLike(inventory) ||
 		nilLike(downstreamKeys) || nilLike(routingProfiles) || nilLike(siteAccounts) || nilLike(pricing) ||
-		nilLike(requestLogs) || nilLike(monitor) || nilLike(settings) {
+		nilLike(requestLogs) || nilLike(systemLogs) || nilLike(capacitySnapshot) || nilLike(monitor) || nilLike(settings) {
 		return nil, errors.New("JieShan HTTP dependencies are incomplete")
 	}
 
@@ -55,6 +57,10 @@ func composeHTTPHandler(
 	adminMux.Handle(PricingAdminPrefix+"/", pricing)
 	adminMux.Handle(RequestLogsAdminPrefix, requestLogs)
 	adminMux.Handle(RequestLogsAdminPrefix+"/", requestLogs)
+	adminMux.Handle(SystemLogsAdminPrefix, systemLogs)
+	adminMux.Handle(SystemLogsAdminPrefix+"/", systemLogs)
+	adminMux.Handle(CapacityAdminPrefix, capacitySnapshot)
+	adminMux.Handle(CapacityAdminPrefix+"/", capacitySnapshot)
 	adminMux.Handle(MonitorAdminPrefix, monitor)
 	adminMux.Handle(MonitorAdminPrefix+"/", monitor)
 	adminMux.Handle(SettingsAdminPrefix, settings)

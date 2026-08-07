@@ -3,7 +3,6 @@ package siteadmin
 import (
 	"context"
 	"errors"
-	"strings"
 	"time"
 )
 
@@ -22,17 +21,20 @@ type SyncCandidate struct {
 	Enabled              bool
 	SecretConfigured     bool
 	LastBalanceRefreshAt *time.Time
-	LastUsageRefreshAt   *time.Time
+	UsageSyncThroughAt   *time.Time
+	HasPendingUsageSync  bool
 }
 
 type SyncCandidateRepository interface {
 	ListSyncCandidates(context.Context) ([]SyncCandidate, error)
+	PlanUsageSyncWindow(context.Context, int64, time.Time, time.Duration, time.Duration) error
+	NextUsageSyncWindow(context.Context, int64) (UsageSyncWindow, bool, error)
 }
 
 type AccountSynchronizer interface {
 	Capabilities(context.Context, int64) (Capabilities, error)
 	RefreshBalance(context.Context, int64) (BalanceResult, error)
-	SyncUsagePage(context.Context, int64, UsageQuery) (UsageResult, error)
+	SyncUsageWindowPage(context.Context, int64, UsageSyncWindow, int) (UsageResult, error)
 }
 
 type SchedulerOptions struct {
@@ -110,33 +112,32 @@ func (scheduler *Scheduler) RunOnce(ctx context.Context) error {
 			_, _ = scheduler.service.RefreshBalance(operationCtx, candidate.SiteID)
 			cancel()
 		}
-		if capabilities.Usage && refreshDue(candidate.LastUsageRefreshAt, now, scheduler.options.UsageInterval) {
-			scheduler.syncUsage(ctx, candidate, now)
+		if capabilities.Usage {
+			planDue := refreshDue(candidate.UsageSyncThroughAt, now, scheduler.options.UsageInterval)
+			if planDue {
+				_ = scheduler.repository.PlanUsageSyncWindow(ctx, candidate.SiteID, now,
+					scheduler.options.InitialUsageLookback, time.Minute)
+			}
+			if planDue || candidate.HasPendingUsageSync {
+				scheduler.syncUsage(ctx, candidate.SiteID)
+			}
 		}
 	}
 	return nil
 }
 
-func (scheduler *Scheduler) syncUsage(ctx context.Context, candidate SyncCandidate, now time.Time) {
-	from := now.Add(-scheduler.options.InitialUsageLookback)
-	if candidate.LastUsageRefreshAt != nil && !candidate.LastUsageRefreshAt.IsZero() {
-		from = candidate.LastUsageRefreshAt.UTC().Add(-time.Minute)
-	}
-	cursor := ""
+func (scheduler *Scheduler) syncUsage(ctx context.Context, siteID int64) {
 	for pageIndex := 0; pageIndex < scheduler.options.UsageMaxPages; pageIndex++ {
+		window, ok, err := scheduler.repository.NextUsageSyncWindow(ctx, siteID)
+		if err != nil || !ok {
+			return
+		}
 		operationCtx, cancel := context.WithTimeout(ctx, scheduler.options.OperationTimeout)
-		result, err := scheduler.service.SyncUsagePage(operationCtx, candidate.SiteID, UsageQuery{
-			Cursor: cursor, From: from, To: now, Limit: scheduler.options.UsagePageLimit,
-		})
+		_, err = scheduler.service.SyncUsageWindowPage(operationCtx, siteID, window, scheduler.options.UsagePageLimit)
 		cancel()
-		if err != nil || !result.Page.HasMore {
+		if err != nil {
 			return
 		}
-		next := strings.TrimSpace(result.Page.NextCursor)
-		if next == "" || next == cursor {
-			return
-		}
-		cursor = next
 	}
 }
 

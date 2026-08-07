@@ -1088,6 +1088,18 @@ func validateRequestSettlement(input RequestSettlement) error {
 			return err
 		}
 	}
+	hasUsage := input.InputTokens != nil || input.OutputTokens != nil || input.CacheReadTokens != nil ||
+		input.CacheWriteTokens != nil || input.CacheWrite5MTokens != nil || input.CacheWrite1HTokens != nil ||
+		input.ReasoningTokens != nil
+	if input.MeteringStatus != "metered" && (hasUsage || input.OfficialCostNanoUSD != 0) {
+		return errors.New("unmetered request cannot record token usage or official cost")
+	}
+	if input.MeteringStatus == "unavailable" && input.MeteringErrorCode == "" {
+		return errors.New("unavailable metering requires an error code")
+	}
+	if input.MeteringStatus == "metered" && input.MeteringErrorCode != "" {
+		return errors.New("metered request cannot retain a metering error code")
+	}
 	for _, code := range []string{input.MeteringErrorCode, input.UnattemptedReason, input.ErrorCode} {
 		if err := validateAccountingCode(code); err != nil {
 			return err

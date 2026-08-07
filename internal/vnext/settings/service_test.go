@@ -25,13 +25,13 @@ func TestServiceAtomicallyPublishesGatewayAndMonitoringPolicy(t *testing.T) {
 	}
 
 	initial := service.Snapshot()
-	if initial.HealthPolicy.FailureThreshold != 2 || initial.HealthPolicy.Cooldown != 5*time.Minute ||
+	if initial.HealthPolicy.FailureThreshold != 2 || initial.HealthPolicy.Cooldown != 15*time.Minute ||
 		initial.FirstOutputTimeout != 15*time.Second || initial.StreamIdleTimeout != time.Minute ||
 		initial.RequestTimeout != 5*time.Minute || initial.MaxAttempts != 4 {
 		t.Fatalf("initial gateway snapshot = %+v", initial)
 	}
-	if monitor := service.MonitoringSnapshot(); monitor.ProbeInterval != 5*time.Minute ||
-		monitor.HealthPolicy != initial.HealthPolicy {
+	if monitor := service.MonitoringSnapshot(); monitor.ProbeInterval != 15*time.Minute ||
+		monitor.HealthPolicy != initial.HealthPolicy || monitor.FirstOutputTimeout != 15*time.Second {
 		t.Fatalf("initial monitor snapshot = %+v", monitor)
 	}
 
@@ -74,7 +74,7 @@ func TestServiceAtomicallyPublishesGatewayAndMonitoringPolicy(t *testing.T) {
 		t.Fatalf("updated gateway snapshot = %+v", policy)
 	}
 	if monitor := service.MonitoringSnapshot(); monitor.ProbeInterval != 3*time.Minute ||
-		monitor.HealthPolicy.FailureThreshold != 4 {
+		monitor.HealthPolicy.FailureThreshold != 4 || monitor.FirstOutputTimeout != 10*time.Second {
 		t.Fatalf("updated monitor snapshot = %+v", monitor)
 	}
 	if _, err := service.UpdateCAS(ctx, 1, write); !errors.Is(err, vnextstore.ErrRevisionConflict) {

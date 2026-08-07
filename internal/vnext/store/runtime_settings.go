@@ -10,8 +10,8 @@ import (
 const (
 	DefaultFailureThreshold   = 2
 	DefaultFailureWindow      = 5 * time.Minute
-	DefaultCooldown           = 5 * time.Minute
-	DefaultProbeInterval      = 5 * time.Minute
+	DefaultCooldown           = 15 * time.Minute
+	DefaultProbeInterval      = 15 * time.Minute
 	DefaultFirstOutputTimeout = 15 * time.Second
 	DefaultStreamIdleTimeout  = 60 * time.Second
 	DefaultRequestTimeout     = 5 * time.Minute
@@ -193,6 +193,9 @@ revision=revision+1,updated_at=?
 WHERE interval_ms<>?`, input.ProbeInterval.Milliseconds(), nowMS, input.ProbeInterval.Milliseconds(),
 		nowMS, input.ProbeInterval.Milliseconds())
 	if err != nil {
+		return RuntimeSettings{}, err
+	}
+	if _, err := s.EnqueueConfigRevisionTx(ctx, tx, "runtime_settings_updated", now); err != nil {
 		return RuntimeSettings{}, err
 	}
 

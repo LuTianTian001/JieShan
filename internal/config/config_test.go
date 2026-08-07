@@ -24,12 +24,15 @@ func TestLoadUsesSafeV3Defaults(t *testing.T) {
 	if cfg.AllowPrivateUpstreams || cfg.TrustProxy || cfg.SecureCookies != nil {
 		t.Fatal("security-sensitive booleans should not be enabled implicitly")
 	}
-	if cfg.FailureThreshold != 2 || cfg.FailureWindow != 5*time.Minute || cfg.Cooldown != 5*time.Minute {
+	if cfg.FailureThreshold != 2 || cfg.FailureWindow != 5*time.Minute || cfg.Cooldown != 15*time.Minute {
 		t.Fatalf("routing defaults = threshold %d, window %s, cooldown %s", cfg.FailureThreshold, cfg.FailureWindow, cfg.Cooldown)
 	}
 	if cfg.FirstOutputTimeout != 15*time.Second || cfg.StreamIdleTimeout != time.Minute ||
 		cfg.RequestTimeout != 5*time.Minute || cfg.MaxAttempts != 4 {
 		t.Fatalf("request boundaries = %s/%s/%s attempts=%d", cfg.FirstOutputTimeout, cfg.StreamIdleTimeout, cfg.RequestTimeout, cfg.MaxAttempts)
+	}
+	if cfg.ProbeInterval != 15*time.Minute {
+		t.Fatalf("scheduled probe interval = %s, want 15m", cfg.ProbeInterval)
 	}
 	if cfg.ProbeMaxConcurrentModels != 1 || cfg.ProbeMaxConcurrentTargets != 2 {
 		t.Fatalf("probe concurrency = %d/%d, want 1/2", cfg.ProbeMaxConcurrentModels, cfg.ProbeMaxConcurrentTargets)
@@ -104,6 +107,7 @@ func clearConfigurationEnvironment(t *testing.T) {
 		"JIESHAN_FAILURE_THRESHOLD", "JIESHAN_FAILURE_WINDOW",
 		"JIESHAN_COOLDOWN", "JIESHAN_HALF_OPEN_LEASE", "JIESHAN_CREDENTIAL_COOLDOWN",
 		"JIESHAN_FIRST_OUTPUT_TIMEOUT", "JIESHAN_STREAM_IDLE_TIMEOUT", "JIESHAN_REQUEST_TIMEOUT", "JIESHAN_MAX_ATTEMPTS",
+		"JIESHAN_PROBE_INTERVAL",
 		"JIESHAN_PROBE_POLL_INTERVAL", "JIESHAN_PROBE_LEASE_DURATION", "JIESHAN_PROBE_TIMEOUT",
 		"JIESHAN_PROBE_MAX_CONCURRENT_MODELS", "JIESHAN_PROBE_MAX_CONCURRENT_TARGETS",
 	}

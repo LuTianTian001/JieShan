@@ -36,7 +36,7 @@ func TestCreateCommitsRecordBoundSecretAndListsOnlyMetadata(t *testing.T) {
 		t.Fatalf("issued metadata = %+v", issued.Key)
 	}
 	if issued.Key.HourlyQuotaNanoUSD == nil || *issued.Key.HourlyQuotaNanoUSD != hourlyQuota ||
-		issued.Key.BillingMultiplierBPS != multiplier || issued.Key.RPMLimit != 0 {
+		issued.Key.BillingMultiplierBPS != multiplier {
 		t.Fatalf("issued billing policy = %+v", issued.Key)
 	}
 

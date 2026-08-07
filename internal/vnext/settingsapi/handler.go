@@ -27,14 +27,19 @@ type Service interface {
 }
 
 type Handler struct {
-	service Service
+	service  Service
+	overview RuntimeOverviewProvider
 }
 
 func New(service Service) (*Handler, error) {
+	return NewWithOverview(service, nil)
+}
+
+func NewWithOverview(service Service, overview RuntimeOverviewProvider) (*Handler, error) {
 	if nilLike(service) {
 		return nil, errors.New("runtime settings service is required")
 	}
-	return &Handler{service: service}, nil
+	return &Handler{service: service, overview: overview}, nil
 }
 
 func NewServiceHandler(service *settings.Service) (*Handler, error) {
@@ -44,9 +49,23 @@ func NewServiceHandler(service *settings.Service) (*Handler, error) {
 	return New(service)
 }
 
+func NewServiceHandlerWithOverview(service *settings.Service, overview RuntimeOverviewProvider) (*Handler, error) {
+	if service == nil {
+		return nil, errors.New("runtime settings service is required")
+	}
+	if nilLike(overview) {
+		return nil, errors.New("runtime overview provider is required")
+	}
+	return NewWithOverview(service, overview)
+}
+
 func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if handler == nil || handler.service == nil {
 		writeError(writer, http.StatusServiceUnavailable, "settings_unavailable", "Runtime settings are unavailable.")
+		return
+	}
+	if request.URL.Path == APIPrefix+"/runtime-overview" {
+		handler.runtimeOverview(writer, request)
 		return
 	}
 	if request.URL.Path != APIPrefix && request.URL.Path != APIPrefix+"/" {
@@ -62,6 +81,24 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		writer.Header().Set("Allow", "GET, PATCH")
 		writeError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "Method is not allowed for this settings resource.")
 	}
+}
+
+func (handler *Handler) runtimeOverview(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		writer.Header().Set("Allow", "GET")
+		writeError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "Method is not allowed for the runtime overview resource.")
+		return
+	}
+	if nilLike(handler.overview) {
+		writeError(writer, http.StatusServiceUnavailable, "runtime_overview_unavailable", "Runtime overview is unavailable.")
+		return
+	}
+	overview, err := handler.overview.RuntimeOverview(request.Context())
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, "runtime_overview_failed", "Runtime overview could not be loaded.")
+		return
+	}
+	writeJSON(writer, http.StatusOK, overview)
 }
 
 func (handler *Handler) get(writer http.ResponseWriter) {

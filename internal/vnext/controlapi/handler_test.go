@@ -25,7 +25,7 @@ func TestDownstreamKeyCollectionCreateAndUpdateContract(t *testing.T) {
 		RoutingProfileID: 70, RoutingProfileName: "Default", UsesDefaultRoutingProfile: true,
 		QuotaNanoUSD: &quota, UsedNanoUSD: 1_500, ReservedNanoUSD: 200,
 		HourlyQuotaNanoUSD: &hourlyQuota, UsedThisHourNanoUSD: 300, ReservedThisHourNanoUSD: 40,
-		HourlyWindowStartedAt: 1_799_998_400_000, BillingMultiplierBPS: 12_500, RPMLimit: 30,
+		HourlyWindowStartedAt: 1_799_998_400_000, BillingMultiplierBPS: 12_500,
 		ExpiresAt: &expires, Revision: 4, CreatedAt: 100, UpdatedAt: 200,
 	}
 	repository.routes[70] = []vnextstore.RoutingProfileRoute{
@@ -38,7 +38,7 @@ func TestDownstreamKeyCollectionCreateAndUpdateContract(t *testing.T) {
 			ID: 8, Name: "Team", KeyPrefix: "js_created", Enabled: false, Revealable: true,
 			RoutingProfileID: 70, RoutingProfileName: "Default", UsesDefaultRoutingProfile: true,
 			QuotaNanoUSD: int64Pointer(5_000), HourlyQuotaNanoUSD: int64Pointer(1_000),
-			BillingMultiplierBPS: 15_000, RPMLimit: 60, ExpiresAt: int64Pointer(1_900_000_000_000),
+			BillingMultiplierBPS: 15_000, ExpiresAt: int64Pointer(1_900_000_000_000),
 			Revision: 1, CreatedAt: 300, UpdatedAt: 300,
 		},
 		RawSecret: "js_one_time_secret",
@@ -62,8 +62,7 @@ func TestDownstreamKeyCollectionCreateAndUpdateContract(t *testing.T) {
 	if want := []string{"claude-sonnet-4-5"}; !reflect.DeepEqual(list.Items[0].Models, want) {
 		t.Fatalf("key models = %v, want %v", list.Items[0].Models, want)
 	}
-	if strings.Contains(response.Body.String(), `"rpm"`) ||
-		!strings.Contains(response.Body.String(), `"billingMultiplierBPS":12500`) ||
+	if !strings.Contains(response.Body.String(), `"billingMultiplierBPS":12500`) ||
 		!strings.Contains(response.Body.String(), `"reservedThisHourNanoUSD":40`) {
 		t.Fatalf("GET keys billing contract = %s", response.Body.String())
 	}
@@ -104,12 +103,6 @@ func TestDownstreamKeyCollectionCreateAndUpdateContract(t *testing.T) {
 	if issuer.calls != 1 {
 		t.Fatalf("issuer called for an unknown field; calls = %d", issuer.calls)
 	}
-	response = performRequest(handler, http.MethodPost, apiPrefix, `{"name":"No RPM","rpm":60}`, "")
-	assertError(t, response, http.StatusBadRequest, "invalid_request")
-	if issuer.calls != 1 {
-		t.Fatalf("issuer called for retired rpm field; calls = %d", issuer.calls)
-	}
-
 	response = performRequest(handler, http.MethodGet, apiPrefix+"/7", "", "")
 	if response.Code != http.StatusOK || response.Header().Get("ETag") != `"4"` {
 		t.Fatalf("GET key status/ETag = %d/%q, body = %s", response.Code, response.Header().Get("ETag"), response.Body.String())
@@ -139,7 +132,7 @@ func TestDownstreamKeyCollectionCreateAndUpdateContract(t *testing.T) {
 		t.Fatalf("update ETag = %q", response.Header().Get("ETag"))
 	}
 	body := response.Body.String()
-	for _, forbidden := range []string{"keyDigest", "encryptedSecret", "rawSecret", "allowedModels", `"rpm"`} {
+	for _, forbidden := range []string{"keyDigest", "encryptedSecret", "rawSecret", "allowedModels"} {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("update response leaks forbidden field %q: %s", forbidden, body)
 		}
@@ -378,7 +371,6 @@ func (repository *fakeRepository) UpdateDownstreamKey(_ context.Context, id int6
 	item.QuotaNanoUSD = cloneInt64(input.QuotaNanoUSD)
 	item.HourlyQuotaNanoUSD = cloneInt64(input.HourlyQuotaNanoUSD)
 	item.BillingMultiplierBPS = input.BillingMultiplierBPS
-	item.RPMLimit = 0
 	item.ExpiresAt = cloneInt64(input.Expires)
 	item.Enabled = input.Enabled
 	item.Revision++

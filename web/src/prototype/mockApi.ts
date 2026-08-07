@@ -187,12 +187,29 @@ function clonedInheritedRoute(source: ModelRoute, profileId: number, profileName
   };
 }
 
-function monitorTargetFor(state: PrototypeState, providerTargetId: number) {
+function monitorTargetFor(state: PrototypeState, providerTargetId: number, publishedModelId?: number) {
   for (const model of state.monitorSnapshot.items) {
+    if (publishedModelId !== undefined && model.publishedModelId !== publishedModelId) continue;
     const target = model.targets.find((item) => item.providerModelTargetId === providerTargetId);
     if (target) return { model, target };
   }
   return null;
+}
+
+function emptyMonitorEvidence(source: 'live_traffic' | 'probe') {
+  return {
+    source,
+    windowMs: source === 'live_traffic' ? 60 * MINUTE : 24 * 60 * MINUTE,
+    samples: 0,
+    successes: 0,
+    failures: 0,
+    skipped: 0,
+    successBasisPoints: 0,
+    p50FirstOutputMs: null,
+    p95FirstOutputMs: null,
+    lastObservedAt: null,
+    lastFailureKind: '',
+  };
 }
 
 function recomputeMonitorModel(model: PrototypeState['monitorSnapshot']['items'][number]): void {
@@ -227,6 +244,7 @@ function syncMonitorRoute(state: PrototypeState, route: ModelRoute): void {
       wireProtocol: routeTarget.wireProtocol, apiSurface: routeTarget.apiSurface, enabled: provider?.enabled ?? true,
       usableCredentialCount: provider?.usableCredentialCount || 0, status: 'unprobed' as const,
       successes: 0, failures: 0, skipped: 0, successBasisPoints: 0, latest: null, statusBar: [], health,
+      evidence: { liveTraffic: emptyMonitorEvidence('live_traffic'), probe: emptyMonitorEvidence('probe') },
     };
     Object.assign(target, {
       publishedModelTargetId: routeTarget.id, publishedModelTargetRevision: routeTarget.revision,
@@ -241,7 +259,7 @@ function syncMonitorRoute(state: PrototypeState, route: ModelRoute): void {
     const history = state.monitorHistories[historyKey];
     const identity = { publishedModelTargetId: routeTarget.id, providerModelTargetId: routeTarget.providerModelTargetId, position: routeTarget.position, siteId: routeTarget.siteId, siteName: routeTarget.siteName, endpointId: routeTarget.endpointId, endpointName: routeTarget.endpointName, sourceModel: routeTarget.sourceModel, wireProtocol: routeTarget.wireProtocol, apiSurface: routeTarget.apiSurface };
     if (history) history.target = identity;
-    else state.monitorHistories[historyKey] = { publishedModelId: route.publishedModelId, publicModel: route.publicName, target: identity, status: target.status, successes: 0, failures: 0, skipped: 0, total: 0, attempted: 0, successBasisPoints: 0, health: target.health, order: 'oldest_first', items: [] };
+    else state.monitorHistories[historyKey] = { publishedModelId: route.publishedModelId, publicModel: route.publicName, target: identity, status: target.status, successes: 0, failures: 0, skipped: 0, total: 0, attempted: 0, successBasisPoints: 0, health: target.health, order: 'oldest_first', items: [], circuitTransitions: [] };
     return target;
   });
   recomputeMonitorModel(model);
@@ -263,8 +281,9 @@ function appendProbe(
   providerTargetId: number,
   outcome: MonitorProbePoint['outcome'],
   details: { httpStatus?: number | null; failureKind?: string; errorCode?: string; permitReason?: string } = {},
+  publishedModelId?: number,
 ): void {
-  const found = monitorTargetFor(state, providerTargetId);
+  const found = monitorTargetFor(state, providerTargetId, publishedModelId);
   if (!found) return;
   const now = Date.now();
   const failed = outcome === 'failure';
@@ -295,6 +314,18 @@ function appendProbe(
   else found.target.skipped += 1;
   const attempted = found.target.successes + found.target.failures;
   found.target.successBasisPoints = attempted ? Math.round((found.target.successes / attempted) * 10_000) : 0;
+  found.target.evidence.probe = {
+    ...found.target.evidence.probe,
+    samples: found.target.successes + found.target.failures + found.target.skipped,
+    successes: found.target.successes,
+    failures: found.target.failures,
+    skipped: found.target.skipped,
+    successBasisPoints: found.target.successBasisPoints,
+    p50FirstOutputMs: point.firstOutputMs,
+    p95FirstOutputMs: Math.max(found.target.evidence.probe.p95FirstOutputMs || 0, point.firstOutputMs || 0) || null,
+    lastObservedAt: point.finishedAt,
+    lastFailureKind: point.failureKind,
+  };
   if (outcome === 'success') found.target.status = 'healthy';
   else if (outcome === 'failure') found.target.status = 'degraded';
   else found.target.status = 'cooling';
@@ -314,7 +345,14 @@ function appendProbe(
   recomputeMonitorModel(found.model);
 }
 
-function updateRuntimeHealth(state: PrototypeState, providerTargetId: number, succeeded: boolean, failureKind = '', credentialId?: number): void {
+function updateRuntimeHealth(
+  state: PrototypeState,
+  providerTargetId: number,
+  succeeded: boolean,
+  failureKind = '',
+  credentialId?: number,
+  trigger: 'live_traffic' | 'probe' = 'live_traffic',
+): void {
   const now = Date.now();
   const modelTarget = state.modelTargets.find((item) => item.id === providerTargetId);
   const health = state.routingHealth[providerTargetId] ||= {
@@ -324,6 +362,7 @@ function updateRuntimeHealth(state: PrototypeState, providerTargetId: number, su
     stateVersion: 1, updatedAt: now,
   };
   const credential = state.credentials.find((item) => item.id === credentialId);
+  const previousPhase = health.phase;
   if (succeeded) {
     health.phase = 'closed';
     health.consecutiveFailures = 0;
@@ -358,6 +397,18 @@ function updateRuntimeHealth(state: PrototypeState, providerTargetId: number, su
     if (history) {
       history.health = clone(health);
       history.status = target.status;
+      if (previousPhase !== health.phase) {
+        history.circuitTransitions.push({
+          id: `circuit-${providerTargetId}-${health.stateVersion}`,
+          fromPhase: previousPhase,
+          toPhase: health.phase,
+          trigger,
+          reason: succeeded ? 'success_recovered' : health.phase === 'cooling' ? 'failure_threshold_reached' : 'first_failure',
+          failureKind,
+          requestId: '',
+          occurredAt: now,
+        });
+      }
     }
     recomputeMonitorModel(model);
   }
@@ -496,10 +547,39 @@ function adminGET(path: string, url: URL, state: PrototypeState): Response | nul
   }
 
   if (path === '/api/vnext/inventory/sites') return json({ items: clone(state.sites) });
+  if (path === '/api/vnext/capacity') {
+    const updatedAt = Date.now();
+    const sites = state.sites.filter((site) => site.enabled).map((site) => {
+      const runtime = state.siteRuntimeStatus[site.id] || { siteId: site.id, inflightRequests: 0, maxConcurrency: site.maxConcurrency, queuedRequests: 0, updatedAt, throttledUntil: null };
+      runtime.maxConcurrency = site.maxConcurrency;
+      runtime.updatedAt = updatedAt;
+      state.siteRuntimeStatus[site.id] = runtime;
+      return clone(runtime);
+    });
+    return json({ updatedAt, queuedRequests: state.systemHealth.runtime.queuedRequests, sites });
+  }
   const siteMatch = /^\/api\/vnext\/inventory\/sites\/(\d+)$/.exec(path);
   if (siteMatch) {
     const item = state.sites.find((site) => site.id === Number(siteMatch[1]));
     return item ? json({ item: clone(item) }, 200, item.revision) : error(404, 'not_found', 'Site was not found.');
+  }
+
+  const platformDetectionMatch = /^\/api\/vnext\/inventory\/sites\/(\d+)\/platform-detection$/.exec(path);
+  if (platformDetectionMatch) {
+    const item = state.sitePlatformDetections[Number(platformDetectionMatch[1])];
+    return item ? json(clone(item)) : error(404, 'not_found', 'Platform detection evidence was not found.');
+  }
+
+  const runtimeStatusMatch = /^\/api\/vnext\/inventory\/sites\/(\d+)\/runtime-status$/.exec(path);
+  if (runtimeStatusMatch) {
+    const siteId = Number(runtimeStatusMatch[1]);
+    const site = state.sites.find((item) => item.id === siteId);
+    if (!site) return error(404, 'not_found', 'Site was not found.');
+    const runtime = state.siteRuntimeStatus[siteId] || { siteId, inflightRequests: 0, maxConcurrency: site.maxConcurrency, queuedRequests: 0, updatedAt: Date.now(), throttledUntil: null };
+    runtime.maxConcurrency = site.maxConcurrency;
+    runtime.updatedAt = Date.now();
+    state.siteRuntimeStatus[siteId] = runtime;
+    return json(clone(runtime));
   }
 
   const endpointsMatch = /^\/api\/vnext\/inventory\/sites\/(\d+)\/endpoints$/.exec(path);
@@ -656,6 +736,31 @@ function adminGET(path: string, url: URL, state: PrototypeState): Response | nul
     const hasMore = offset + limit < matched.length;
     return json({ items: page.map(logListItem), hasMore, nextCursor: hasMore ? String(offset + limit) : '' });
   }
+  if (path === '/api/vnext/system-logs') {
+    const now = Date.now();
+    const source = [
+      { id: 'sys-prototype-6', timestamp: now - 18_000, level: 'info', module: 'gateway.capacity', code: 'site_permit_acquired', message: '已为请求分配上游站点容量。', requestId: 'req-prototype-2048', fields: { siteId: 1, inFlight: 2, maxInFlight: 4, queued: 0 } },
+      { id: 'sys-prototype-5', timestamp: now - 74_000, level: 'warn', module: 'gateway.upstream', code: 'upstream_throttled', message: '上游返回并发限流，已按 Retry-After 暂停调度。', requestId: 'req-prototype-2047', fields: { siteId: 2, retryAfterMs: 15_000, httpStatus: 429 } },
+      { id: 'sys-prototype-4', timestamp: now - 146_000, level: 'info', module: 'runtime.config', code: 'snapshot_published', message: '新的运行时配置已通过校验并原子发布。', taskId: 'runtime-config-poller', fields: { revision: state.settings.revision, source: 'config_revisions' } },
+      { id: 'sys-prototype-3', timestamp: now - 274_000, level: 'debug', module: 'monitor.probe', code: 'probe_deferred_busy', message: '站点正在承载真实请求，本轮主动探针已延后。', taskId: 'monitor-probe-scheduler', fields: { siteId: 1, model: 'claude-sonnet-4-5' } },
+      { id: 'sys-prototype-2', timestamp: now - 620_000, level: 'error', module: 'site.account', code: 'balance_refresh_failed', message: '余额刷新失败，已保留上一次成功数据。', taskId: 'site-account-refresh', fields: { siteId: 3, adapter: 'sub2api', error: 'upstream_timeout' } },
+      { id: 'sys-prototype-1', timestamp: now - 940_000, level: 'info', module: 'runtime.supervisor', code: 'worker_restarted', message: '后台任务在退避后恢复运行。', taskId: 'usage-sync', fields: { attempt: 2, backoffMs: 2_000 } },
+    ];
+    const level = url.searchParams.get('level')?.toLowerCase() || '';
+    const module = url.searchParams.get('module')?.toLowerCase() || '';
+    const search = url.searchParams.get('search')?.toLowerCase() || '';
+    const requestId = url.searchParams.get('requestId') || '';
+    const taskId = url.searchParams.get('taskId') || '';
+    const items = source.filter((item) => {
+      if (level && item.level !== level) return false;
+      if (module && !item.module.toLowerCase().includes(module)) return false;
+      if (requestId && item.requestId !== requestId) return false;
+      if (taskId && item.taskId !== taskId) return false;
+      if (search && !JSON.stringify(item).toLowerCase().includes(search)) return false;
+      return true;
+    });
+    return json({ items, hasMore: false, nextBefore: 0 });
+  }
   const logMatch = /^\/api\/vnext\/request-logs\/([^/]+)$/.exec(path);
   if (logMatch) {
     const item = state.requestLogs.find((log) => log.id === decodeURIComponent(logMatch[1]));
@@ -665,6 +770,12 @@ function adminGET(path: string, url: URL, state: PrototypeState): Response | nul
   }
 
   if (path === '/api/vnext/settings') return json(clone(state.settings), 200, state.settings.revision);
+  if (path === '/api/vnext/settings/runtime-overview') {
+    state.systemHealth.runtime.snapshotAt = Date.now();
+    state.systemHealth.runtime.configRevision = state.settings.revision;
+    state.systemHealth.runtime.activePriceCatalogVersion = state.catalogState.active_version || '';
+    return json(clone(state.systemHealth));
+  }
   return null;
 }
 
@@ -673,15 +784,17 @@ async function handleAdminMutation(request: Request, path: string, state: Protot
   const now = Date.now();
 
   if (method === 'POST' && path === '/api/vnext/inventory/sites') {
-    const body = await requestBody<{ name?: string; dashboardUrl?: string; enabled?: boolean }>(request);
+    const body = await requestBody<{ name?: string; dashboardUrl?: string; enabled?: boolean; maxConcurrency?: number }>(request);
     if (body instanceof Response) return body;
     const name = body.name?.trim();
     if (!name) return error(400, 'invalid_request', 'Site name is required.');
     const item = {
       id: nextID(state, 'site'), name, dashboardUrl: body.dashboardUrl?.trim() || '', enabled: body.enabled ?? true,
+      maxConcurrency: Math.max(1, body.maxConcurrency || 4),
       revision: 1, createdAt: now, updatedAt: now,
     };
     state.sites.push(item);
+    state.siteRuntimeStatus[item.id] = { siteId: item.id, inflightRequests: 0, maxConcurrency: item.maxConcurrency, queuedRequests: 0, updatedAt: now, throttledUntil: null };
     return json({ item: clone(item) }, 201, item.revision);
   }
 
@@ -691,7 +804,7 @@ async function handleAdminMutation(request: Request, path: string, state: Protot
     if (!item) return error(404, 'not_found', 'Site was not found.');
     const conflict = revisionError(request, item.revision);
     if (conflict) return conflict;
-    const body = await requestBody<{ name?: string; dashboardUrl?: string | null; enabled?: boolean }>(request);
+    const body = await requestBody<{ name?: string; dashboardUrl?: string | null; enabled?: boolean; maxConcurrency?: number }>(request);
     if (body instanceof Response) return body;
     if (body.name !== undefined) {
       const name = body.name.trim();
@@ -700,6 +813,12 @@ async function handleAdminMutation(request: Request, path: string, state: Protot
     }
     if (body.dashboardUrl !== undefined) item.dashboardUrl = body.dashboardUrl?.trim() || '';
     if (body.enabled !== undefined) item.enabled = body.enabled;
+    if (body.maxConcurrency !== undefined) {
+      if (!Number.isInteger(body.maxConcurrency) || body.maxConcurrency < 1 || body.maxConcurrency > 10_000) return error(400, 'invalid_request', 'maxConcurrency must be an integer between 1 and 10000.');
+      item.maxConcurrency = body.maxConcurrency;
+      const runtime = state.siteRuntimeStatus[item.id];
+      if (runtime) runtime.maxConcurrency = body.maxConcurrency;
+    }
     item.revision += 1;
     item.updatedAt = now;
     for (const target of state.modelTargets.filter((candidate) => candidate.siteId === item.id)) {
@@ -709,6 +828,159 @@ async function handleAdminMutation(request: Request, path: string, state: Protot
     }
     refreshRouteTargetMetadata(state);
     return json({ item: clone(item) }, 200, item.revision);
+  }
+
+  if (method === 'DELETE' && siteMatch) {
+    const siteId = Number(siteMatch[1]);
+    const item = state.sites.find((site) => site.id === siteId);
+    if (!item) return error(404, 'not_found', 'Site was not found.');
+    const conflict = revisionError(request, item.revision);
+    if (conflict) return conflict;
+
+    const endpointIds = new Set(state.endpoints.filter((endpoint) => endpoint.siteId === siteId).map((endpoint) => endpoint.id));
+    const credentialIds = new Set(state.credentials.filter((credential) => credential.siteId === siteId).map((credential) => credential.id));
+    const targetIds = new Set(state.modelTargets.filter((target) => target.siteId === siteId).map((target) => target.id));
+    const affectedProfiles = new Set<number>();
+
+    for (const route of state.routes) {
+      const remaining = route.targets.filter((target) => !targetIds.has(target.providerModelTargetId));
+      if (remaining.length === route.targets.length) continue;
+      route.targets = remaining.map((target, position) => ({ ...target, position, revision: target.revision + 1, updatedAt: now }));
+      route.enabled = route.targets.length > 0 && route.enabled;
+      route.publishedModelRevision += 1;
+      route.revision += 1;
+      route.updatedAt = now;
+      if (route.routingProfileId === 1 || route.targetsOverridden) affectedProfiles.add(route.routingProfileId);
+    }
+    for (const profile of state.routingProfiles) {
+      if (affectedProfiles.has(profile.id)) {
+        profile.revision += 1;
+        profile.updatedAt = now;
+      }
+    }
+
+    state.sites = state.sites.filter((site) => site.id !== siteId);
+    state.endpoints = state.endpoints.filter((endpoint) => endpoint.siteId !== siteId);
+    state.credentials = state.credentials.filter((credential) => credential.siteId !== siteId);
+    state.modelTargets = state.modelTargets.filter((target) => target.siteId !== siteId);
+    for (const endpointId of endpointIds) {
+      delete state.endpointCredentialIds[String(endpointId)];
+      delete state.discoveredModels[String(endpointId)];
+    }
+    for (const credentialId of credentialIds) {
+      for (const endpointId of Object.keys(state.endpointCredentialIds)) {
+        state.endpointCredentialIds[endpointId] = state.endpointCredentialIds[endpointId].filter((id) => id !== credentialId);
+      }
+    }
+    delete state.siteAccounts[siteId];
+    delete state.siteUsage[siteId];
+    delete state.sitePlatformDetections[siteId];
+    delete state.siteRuntimeStatus[siteId];
+    for (const targetId of targetIds) {
+      delete state.routingHealth[targetId];
+      for (const key of Object.keys(state.monitorHistories)) {
+        if (state.monitorHistories[key].target.providerModelTargetId === targetId) delete state.monitorHistories[key];
+      }
+    }
+    for (const model of state.monitorSnapshot.items) {
+      model.targets = model.targets.filter((target) => !targetIds.has(target.providerModelTargetId));
+      const defaultRoute = state.routes.find((route) => route.routingProfileId === 1 && route.publishedModelId === model.publishedModelId);
+      if (defaultRoute) {
+        model.publishedModelEnabled = defaultRoute.enabled;
+        model.publishedModelRevision = defaultRoute.publishedModelRevision;
+      }
+      recomputeMonitorModel(model);
+    }
+    return noContent();
+  }
+
+  const tokenPreviewMatch = /^\/api\/vnext\/inventory\/sites\/(\d+)\/token-json\/preview$/.exec(path);
+  if (method === 'POST' && tokenPreviewMatch) {
+    const siteId = Number(tokenPreviewMatch[1]);
+    if (!state.sites.some((site) => site.id === siteId)) return error(404, 'not_found', 'Site was not found.');
+    const body = await requestBody<{ rawJson?: string }>(request);
+    if (body instanceof Response) return body;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body.rawJson || '');
+    } catch {
+      return error(400, 'invalid_token_json', 'Token JSON must be valid JSON.');
+    }
+    const envelope = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+    const rawItems = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(envelope?.accounts)
+        ? envelope.accounts
+        : Array.isArray(envelope?.tokens)
+          ? envelope.tokens
+          : envelope
+            ? [envelope]
+            : [];
+    if (!rawItems.length) return error(400, 'empty_token_json', 'No token accounts were found in this JSON document.');
+    const items = rawItems.map((value, index) => {
+      const account = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+      const accountName = String(account.accountName || account.name || account.email || `Account ${index + 1}`);
+      const credentialName = String(account.credentialName || account.label || accountName);
+      const token = String(account.access_token || account.api_key || account.token || '');
+      const platform = String(account.platform || account.provider || account.wire_protocol || '');
+      const endpoint = String(account.endpoint || account.base_url || account.api_base || '');
+      const duplicate = state.credentials.some((credential) => credential.siteId === siteId && credential.name.toLowerCase() === credentialName.toLowerCase());
+      const status = !token || !platform || !endpoint ? 'invalid' as const : duplicate ? 'duplicate' as const : 'ready' as const;
+      const warnings = [
+        ...(!token ? [account.refresh_token ? 'refresh_token 不能作为运行时 API 凭据' : '缺少 token、access_token 或 api_key 字段'] : []),
+        ...(!platform ? ['缺少 platform、provider 或 wire_protocol 字段'] : []),
+        ...(!endpoint ? ['缺少 endpoint、base_url 或 api_base 字段'] : []),
+        ...(duplicate ? ['同名凭据已存在，默认不会重复导入'] : []),
+      ];
+      return {
+        index, accountName, credentialName, platform, endpoint,
+        tokenHint: token ? `${token.slice(0, 4)}••••${token.slice(-4)}` : '未找到 Token',
+        scopes: Array.isArray(account.scopes) ? account.scopes.map(String) : [],
+        status,
+        warnings,
+      };
+    });
+    const previewId = `token-preview-${siteId}-${now}`;
+    const preview = {
+      previewId, siteId, detectedFormat: Array.isArray(parsed) ? 'account_array' : Array.isArray(envelope?.accounts) ? 'accounts_envelope' : Array.isArray(envelope?.tokens) ? 'tokens_envelope' : 'single_account',
+      items,
+      readyCount: items.filter((item) => item.status === 'ready').length,
+      duplicateCount: items.filter((item) => item.status === 'duplicate').length,
+      invalidCount: items.filter((item) => item.status === 'invalid').length,
+      expiresAt: now + 10 * MINUTE,
+    };
+    state.tokenImportPreviews[previewId] = preview;
+    return json(clone(preview));
+  }
+
+  const tokenImportMatch = /^\/api\/vnext\/inventory\/sites\/(\d+)\/token-json\/import$/.exec(path);
+  if (method === 'POST' && tokenImportMatch) {
+    const siteId = Number(tokenImportMatch[1]);
+    const body = await requestBody<{ previewId?: string; indices?: number[] }>(request);
+    if (body instanceof Response) return body;
+    const preview = body.previewId ? state.tokenImportPreviews[body.previewId] : undefined;
+    if (!preview || preview.siteId !== siteId || preview.expiresAt <= now) return error(409, 'token_preview_expired', 'Token import preview is missing or expired.');
+    if (!Array.isArray(body.indices) || body.indices.length === 0 || body.indices.some((index) => !Number.isInteger(index) || index < 0) || new Set(body.indices).size !== body.indices.length) {
+      return error(400, 'invalid_request', 'indices must contain unique non-negative integers.');
+    }
+    const selected = new Set(body.indices || []);
+    const candidates = preview.items.filter((item) => selected.has(item.index) && item.status === 'ready');
+    if (candidates.length !== selected.size) return error(400, 'invalid_request', 'indices may select only ready preview items.');
+    const credentialIds: number[] = [];
+    const endpointIds: number[] = [];
+    for (const candidate of candidates) {
+      const protocol: WireProtocol = candidate.platform.toLowerCase().includes('anthropic') || candidate.platform.toLowerCase().includes('claude') ? 'anthropic' : candidate.platform.toLowerCase().includes('gemini') ? 'gemini' : 'openai';
+      const defaults = endpointDefaults(protocol);
+      const credentialId = nextID(state, 'credential');
+      const endpointId = nextID(state, 'endpoint');
+      state.credentials.push({ id: credentialId, siteId, name: candidate.credentialName, secretConfigured: true, enabled: true, revision: 1, runtimeState: 'unknown', coolingUntil: null, lastHttpStatus: null, lastErrorCode: '', runtimeRevision: 1, runtimeUpdatedAt: now, createdAt: now, updatedAt: now });
+      state.endpoints.push({ id: endpointId, siteId, name: `${candidate.credentialName} · Token JSON`, baseUrl: candidate.endpoint, wireProtocol: protocol, surface: defaults.surface, adapterKind: candidate.platform, authScheme: defaults.authScheme, headers: {}, secretHeadersConfigured: false, position: state.endpoints.filter((item) => item.siteId === siteId).length, enabled: true, revision: 1, createdAt: now, updatedAt: now });
+      state.endpointCredentialIds[String(endpointId)] = [credentialId];
+      credentialIds.push(credentialId);
+      endpointIds.push(endpointId);
+    }
+    delete state.tokenImportPreviews[preview.previewId];
+    return json({ importedCount: candidates.length, skippedCount: preview.items.length - candidates.length, credentialIds, endpointIds }, 201);
   }
 
   const endpointsMatch = /^\/api\/vnext\/inventory\/sites\/(\d+)\/endpoints$/.exec(path);
@@ -904,9 +1176,8 @@ async function handleAdminMutation(request: Request, path: string, state: Protot
   }
 
   if (method === 'POST' && path === '/api/vnext/downstream-keys') {
-    const body = await requestBody<{ name?: string; quotaNanoUSD?: number | null; hourlyQuotaNanoUSD?: number | null; billingMultiplierBPS?: number; rpm?: unknown; expires?: number | null; routingProfileId?: number | null; enabled?: boolean }>(request);
+    const body = await requestBody<{ name?: string; quotaNanoUSD?: number | null; hourlyQuotaNanoUSD?: number | null; billingMultiplierBPS?: number; expires?: number | null; routingProfileId?: number | null; enabled?: boolean }>(request);
     if (body instanceof Response) return body;
-    if (body.rpm !== undefined) return error(400, 'invalid_request', 'rpm is no longer supported.');
     if (!body.name?.trim()) return error(400, 'invalid_request', 'Downstream key name is required.');
     if (body.billingMultiplierBPS !== undefined && (!Number.isInteger(body.billingMultiplierBPS) || body.billingMultiplierBPS < 0 || body.billingMultiplierBPS > 10_000_000)) return error(400, 'invalid_request', 'billingMultiplierBPS must be an integer between 0 and 10000000.');
     const profile = body.routingProfileId
@@ -937,9 +1208,8 @@ async function handleAdminMutation(request: Request, path: string, state: Protot
     if (!item) return error(404, 'not_found', 'Downstream key was not found.');
     const conflict = revisionError(request, item.revision);
     if (conflict) return conflict;
-    const body = await requestBody<{ name?: string; quotaNanoUSD?: number | null; hourlyQuotaNanoUSD?: number | null; billingMultiplierBPS?: number; rpm?: unknown; expires?: number | null; routingProfileId?: number | null; enabled?: boolean }>(request);
+    const body = await requestBody<{ name?: string; quotaNanoUSD?: number | null; hourlyQuotaNanoUSD?: number | null; billingMultiplierBPS?: number; expires?: number | null; routingProfileId?: number | null; enabled?: boolean }>(request);
     if (body instanceof Response) return body;
-    if (body.rpm !== undefined) return error(400, 'invalid_request', 'rpm is no longer supported.');
     if (body.billingMultiplierBPS !== undefined && (!Number.isInteger(body.billingMultiplierBPS) || body.billingMultiplierBPS < 0 || body.billingMultiplierBPS > 10_000_000)) return error(400, 'invalid_request', 'billingMultiplierBPS must be an integer between 0 and 10000000.');
     if (body.name !== undefined) item.name = body.name.trim();
     if (body.quotaNanoUSD !== undefined) item.quotaNanoUSD = body.quotaNanoUSD;
@@ -1272,6 +1542,24 @@ async function handleAdminMutation(request: Request, path: string, state: Protot
     return noContent();
   }
 
+  if (method === 'POST' && path === '/api/vnext/pricing/builtin/ensure') {
+    const active = state.priceCatalogs.find((item) => item.version === state.catalogState.active_version);
+    const bundled = state.priceCatalogs.find((item) => item.source === 'JieShan bundled official API pricing snapshot');
+    const candidate = bundled || state.priceCatalogs[0];
+    if (!candidate) return error(503, 'pricing_unavailable', 'Bundled price catalog is unavailable.');
+    const operatorSelected = Boolean(active && active.version !== candidate.version && active.source !== 'JieShan bundled official API pricing snapshot');
+    if (operatorSelected) {
+      return json({ catalog_version: candidate.version, catalog_digest: candidate.digest || '', outcome: 'operator_catalog_preserved', imported: false, activated: false, state: clone(state.catalogState) }, 200, state.catalogState.revision);
+    }
+    const activated = state.catalogState.active_version !== candidate.version;
+    if (activated) {
+      state.catalogState.active_version = candidate.version;
+      state.catalogState.revision += 1;
+      state.catalogState.updated_at = new Date(now).toISOString();
+    }
+    return json({ catalog_version: candidate.version, catalog_digest: candidate.digest || '', outcome: activated ? 'activated_existing' : 'already_current', imported: false, activated, state: clone(state.catalogState) }, 200, state.catalogState.revision);
+  }
+
   if (method === 'POST' && path === '/api/vnext/pricing/catalogs/preview') {
     const body = await requestBody<{ catalog?: PriceCatalog }>(request);
     if (body instanceof Response) return body;
@@ -1344,8 +1632,8 @@ async function handleAdminMutation(request: Request, path: string, state: Protot
     const targets = route.targets.map((target) => {
       const provider = state.modelTargets.find((item) => item.id === target.providerModelTargetId);
       const health = state.routingHealth[target.providerModelTargetId] || null;
-      const item = { publishedModelTargetId: target.id, publishedModelTargetRevision: target.revision, providerModelTargetId: target.providerModelTargetId, providerModelTargetRevision: provider?.revision || 1, position: target.position, siteId: target.siteId, siteName: target.siteName, endpointId: target.endpointId, endpointName: target.endpointName, sourceModel: target.sourceModel, wireProtocol: target.wireProtocol, apiSurface: target.apiSurface, enabled: provider?.enabled ?? true, usableCredentialCount: provider?.usableCredentialCount || 0, status: 'unprobed' as const, successes: 0, failures: 0, skipped: 0, successBasisPoints: 0, latest: null, statusBar: [], health };
-      state.monitorHistories[`${publishedModelId}:${target.providerModelTargetId}`] = { publishedModelId, publicModel: route.publicName, target: { publishedModelTargetId: target.id, providerModelTargetId: target.providerModelTargetId, position: target.position, siteId: target.siteId, siteName: target.siteName, endpointId: target.endpointId, endpointName: target.endpointName, sourceModel: target.sourceModel, wireProtocol: target.wireProtocol, apiSurface: target.apiSurface }, status: 'unprobed', successes: 0, failures: 0, skipped: 0, total: 0, attempted: 0, successBasisPoints: 0, health: clone(item.health), order: 'oldest_first', items: [] };
+      const item = { publishedModelTargetId: target.id, publishedModelTargetRevision: target.revision, providerModelTargetId: target.providerModelTargetId, providerModelTargetRevision: provider?.revision || 1, position: target.position, siteId: target.siteId, siteName: target.siteName, endpointId: target.endpointId, endpointName: target.endpointName, sourceModel: target.sourceModel, wireProtocol: target.wireProtocol, apiSurface: target.apiSurface, enabled: provider?.enabled ?? true, usableCredentialCount: provider?.usableCredentialCount || 0, status: 'unprobed' as const, successes: 0, failures: 0, skipped: 0, successBasisPoints: 0, latest: null, statusBar: [], health, evidence: { liveTraffic: emptyMonitorEvidence('live_traffic'), probe: emptyMonitorEvidence('probe') } };
+      state.monitorHistories[`${publishedModelId}:${target.providerModelTargetId}`] = { publishedModelId, publicModel: route.publicName, target: { publishedModelTargetId: target.id, providerModelTargetId: target.providerModelTargetId, position: target.position, siteId: target.siteId, siteName: target.siteName, endpointId: target.endpointId, endpointName: target.endpointName, sourceModel: target.sourceModel, wireProtocol: target.wireProtocol, apiSurface: target.apiSurface }, status: 'unprobed', successes: 0, failures: 0, skipped: 0, total: 0, attempted: 0, successBasisPoints: 0, health: clone(item.health), order: 'oldest_first', items: [], circuitTransitions: [] };
       return item;
     });
     state.monitorSnapshot.items.push({ publishedModelId, publicModel: route.publicName, officialPriceSku: route.officialPriceSku, publishedModelEnabled: route.enabled, publishedModelRevision: route.publishedModelRevision, status: monitor.enabled ? 'unprobed' : 'disabled', monitor, targets, successes: 0, failures: 0, skipped: 0, successBasisPoints: 0 });
@@ -1386,11 +1674,32 @@ async function handleAdminMutation(request: Request, path: string, state: Protot
     model.monitor.lastProbeStartedAt = now;
     for (const target of model.targets) {
       const coolingUntil = target.health?.cooldownUntil || 0;
-      if (coolingUntil > now) appendProbe(state, target.providerModelTargetId, 'skipped', { permitReason: 'cooldown_active' });
+      if (coolingUntil > now) appendProbe(state, target.providerModelTargetId, 'skipped', { permitReason: 'cooldown_active' }, model.publishedModelId);
       else {
-        updateRuntimeHealth(state, target.providerModelTargetId, true);
-        appendProbe(state, target.providerModelTargetId, 'success');
+        updateRuntimeHealth(state, target.providerModelTargetId, true, '', undefined, 'probe');
+        appendProbe(state, target.providerModelTargetId, 'success', {}, model.publishedModelId);
       }
+    }
+    model.monitor.busy = false;
+    model.monitor.lastProbeFinishedAt = Date.now();
+    model.monitor.nextProbeAt = Date.now() + model.monitor.intervalMs;
+    model.monitor.updatedAt = Date.now();
+    return noContent();
+  }
+
+  const targetProbeMatch = /^\/api\/vnext\/monitor\/models\/(\d+)\/targets\/(\d+)\/probe$/.exec(path);
+  if (method === 'POST' && targetProbeMatch) {
+    const model = state.monitorSnapshot.items.find((item) => item.publishedModelId === Number(targetProbeMatch[1]));
+    if (!model) return error(404, 'not_found', 'Monitor configuration was not found.');
+    const target = model.targets.find((item) => item.providerModelTargetId === Number(targetProbeMatch[2]));
+    if (!target) return error(404, 'not_found', 'Monitor target was not found.');
+    model.monitor.busy = true;
+    model.monitor.lastProbeStartedAt = now;
+    const coolingUntil = target.health?.cooldownUntil || 0;
+    if (coolingUntil > now) appendProbe(state, target.providerModelTargetId, 'skipped', { permitReason: 'cooldown_active' }, model.publishedModelId);
+    else {
+      updateRuntimeHealth(state, target.providerModelTargetId, true, '', undefined, 'probe');
+      appendProbe(state, target.providerModelTargetId, 'success', {}, model.publishedModelId);
     }
     model.monitor.busy = false;
     model.monitor.lastProbeFinishedAt = Date.now();
@@ -1406,6 +1715,20 @@ async function handleAdminMutation(request: Request, path: string, state: Protot
     if (body instanceof Response) return body;
     if (Object.values(body).some((value) => typeof value !== 'number' || value <= 0)) return error(400, 'invalid_request', 'Every runtime setting must be a positive number.');
     state.settings = { ...body, revision: state.settings.revision + 1 };
+    state.systemHealth.runtime.configRevision = state.settings.revision;
+    state.systemHealth.runtime.configLoadedAt = now;
+    state.systemHealth.configHistory.unshift({
+      id: `cfg-${state.settings.revision}`,
+      revision: state.settings.revision,
+      actor: 'admin',
+      summary: '更新网关运行设置',
+      changedFields: Object.keys(body),
+      status: 'applied',
+      createdAt: now,
+    });
+    for (const entry of state.systemHealth.configHistory.slice(1)) {
+      if (entry.status === 'applied') entry.status = 'superseded';
+    }
     for (const model of state.monitorSnapshot.items) {
       model.monitor.intervalMs = state.settings.probeIntervalMs;
       model.monitor.nextProbeAt = now + state.settings.probeIntervalMs;

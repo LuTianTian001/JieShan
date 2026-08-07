@@ -2,11 +2,14 @@ package store
 
 import "encoding/json"
 
+const DefaultSiteMaxInFlight = 4
+
 type Site struct {
 	ID           int64
 	Name         string
 	DashboardURL string
 	Enabled      bool
+	MaxInFlight  int
 	Revision     int64
 	CreatedAt    int64
 	UpdatedAt    int64
@@ -16,6 +19,7 @@ type SiteWrite struct {
 	Name         string
 	DashboardURL string
 	Enabled      bool
+	MaxInFlight  int
 }
 
 type SiteEndpoint struct {
@@ -144,14 +148,11 @@ type DownstreamKey struct {
 	ReservedThisHourNanoUSD   int64
 	HourlyWindowStartedAt     int64
 	BillingMultiplierBPS      int
-	// RPMLimit is retained only while the VNext migration history still owns
-	// the legacy column. New control-plane writes always keep it unlimited.
-	RPMLimit   int
-	ExpiresAt  *int64
-	LastUsedAt *int64
-	Revision   int64
-	CreatedAt  int64
-	UpdatedAt  int64
+	ExpiresAt                 *int64
+	LastUsedAt                *int64
+	Revision                  int64
+	CreatedAt                 int64
+	UpdatedAt                 int64
 }
 
 type DownstreamKeyWrite struct {
@@ -163,7 +164,6 @@ type DownstreamKeyWrite struct {
 	QuotaNanoUSD         *int64
 	HourlyQuotaNanoUSD   *int64
 	BillingMultiplierBPS *int
-	RPMLimit             int
 	ExpiresAt            *int64
 }
 
@@ -175,7 +175,6 @@ type DownstreamKeyUpdate struct {
 	QuotaNanoUSD         *int64
 	HourlyQuotaNanoUSD   *int64
 	BillingMultiplierBPS int
-	RPMLimit             int
 	ExpiresAt            *int64
 }
 

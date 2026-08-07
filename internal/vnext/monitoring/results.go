@@ -10,7 +10,7 @@ import (
 	"github.com/LuTianTian001/JieShan/internal/vnext/routing"
 )
 
-const DefaultProbeInterval = 5 * time.Minute
+const DefaultProbeInterval = 15 * time.Minute
 
 type Outcome string
 

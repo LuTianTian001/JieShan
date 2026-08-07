@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LuTianTian001/JieShan/internal/vnext/capacity"
 	"github.com/LuTianTian001/JieShan/internal/vnext/pricing"
 	"github.com/LuTianTian001/JieShan/internal/vnext/protocol"
 	"github.com/LuTianTian001/JieShan/internal/vnext/protocol/openai"
@@ -194,7 +195,8 @@ func TestFirstOutputTimeoutFailsOverBeforeStreamCommit(t *testing.T) {
 		t.Fatalf("first attempt = %+v", first)
 	}
 	state := health.snapshot(1)
-	if state.Phase != routing.CircuitSuspect || state.LastFailureKind != routing.FailureFirstOutputTimeout {
+	if state.Phase != routing.CircuitOpen || state.ConsecutiveFailures != 1 || state.CooldownUntil.IsZero() ||
+		state.LastFailureKind != routing.FailureFirstOutputTimeout {
 		t.Fatalf("target health = %+v", state)
 	}
 }
@@ -243,7 +245,7 @@ func TestHalfOpenFirstOutputTimeoutReopensAndFailsOver(t *testing.T) {
 		t.Fatalf("half-open timeout failover = %+v", result)
 	}
 	state := health.snapshot(1)
-	if state.Phase != routing.CircuitOpen || state.ConsecutiveFailures < 2 || !state.CooldownUntil.After(base) ||
+	if state.Phase != routing.CircuitOpen || state.ConsecutiveFailures != 1 || !state.CooldownUntil.After(base) ||
 		!state.HalfOpenLeaseUntil.IsZero() {
 		t.Fatalf("failed half-open timeout did not reopen target: %+v", state)
 	}
@@ -319,52 +321,6 @@ func TestExecuteEnforcesMaximumStartedAttempts(t *testing.T) {
 	}
 }
 
-func TestExecuteAppliesRPMPolicyAndResetsWindowOnKeyRevision(t *testing.T) {
-	doer := &scriptedDoer{scripts: []responseScript{
-		{status: http.StatusOK, body: chatResponse("source-a", "one")},
-		{status: http.StatusOK, body: chatResponse("source-a", "two")},
-		{status: http.StatusOK, body: chatResponse("source-a", "three")},
-	}}
-	service, _, _ := newGatewayFixture(t, doer)
-	resolved := service.resolver.(staticResolver).resolution
-	resolved.DownstreamKeyRPMLimit = 1
-	service.resolver = staticResolver{resolution: resolved}
-
-	execute := func(requestID string) error {
-		_, err := service.Execute(context.Background(), Input{
-			RequestID: requestID, DownstreamKey: "js_test", PublicModel: "public-model",
-			IngressProtocol: protocol.OpenAI, IngressSurface: protocol.OpenAIChatCompletions,
-			Payload: []byte(`{"model":"public-model","messages":[{"role":"user","content":"hello"}]}`),
-		}, nil)
-		return err
-	}
-	if err := execute("req-rpm-1"); err != nil {
-		t.Fatal(err)
-	}
-	if err := execute("req-rpm-limited"); !errors.Is(err, ErrRateLimitExceeded) || RateLimitRetryAfter(err) <= 0 {
-		t.Fatalf("same revision should be limited with retry metadata: %v", err)
-	}
-	if len(doer.requests) != 1 {
-		t.Fatalf("rate-limited request reached upstream: %+v", doer.requests)
-	}
-
-	resolved.DownstreamKeyRevision++
-	resolved.DownstreamKeyRPMLimit = 2
-	service.resolver = staticResolver{resolution: resolved}
-	if err := execute("req-rpm-revision-1"); err != nil {
-		t.Fatal(err)
-	}
-	if err := execute("req-rpm-revision-2"); err != nil {
-		t.Fatal(err)
-	}
-	if err := execute("req-rpm-revision-limited"); !errors.Is(err, ErrRateLimitExceeded) {
-		t.Fatalf("updated RPM policy should apply to the new revision: %v", err)
-	}
-	if len(doer.requests) != 3 {
-		t.Fatalf("upstream requests = %d, want 3", len(doer.requests))
-	}
-}
-
 func TestLiveFailuresDriveTheSameSuspectOpenAndCooldownSemantics(t *testing.T) {
 	doer := &scriptedDoer{scripts: []responseScript{
 		{status: http.StatusServiceUnavailable, body: `{"error":{"code":"service_unavailable"}}`},
@@ -428,7 +384,7 @@ func newGatewayFixture(t *testing.T, doer *scriptedDoer) (*Service, *fakeHealth,
 		t.Fatal(err)
 	}
 	resolution := resolver.Resolution{
-		DownstreamKeyID: 7, DownstreamKeyRevision: 2,
+		DownstreamKeyID:  7,
 		PublishedModelID: 70, PublishedModelRevision: 3,
 		RoutingProfileID: 9, RoutingProfileName: "Low latency",
 		SourceProfileID: 1, SourceProfileName: "Default", RouteRevision: 3,
@@ -468,13 +424,31 @@ func newGatewayFixture(t *testing.T, doer *scriptedDoer) (*Service, *fakeHealth,
 		book,
 		NewConservativeJSONReservationPlanner(),
 		doer,
-		Options{Now: clock, DefaultMaxOutputTokens: 128},
+		Options{Now: clock, DefaultMaxOutputTokens: 128, Capacity: directCapacity{}},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return service, health, effects
 }
+
+type directCapacity struct {
+	onAcquire func()
+	err       error
+}
+
+func (item directCapacity) Acquire(_ context.Context, request capacity.Request) (*capacity.Permit, error) {
+	if item.onAcquire != nil {
+		item.onAcquire()
+	}
+	if item.err != nil {
+		return nil, item.err
+	}
+	candidate := request.Candidates[0]
+	return &capacity.Permit{SiteID: candidate.SiteID, TargetID: candidate.TargetID}, nil
+}
+
+func (directCapacity) ReportThrottle(capacity.ThrottleSignal) error { return nil }
 
 func newGatewayPriceBook(t *testing.T) *pricing.Book {
 	t.Helper()
@@ -503,6 +477,7 @@ func newGatewayPriceBook(t *testing.T) *pricing.Book {
 
 type fakeAccounting struct {
 	mu                  sync.Mutex
+	onStart             func()
 	startResult         vnextstore.RequestStartResult
 	startErr            error
 	recordErr           error
@@ -515,6 +490,9 @@ type fakeAccounting struct {
 }
 
 func (accounting *fakeAccounting) StartRequestWithQuotaReservation(_ context.Context, input vnextstore.RequestStart) (vnextstore.RequestStartResult, error) {
+	if accounting.onStart != nil {
+		accounting.onStart()
+	}
 	accounting.mu.Lock()
 	defer accounting.mu.Unlock()
 	accounting.starts = append(accounting.starts, input)
@@ -663,6 +641,7 @@ func (health *fakeHealth) snapshot(targetID int64) routing.HealthState {
 type responseScript struct {
 	status      int
 	contentType string
+	header      http.Header
 	body        string
 	bodyFactory func(*http.Request) io.ReadCloser
 	err         error
@@ -700,6 +679,11 @@ func (doer *scriptedDoer) Do(request *http.Request) (*http.Response, error) {
 		return nil, script.err
 	}
 	header := make(http.Header)
+	for name, values := range script.header {
+		for _, value := range values {
+			header.Add(name, value)
+		}
+	}
 	if script.contentType != "" {
 		header.Set("Content-Type", script.contentType)
 	} else {

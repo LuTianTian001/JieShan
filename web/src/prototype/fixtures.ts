@@ -117,6 +117,8 @@ function monitorTarget(
   const skipped = points.length - successes - failures;
   const attempted = successes + failures;
   const latest = points[points.length - 1] || null;
+  const liveSamples = modelTarget.id === 1001 ? 184 : modelTarget.id === 2001 ? 96 : 74;
+  const liveFailures = modelTarget.id === 1001 ? 3 : modelTarget.id === 2001 ? 1 : 0;
   return {
     publishedModelTargetId: publishedTargetId,
     publishedModelTargetRevision: 1,
@@ -141,6 +143,34 @@ function monitorTarget(
     successBasisPoints: attempted ? Math.round((successes / attempted) * 10_000) : 0,
     latest,
     statusBar: points,
+    evidence: {
+      liveTraffic: {
+        source: 'live_traffic',
+        windowMs: 60 * MINUTE,
+        samples: liveSamples,
+        successes: liveSamples - liveFailures,
+        failures: liveFailures,
+        skipped: 0,
+        successBasisPoints: Math.round(((liveSamples - liveFailures) / liveSamples) * 10_000),
+        p50FirstOutputMs: modelTarget.id === 2001 ? 1_480 : 420,
+        p95FirstOutputMs: modelTarget.id === 2001 ? 4_880 : 1_260,
+        lastObservedAt: now - (modelTarget.id === 2001 ? 4 : 1) * MINUTE,
+        lastFailureKind: liveFailures ? 'upstream_unavailable' : '',
+      },
+      probe: {
+        source: 'probe',
+        windowMs: 24 * 60 * MINUTE,
+        samples: points.length,
+        successes,
+        failures,
+        skipped,
+        successBasisPoints: attempted ? Math.round((successes / attempted) * 10_000) : 0,
+        p50FirstOutputMs: 360,
+        p95FirstOutputMs: modelTarget.id === 2001 ? 16_400 : 610,
+        lastObservedAt: latest?.finishedAt || null,
+        lastFailureKind: latest?.outcome === 'failure' ? latest.failureKind : '',
+      },
+    },
     health: {
       phase: latest?.outcome === 'failure' ? 'suspect' : 'closed',
       capability: 'available',
@@ -330,8 +360,8 @@ export function createPrototypeState(now = Date.now()): PrototypeState {
   }
   const claudeMonitorTargets = [monitorTarget(byTarget.get(1002)!, claudeTargets[0].id, 0, now)];
   const monitorItems = [
-    { publishedModelId: 501, publicModel: 'gpt-5.2', officialPriceSku: 'openai/gpt-5.2', publishedModelEnabled: true, publishedModelRevision: 1, status: 'healthy' as const, monitor: { enabled: true, intervalMs: 5 * MINUTE, historyLimit: 120, nextProbeAt: now + 3 * MINUTE, lastProbeStartedAt: now - 2 * MINUTE - 620, lastProbeFinishedAt: now - 2 * MINUTE, busy: false, revision: 2, createdAt: now - 10 * 24 * 60 * MINUTE, updatedAt: now - 2 * MINUTE }, targets: gptMonitorTargets, successes: gptMonitorTargets.reduce((sum, item) => sum + item.successes, 0), failures: gptMonitorTargets.reduce((sum, item) => sum + item.failures, 0), skipped: 0, successBasisPoints: 9_583 },
-    { publishedModelId: 502, publicModel: 'claude-sonnet-4-5', officialPriceSku: 'anthropic/claude-sonnet-4-5', publishedModelEnabled: true, publishedModelRevision: 1, status: 'healthy' as const, monitor: { enabled: true, intervalMs: 5 * MINUTE, historyLimit: 120, nextProbeAt: now + 3 * MINUTE, lastProbeStartedAt: now - 2 * MINUTE - 620, lastProbeFinishedAt: now - 2 * MINUTE, busy: false, revision: 1, createdAt: now - 9 * 24 * 60 * MINUTE, updatedAt: now - 2 * MINUTE }, targets: claudeMonitorTargets, successes: 12, failures: 0, skipped: 0, successBasisPoints: 10_000 },
+    { publishedModelId: 501, publicModel: 'gpt-5.2', officialPriceSku: 'openai/gpt-5.2', publishedModelEnabled: true, publishedModelRevision: 1, status: 'healthy' as const, monitor: { enabled: true, intervalMs: 15 * MINUTE, historyLimit: 120, nextProbeAt: now + 3 * MINUTE, lastProbeStartedAt: now - 2 * MINUTE - 620, lastProbeFinishedAt: now - 2 * MINUTE, busy: false, revision: 2, createdAt: now - 10 * 24 * 60 * MINUTE, updatedAt: now - 2 * MINUTE }, targets: gptMonitorTargets, successes: gptMonitorTargets.reduce((sum, item) => sum + item.successes, 0), failures: gptMonitorTargets.reduce((sum, item) => sum + item.failures, 0), skipped: 0, successBasisPoints: 9_583 },
+    { publishedModelId: 502, publicModel: 'claude-sonnet-4-5', officialPriceSku: 'anthropic/claude-sonnet-4-5', publishedModelEnabled: true, publishedModelRevision: 1, status: 'healthy' as const, monitor: { enabled: true, intervalMs: 15 * MINUTE, historyLimit: 120, nextProbeAt: now + 3 * MINUTE, lastProbeStartedAt: now - 2 * MINUTE - 620, lastProbeFinishedAt: now - 2 * MINUTE, busy: false, revision: 1, createdAt: now - 9 * 24 * 60 * MINUTE, updatedAt: now - 2 * MINUTE }, targets: claudeMonitorTargets, successes: 12, failures: 0, skipped: 0, successBasisPoints: 10_000 },
   ];
 
   const successStart = now - 7 * MINUTE;
@@ -420,9 +450,9 @@ export function createPrototypeState(now = Date.now()): PrototypeState {
     sessionExpiresAt: now + 8 * 60 * MINUTE,
     csrfToken: 'prototype-csrf-token',
     sites: [
-      { id: 1, name: 'Ciii', dashboardUrl: 'https://codex.ciii.club', enabled: true, revision: 2, createdAt: now - 40 * 24 * 60 * MINUTE, updatedAt: now - 20 * MINUTE },
-      { id: 2, name: 'Tokyo Relay', dashboardUrl: 'https://tokyo-relay.example.com', enabled: true, revision: 1, createdAt: now - 28 * 24 * 60 * MINUTE, updatedAt: now - 30 * MINUTE },
-      { id: 3, name: 'Gemini Hub', dashboardUrl: 'https://gemini-hub.example.com', enabled: true, revision: 1, createdAt: now - 21 * 24 * 60 * MINUTE, updatedAt: now - 40 * MINUTE },
+      { id: 1, name: 'Ciii', dashboardUrl: 'https://codex.ciii.club', enabled: true, maxConcurrency: 24, revision: 2, createdAt: now - 40 * 24 * 60 * MINUTE, updatedAt: now - 20 * MINUTE },
+      { id: 2, name: 'Tokyo Relay', dashboardUrl: 'https://tokyo-relay.example.com', enabled: true, maxConcurrency: 12, revision: 1, createdAt: now - 28 * 24 * 60 * MINUTE, updatedAt: now - 30 * MINUTE },
+      { id: 3, name: 'Gemini Hub', dashboardUrl: 'https://gemini-hub.example.com', enabled: true, maxConcurrency: 8, revision: 1, createdAt: now - 21 * 24 * 60 * MINUTE, updatedAt: now - 40 * MINUTE },
     ],
     endpoints: [
       { id: 11, siteId: 1, name: 'OpenAI 主线路', baseUrl: 'https://codex.ciii.club/v1', wireProtocol: 'openai', surface: 'openai.chat_completions', adapterKind: 'openai', authScheme: 'bearer', headers: {}, secretHeadersConfigured: false, position: 0, enabled: true, revision: 2, createdAt: now - 30 * 24 * 60 * MINUTE, updatedAt: now - 20 * MINUTE },
@@ -451,16 +481,77 @@ export function createPrototypeState(now = Date.now()): PrototypeState {
     downstreamSecrets: { 1: 'js_prototype_personal_6fc2d9d8', 2: 'js_prototype_code_8a10e43b' },
     siteAccounts: { 1: account(1, 'Ciii', 'ciii', '86.58'), 2: account(2, 'Tokyo Relay', 'new_api', '42.20') },
     siteUsage: { 1: siteUsage(now, 1, 'ciii'), 2: siteUsage(now, 2, 'tokyo'), 3: [] },
+    sitePlatformDetections: {
+      1: {
+        siteId: 1, state: 'detected', verdict: 'trusted', selectedPlatform: 'new_api', selectedPlatformLabel: 'New API', selectionLocked: false, confidence: 'high', score: 94,
+        capabilities: { sessionRefresh: true, balance: true, usage: true }, checkedAt: now - 19 * MINUTE, detectedAt: now - 19 * MINUTE,
+        candidates: [
+          { platform: 'new_api', label: 'New API', confidence: 'high', score: 94, supported: true, capabilities: { sessionRefresh: true, balance: true, usage: true }, evidenceIds: ['header-server', 'api-shape', 'html-marker'] },
+          { platform: 'one_api', label: 'One API', confidence: 'low', score: 28, supported: true, capabilities: { sessionRefresh: true, balance: true, usage: true }, evidenceIds: ['api-shape'] },
+        ],
+        evidence: [
+          { id: 'header-server', source: 'response_header', signal: 'x-oneapi-version', observedValue: 'v0.6.8', matched: true, weight: 38, observedAt: now - 19 * MINUTE },
+          { id: 'api-shape', source: 'api_shape', signal: '/api/status response', observedValue: 'data.version + data.system_name', matched: true, weight: 34, observedAt: now - 19 * MINUTE },
+          { id: 'html-marker', source: 'html_marker', signal: 'frontend bundle marker', observedValue: '__NEW_API__', matched: true, weight: 22, observedAt: now - 19 * MINUTE },
+        ],
+        errors: [],
+      },
+      2: {
+        siteId: 2, state: 'ambiguous', verdict: 'possible', selectedPlatform: 'one_api', selectedPlatformLabel: 'One API', selectionLocked: false, confidence: 'medium', score: 68,
+        capabilities: { sessionRefresh: true, balance: true, usage: true }, checkedAt: now - 29 * MINUTE, detectedAt: now - 29 * MINUTE,
+        candidates: [
+          { platform: 'one_api', label: 'One API', confidence: 'medium', score: 68, supported: true, capabilities: { sessionRefresh: true, balance: true, usage: true }, evidenceIds: ['tokyo-api-shape', 'tokyo-html'] },
+          { platform: 'new_api', label: 'New API', confidence: 'low', score: 51, supported: true, capabilities: { sessionRefresh: true, balance: true, usage: true }, evidenceIds: ['tokyo-api-shape'] },
+        ],
+        evidence: [
+          { id: 'tokyo-api-shape', source: 'api_shape', signal: '/api/status response', observedValue: 'legacy status envelope', matched: true, weight: 48, observedAt: now - 29 * MINUTE },
+          { id: 'tokyo-html', source: 'html_marker', signal: 'page title', observedValue: 'One API', matched: true, weight: 20, observedAt: now - 29 * MINUTE },
+        ],
+        errors: [],
+      },
+      3: {
+        siteId: 3, state: 'unknown', verdict: 'unknown', selectedPlatform: '', selectedPlatformLabel: '', selectionLocked: false, confidence: 'unknown', score: 0,
+        capabilities: { sessionRefresh: false, balance: false, usage: false }, checkedAt: now - 39 * MINUTE, detectedAt: null,
+        candidates: [], evidence: [],
+        errors: [
+          { probeId: 'status', path: '/api/status', code: 'http_status', status: 404, message: 'platform detection probe returned HTTP 404', observedAt: now - 39 * MINUTE },
+          { probeId: 'sub2api-public-settings', path: '/api/v1/settings/public', code: 'http_status', status: 404, message: 'platform detection probe returned HTTP 404', observedAt: now - 39 * MINUTE },
+        ],
+      },
+    },
+    siteRuntimeStatus: {
+      1: { siteId: 1, inflightRequests: 7, maxConcurrency: 24, queuedRequests: 2, updatedAt: now - 8_000, throttledUntil: null },
+      2: { siteId: 2, inflightRequests: 3, maxConcurrency: 12, queuedRequests: 0, updatedAt: now - 8_000, throttledUntil: null },
+      3: { siteId: 3, inflightRequests: 1, maxConcurrency: 8, queuedRequests: 0, updatedAt: now - 8_000, throttledUntil: null },
+    },
+    tokenImportPreviews: {},
     priceCatalogs: [priceCatalog],
     catalogState: { active_version: priceCatalog.version, revision: 1, updated_at: new Date(now - 24 * 60 * MINUTE).toISOString() },
     monitorSnapshot: { items: monitorItems },
-    monitorHistories: Object.fromEntries(monitorItems.flatMap((model) => model.targets.map((item) => [`${model.publishedModelId}:${item.providerModelTargetId}`, { publishedModelId: model.publishedModelId, publicModel: model.publicModel, target: { publishedModelTargetId: item.publishedModelTargetId, providerModelTargetId: item.providerModelTargetId, position: item.position, siteId: item.siteId, siteName: item.siteName, endpointId: item.endpointId, endpointName: item.endpointName, sourceModel: item.sourceModel, wireProtocol: item.wireProtocol, apiSurface: item.apiSurface }, status: item.status, successes: item.successes, failures: item.failures, skipped: item.skipped, total: item.statusBar.length, attempted: item.successes + item.failures, successBasisPoints: item.successBasisPoints, health: item.health, order: 'oldest_first' as const, items: item.statusBar }]))),
+    monitorHistories: Object.fromEntries(monitorItems.flatMap((model) => model.targets.map((item) => [`${model.publishedModelId}:${item.providerModelTargetId}`, { publishedModelId: model.publishedModelId, publicModel: model.publicModel, target: { publishedModelTargetId: item.publishedModelTargetId, providerModelTargetId: item.providerModelTargetId, position: item.position, siteId: item.siteId, siteName: item.siteName, endpointId: item.endpointId, endpointName: item.endpointName, sourceModel: item.sourceModel, wireProtocol: item.wireProtocol, apiSurface: item.apiSurface }, status: item.status, successes: item.successes, failures: item.failures, skipped: item.skipped, total: item.statusBar.length, attempted: item.successes + item.failures, successBasisPoints: item.successBasisPoints, health: item.health, order: 'oldest_first' as const, items: item.statusBar, circuitTransitions: item.providerModelTargetId === 1001 ? [
+      { id: 'circuit-1001-1', fromPhase: 'closed', toPhase: 'suspect', trigger: 'live_traffic' as const, reason: 'first_failure', failureKind: 'upstream_unavailable', requestId: 'req_01J7ERROR', occurredAt: now - 47 * MINUTE },
+      { id: 'circuit-1001-2', fromPhase: 'suspect', toPhase: 'closed', trigger: 'probe' as const, reason: 'probe_recovered', failureKind: '', requestId: '', occurredAt: now - 42 * MINUTE },
+    ] : [] }]))),
     routingHealth: Object.fromEntries(modelTargets.map((modelTarget) => {
       const monitored = monitorItems.flatMap((model) => model.targets).find((item) => item.providerModelTargetId === modelTarget.id);
       return [modelTarget.id, monitored?.health ? structuredClone(monitored.health) : { phase: 'closed', capability: 'available', consecutiveFailures: 0, failureWindowStartedAt: null, lastFailureAt: null, lastSuccessAt: null, cooldownUntil: null, halfOpenLeaseUntil: null, lastEventAt: null, lastFailureKind: '', providerTargetRevision: modelTarget.revision, stateVersion: 1, updatedAt: now }];
     })),
     requestLogs,
-    settings: { failureThreshold: 2, failureWindowMs: 60_000, cooldownMs: 5 * MINUTE, probeIntervalMs: 5 * MINUTE, firstOutputTimeoutMs: 20_000, streamIdleTimeoutMs: 45_000, requestTimeoutMs: 120_000, maxAttempts: 3, logRetentionDays: 30, revision: 3 },
+    settings: { failureThreshold: 2, failureWindowMs: 5 * MINUTE, cooldownMs: 15 * MINUTE, probeIntervalMs: 15 * MINUTE, firstOutputTimeoutMs: 15_000, streamIdleTimeoutMs: 45_000, requestTimeoutMs: 120_000, maxAttempts: 3, logRetentionDays: 30, revision: 3 },
+    systemHealth: {
+      runtime: { processStartedAt: now - 9 * 60 * MINUTE, snapshotAt: now - 8_000, configRevision: 3, configLoadedAt: now - 42 * MINUTE, activePriceCatalogVersion: priceCatalog.version, inflightRequests: 11, maxConcurrency: 64, queuedRequests: 2, meteringMode: 'degraded' },
+      meteringWarnings: [{ code: 'usage_missing_cache_write', severity: 'warning', title: '部分上游未返回完整缓存计量', message: '最近 24 小时有 14 个请求缺少 cache_write 明细，账单仍按可用 Token 字段结算并标记为降级。', affectedRequests: 14, since: now - 6 * 60 * MINUTE, lastSeenAt: now - 8 * MINUTE }],
+      backgroundTasks: [
+        { id: 'monitor-probes', label: '模型自动探针', state: 'healthy', schedule: '每 5 分钟', lastStartedAt: now - 2 * MINUTE - 620, lastFinishedAt: now - 2 * MINUTE, nextRunAt: now + 3 * MINUTE, lastDurationMs: 620, lastErrorCode: '' },
+        { id: 'usage-sync', label: '站点用量同步', state: 'delayed', schedule: '每 10 分钟', lastStartedAt: now - 16 * MINUTE, lastFinishedAt: now - 15 * MINUTE, nextRunAt: now - 5 * MINUTE, lastDurationMs: 48_200, lastErrorCode: 'upstream_rate_limited' },
+        { id: 'log-retention', label: '日志保留清理', state: 'healthy', schedule: '每天 03:20', lastStartedAt: now - 11 * 60 * MINUTE, lastFinishedAt: now - 11 * 60 * MINUTE + 12_400, nextRunAt: now + 13 * 60 * MINUTE, lastDurationMs: 12_400, lastErrorCode: '' },
+      ],
+      configHistory: [
+        { id: 'cfg-3', revision: 3, actor: 'admin', summary: '调整探针和请求超时策略', changedFields: ['probeIntervalMs', 'firstOutputTimeoutMs', 'requestTimeoutMs'], status: 'applied', createdAt: now - 42 * MINUTE },
+        { id: 'cfg-2', revision: 2, actor: 'admin', summary: '更新故障冷却窗口', changedFields: ['failureWindowMs', 'cooldownMs'], status: 'superseded', createdAt: now - 2 * 24 * 60 * MINUTE },
+        { id: 'cfg-1', revision: 1, actor: 'bootstrap', summary: '初始化网关运行配置', changedFields: ['*'], status: 'superseded', createdAt: now - 40 * 24 * 60 * MINUTE },
+      ],
+    },
     nextIds: { site: 4, endpoint: 41, credential: 411, providerModel: 4001, profile: 3, publishedModel: 504, downstreamKey: 3, balance: 10, usage: 20, attempt: 100, ledger: 100 },
     failNextTargetIds: [],
   };

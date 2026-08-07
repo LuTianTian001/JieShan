@@ -237,6 +237,81 @@ func TestAdminMiddlewareAndLogoutRequireOriginAndBoundCSRF(t *testing.T) {
 	}
 }
 
+func TestPasswordChangeValidatesInputAndRevokesOtherSessions(t *testing.T) {
+	ctx := context.Background()
+	storage, err := vnextstore.Open(ctx, filepath.Join(t.TempDir(), "password-change.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	clock := &mutableClock{now: time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)}
+	service, _, err := adminauth.NewService(ctx, storage, testOptions(clock, testPassword))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, _ := adminauth.NewHandler(service)
+	currentLogin := loginRequest(t, handler, "http://panel.example", testPassword, "192.0.2.10:1000")
+	otherLogin := loginRequest(t, handler, "http://panel.example", testPassword, "192.0.2.11:1000")
+	currentCookies := authCookies(t, currentLogin)
+	otherCookies := authCookies(t, otherLogin)
+	csrf := currentCookies[adminauth.CSRFCookieName].Value
+	newPassword := "replacement administrator password"
+
+	missingCSRF := passwordRequest(t, handler, currentCookies, "", testPassword, newPassword, newPassword)
+	wrongCurrent := passwordRequest(t, handler, currentCookies, csrf, "wrong current password", newPassword, newPassword)
+	mismatch := passwordRequest(t, handler, currentCookies, csrf, testPassword, newPassword, "different confirmation value")
+	tooShort := passwordRequest(t, handler, currentCookies, csrf, testPassword, "short", "short")
+	unchanged := passwordRequest(t, handler, currentCookies, csrf, testPassword, testPassword, testPassword)
+	if missingCSRF.Code != http.StatusForbidden || wrongCurrent.Code != http.StatusUnauthorized ||
+		mismatch.Code != http.StatusBadRequest || tooShort.Code != http.StatusBadRequest || unchanged.Code != http.StatusBadRequest {
+		t.Fatalf("password validation statuses csrf=%d current=%d confirmation=%d short=%d unchanged=%d",
+			missingCSRF.Code, wrongCurrent.Code, mismatch.Code, tooShort.Code, unchanged.Code)
+	}
+	if jsonErrorCode(t, wrongCurrent) != "invalid_current_password" ||
+		jsonErrorCode(t, mismatch) != "password_confirmation_mismatch" ||
+		jsonErrorCode(t, tooShort) != "password_too_short" || jsonErrorCode(t, unchanged) != "password_unchanged" {
+		t.Fatal("password validation returned an unexpected error contract")
+	}
+
+	changed := passwordRequest(t, handler, currentCookies, csrf, testPassword, newPassword, newPassword)
+	if changed.Code != http.StatusNoContent || changed.Body.Len() != 0 {
+		t.Fatalf("password change status=%d body=%s", changed.Code, changed.Body.String())
+	}
+	staleCreatedAt := clock.now.UnixMilli()
+	staleSession := adminauth.Session{
+		TokenHash: sha256.Sum256([]byte("stale-session-token")), AdminUserID: 1, AdminUsername: adminauth.AdminUsername,
+		CSRFHash: sha256.Sum256([]byte("stale-csrf-token")), CreatedAt: staleCreatedAt,
+		LastSeenAt: staleCreatedAt, ExpiresAt: clock.now.Add(time.Hour).UnixMilli(),
+	}
+	if err := storage.CreateAdminSession(ctx, staleSession, 1); !errors.Is(err, adminauth.ErrAdminRevisionConflict) {
+		t.Fatalf("stale credential session error = %v", err)
+	}
+	var sessionCount int
+	if err := storage.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM admin_sessions`).Scan(&sessionCount); err != nil || sessionCount != 1 {
+		t.Fatalf("session count after password change=%d err=%v", sessionCount, err)
+	}
+	currentStatus := authRequest(handler, http.MethodGet, "http://panel.example/api/vnext/auth/status", nil, "", currentCookies, "")
+	otherStatus := authRequest(handler, http.MethodGet, "http://panel.example/api/vnext/auth/status", nil, "", otherCookies, "")
+	if currentStatus.Code != http.StatusOK || !jsonBool(t, currentStatus, "authenticated") ||
+		otherStatus.Code != http.StatusOK || jsonBool(t, otherStatus, "authenticated") {
+		t.Fatalf("post-change sessions current=%s other=%s", currentStatus.Body.String(), otherStatus.Body.String())
+	}
+
+	oldLogin := loginRequest(t, handler, "http://panel.example", testPassword, "192.0.2.12:1000")
+	newLogin := loginRequest(t, handler, "http://panel.example", newPassword, "192.0.2.13:1000")
+	if oldLogin.Code != http.StatusUnauthorized || newLogin.Code != http.StatusOK {
+		t.Fatalf("post-change login statuses old=%d new=%d", oldLogin.Code, newLogin.Code)
+	}
+	var passwordHash string
+	var revision int64
+	if err := storage.DB.QueryRowContext(ctx, `SELECT password_hash,revision FROM admin_users WHERE id=1`).Scan(&passwordHash, &revision); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(passwordHash, newPassword) || !strings.HasPrefix(passwordHash, "$argon2id$") || revision != 2 {
+		t.Fatal("changed administrator credential was not stored as the expected versioned Argon2id verifier")
+	}
+}
+
 func TestExpiredSessionIsRejectedDeletedAndCookiesCleared(t *testing.T) {
 	ctx := context.Background()
 	storage, err := vnextstore.Open(ctx, filepath.Join(t.TempDir(), "expired.db"))
@@ -370,6 +445,38 @@ func authRequest(handler http.Handler, method, target string, body []byte, origi
 	return response
 }
 
+func passwordRequest(
+	t *testing.T,
+	handler http.Handler,
+	cookies map[string]*http.Cookie,
+	csrf string,
+	currentPassword string,
+	newPassword string,
+	confirmPassword string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{
+		"currentPassword": currentPassword,
+		"newPassword":     newPassword,
+		"confirmPassword": confirmPassword,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://panel.example/api/vnext/auth/password", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", "http://panel.example")
+	if csrf != "" {
+		request.Header.Set(adminauth.CSRFHeaderName, csrf)
+	}
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
 func authCookies(t *testing.T, response *httptest.ResponseRecorder) map[string]*http.Cookie {
 	t.Helper()
 	result := make(map[string]*http.Cookie)
@@ -394,4 +501,17 @@ func jsonBool(t *testing.T, response *httptest.ResponseRecorder, key string) boo
 		t.Fatalf("response %q missing bool %s", response.Body.String(), key)
 	}
 	return value
+}
+
+func jsonErrorCode(t *testing.T, response *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	return body.Error.Code
 }

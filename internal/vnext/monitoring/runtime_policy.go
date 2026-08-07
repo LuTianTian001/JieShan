@@ -10,8 +10,9 @@ import (
 // A scheduler samples it once per target probe so permit acquisition and the
 // resulting health event use one coherent failure policy.
 type RuntimePolicy struct {
-	HealthPolicy  routing.HealthPolicy
-	ProbeInterval time.Duration
+	HealthPolicy       routing.HealthPolicy
+	ProbeInterval      time.Duration
+	FirstOutputTimeout time.Duration
 }
 
 type RuntimePolicyProvider interface {
@@ -42,6 +43,9 @@ func normalizeRuntimePolicy(policy RuntimePolicy) RuntimePolicy {
 	}
 	if policy.ProbeInterval <= 0 {
 		policy.ProbeInterval = DefaultProbeInterval
+	}
+	if policy.FirstOutputTimeout <= 0 {
+		policy.FirstOutputTimeout = 15 * time.Second
 	}
 	return policy
 }

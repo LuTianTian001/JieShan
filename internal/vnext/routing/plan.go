@@ -159,6 +159,25 @@ func (cursor *Cursor) First() (Candidate, bool) {
 	return cursor.moveToTarget(0)
 }
 
+// RemainingTargets returns the current eligible target followed by later
+// eligible targets in strict plan order. Each target appears once, with the
+// credential the cursor would use if that target were selected now.
+func (cursor *Cursor) RemainingTargets() []Candidate {
+	if cursor == nil || cursor.stopped || !cursor.hasCurrent {
+		return nil
+	}
+	probe := *cursor
+	result := make([]Candidate, 0, len(probe.targets)-probe.targetIndex)
+	result = append(result, probe.current)
+	for {
+		candidate, ok := probe.SkipTarget()
+		if !ok {
+			return result
+		}
+		result = append(result, candidate)
+	}
+}
+
 // Advance applies only request-level retry semantics. Target health mutation
 // is deliberately separate and only applies when Disposition penalizes the
 // target.

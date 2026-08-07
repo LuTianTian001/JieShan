@@ -77,8 +77,6 @@ type EndpointMetadata struct {
 
 type Resolution struct {
 	DownstreamKeyID        int64
-	DownstreamKeyRevision  int64
-	DownstreamKeyRPMLimit  int
 	PublishedModelID       int64
 	PublishedModelRevision int64
 	RoutingProfileID       int64
@@ -143,8 +141,7 @@ func (resolver *Resolver) Resolve(
 		health[routing.TargetID(targetID)] = state
 	}
 	return Resolution{
-		DownstreamKeyID: key.ID, DownstreamKeyRevision: key.Revision,
-		DownstreamKeyRPMLimit: key.RPMLimit, PublishedModelID: route.PublishedModelID,
+		DownstreamKeyID: key.ID, PublishedModelID: route.PublishedModelID,
 		PublishedModelRevision: route.PublishedModelRevision,
 		RoutingProfileID:       route.RoutingProfileID, RoutingProfileName: route.RoutingProfileName,
 		SourceProfileID: route.SourceProfileID, SourceProfileName: route.SourceProfileName,

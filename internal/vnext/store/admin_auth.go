@@ -51,16 +51,68 @@ FROM admin_users WHERE username=? COLLATE NOCASE`, adminauth.AdminUsername))
 	return admin, affected == 1, nil
 }
 
-func (s *Store) CreateAdminSession(ctx context.Context, input adminauth.Session) error {
+func (s *Store) CreateAdminSession(ctx context.Context, input adminauth.Session, expectedAdminRevision int64) error {
 	if err := validateAdminSession(input); err != nil {
 		return err
 	}
-	_, err := s.DB.ExecContext(ctx, `
+	if expectedAdminRevision <= 0 {
+		return errors.New("administrator revision is required")
+	}
+	result, err := s.DB.ExecContext(ctx, `
 INSERT INTO admin_sessions(token_hash,admin_user_id,csrf_hash,expires_at,last_seen_at,created_at)
-VALUES (?,?,?,?,?,?)`,
+SELECT ?,?,?,?,?,? FROM admin_users WHERE id=? AND revision=?`,
 		input.TokenHash[:], input.AdminUserID, input.CSRFHash[:], input.ExpiresAt, input.LastSeenAt, input.CreatedAt,
+		input.AdminUserID, expectedAdminRevision,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return adminauth.ErrAdminRevisionConflict
+	}
+	return nil
+}
+
+func (s *Store) ChangeAdminPassword(
+	ctx context.Context,
+	adminUserID int64,
+	expectedRevision int64,
+	passwordHash string,
+	changedAt int64,
+	retainedSession [32]byte,
+) error {
+	if adminUserID != 1 || expectedRevision <= 0 || changedAt <= 0 ||
+		!strings.HasPrefix(passwordHash, "$argon2id$") || len(passwordHash) > 512 {
+		return errors.New("administrator password change is invalid")
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
+UPDATE admin_users
+SET password_hash=?,password_changed_at=?,revision=revision+1,updated_at=?
+WHERE id=? AND revision=?`, passwordHash, changedAt, changedAt, adminUserID, expectedRevision)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return adminauth.ErrAdminRevisionConflict
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM admin_sessions WHERE admin_user_id=? AND token_hash<>?`, adminUserID, retainedSession[:]); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) GetAdminSession(ctx context.Context, tokenHash [32]byte) (adminauth.Session, error) {

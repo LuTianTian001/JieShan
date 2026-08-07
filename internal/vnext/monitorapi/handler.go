@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/LuTianTian001/JieShan/internal/vnext/monitoring"
+	"github.com/LuTianTian001/JieShan/internal/vnext/routing"
 	vnextstore "github.com/LuTianTian001/JieShan/internal/vnext/store"
 )
 
@@ -43,6 +44,16 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 			return
 		}
 		handler.probeModel(writer, request, publishedModelID)
+	case len(segments) == 5 && segments[2] == "targets" && segments[4] == "probe":
+		targetID, valid := positiveID(writer, segments[3], "provider model target")
+		if !valid {
+			return
+		}
+		if request.Method != http.MethodPost {
+			methodNotAllowed(writer, http.MethodPost)
+			return
+		}
+		handler.probeTarget(writer, request, publishedModelID, targetID)
 	case len(segments) == 5 && segments[2] == "targets" && segments[4] == "history":
 		targetID, valid := positiveID(writer, segments[3], "provider model target")
 		if !valid {
@@ -212,16 +223,61 @@ func (handler *Handler) probeModel(writer http.ResponseWriter, request *http.Req
 	}
 	run, err := handler.prober.ProbeModel(request.Context(), publishedModelID)
 	if err != nil {
-		switch {
-		case errors.Is(err, monitoring.ErrProbeInProgress), errors.Is(err, vnextstore.ErrModelMonitorBusy):
-			writeError(writer, http.StatusConflict, "monitor_busy", "a probe for this model is already in progress")
-		case errors.Is(err, vnextstore.ErrModelMonitorNotFound), errors.Is(err, vnextstore.ErrModelMonitorLeaseLost):
-			writeError(writer, http.StatusConflict, "monitor_disabled", "the selected model monitor is disabled")
-		default:
-			writeError(writer, http.StatusInternalServerError, "probe_failed", "the model probe could not be completed")
-		}
+		handler.writeProbeError(writer, err)
 		return
 	}
+	handler.writeProbeRun(writer, run, view)
+}
+
+func (handler *Handler) probeTarget(
+	writer http.ResponseWriter,
+	request *http.Request,
+	publishedModelID, targetID int64,
+) {
+	view, err := handler.selectedModel(request, publishedModelID)
+	if err != nil {
+		writeRepositoryError(writer, err, "selected")
+		return
+	}
+	target, exists := findTarget(view.Targets, targetID)
+	if !exists {
+		writeError(writer, http.StatusNotFound, "monitor_target_not_found", "target is not part of this published model")
+		return
+	}
+	if !view.Setting.Enabled || !view.PublishedModelEnabled || !targetConfiguredEnabled(target) {
+		writeError(writer, http.StatusConflict, "monitor_disabled", "the selected upstream target is not enabled for probing")
+		return
+	}
+	if handler.target == nil {
+		writeError(writer, http.StatusServiceUnavailable, "probe_unavailable", "target probe execution is not installed")
+		return
+	}
+	run, err := handler.target.ProbeTarget(request.Context(), publishedModelID, targetID)
+	if err != nil {
+		handler.writeProbeError(writer, err)
+		return
+	}
+	handler.writeProbeRun(writer, run, view)
+}
+
+func (handler *Handler) writeProbeError(writer http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, monitoring.ErrProbeInProgress), errors.Is(err, vnextstore.ErrModelMonitorBusy):
+		writeError(writer, http.StatusConflict, "monitor_busy", "a probe for this model is already in progress")
+	case errors.Is(err, monitoring.ErrProbeTargetMissing):
+		writeError(writer, http.StatusConflict, "monitor_target_unavailable", "the selected upstream target is no longer available")
+	case errors.Is(err, vnextstore.ErrModelMonitorNotFound), errors.Is(err, vnextstore.ErrModelMonitorLeaseLost):
+		writeError(writer, http.StatusConflict, "monitor_disabled", "the selected model monitor is disabled")
+	default:
+		writeError(writer, http.StatusInternalServerError, "probe_failed", "the model probe could not be completed")
+	}
+}
+
+func (handler *Handler) writeProbeRun(
+	writer http.ResponseWriter,
+	run monitoring.ModelRun,
+	view vnextstore.MonitorRouteView,
+) {
 	response := newProbeRunResponse(run, view)
 	if response.FailureCount > 0 && response.SuccessCount == 0 {
 		writeJSON(writer, http.StatusBadGateway, map[string]any{
@@ -255,12 +311,36 @@ func (handler *Handler) targetHistory(
 		writeError(writer, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	results, err := handler.repository.ListModelProbeTargetResults(request.Context(), publishedModelID, targetID, limit)
+	results, err := handler.repository.ListModelProbeTargetResults(
+		request.Context(), publishedModelID, targetID, maxInt(limit, monitorProbeEvidenceLimit),
+	)
 	if err != nil {
 		writeRepositoryError(writer, err, "")
 		return
 	}
-	response, err := newTargetHistoryResponse(view, target, results, handler.now().UTC())
+	currentEvidenceResults := resultsAtRevision(results, target.ProviderModelTargetRevision)
+	currentResults := firstResults(currentEvidenceResults, limit)
+	now := handler.now().UTC()
+	traffic, err := handler.repository.ListMonitorTrafficObservations(
+		request.Context(), target.ProviderModelTargetID, target.ProviderModelTargetRevision,
+		now.Add(-monitorTransitionEvidenceWindow), now, monitorTrafficObservationLimit,
+	)
+	if err != nil {
+		writeRepositoryError(writer, err, "")
+		return
+	}
+	runtimeSettings, err := handler.repository.GetRuntimeSettings(request.Context())
+	if err != nil {
+		writeRepositoryError(writer, err, "")
+		return
+	}
+	policy := routing.DefaultHealthPolicy()
+	policy.FailureThreshold = runtimeSettings.FailureThreshold
+	policy.FailureWindow = runtimeSettings.FailureWindow
+	policy.Cooldown = runtimeSettings.Cooldown
+	response, err := newTargetHistoryResponse(
+		view, target, currentResults, currentEvidenceResults, traffic, policy, now,
+	)
 	if err != nil {
 		writeRepositoryError(writer, err, "")
 		return

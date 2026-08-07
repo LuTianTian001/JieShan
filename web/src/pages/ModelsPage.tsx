@@ -20,7 +20,6 @@ import {
 } from '../components/ui';
 import { api } from '../lib/api';
 import { useResource } from '../lib/hooks';
-import { loadProbePrototypePreferences } from '../lib/probePreferences';
 import type {
   CreateDefaultRouteInput,
   GatewaySettings,
@@ -88,11 +87,7 @@ function ProfileDialog({
   return <Dialog open={open} title={editing ? '重命名路由方案' : '新建路由方案'} description={editing ? '名称只用于管理和分配下游密钥，不改变已有模型顺序。' : '命名方案默认继承全局路由，只需覆盖有差异的模型。'} onClose={onClose} footer={<><Button onClick={onClose}>取消</Button><Button variant="primary" busy={saving} onClick={() => submitForm('profile-form')}>{editing ? '保存名称' : '创建方案'}</Button></>}><form id="profile-form" className="form-stack" onSubmit={submit}><Field label="方案名称" required hint="例如 低延迟、Claude 专线。"><input className="input" value={name} onChange={(event) => { setName(event.target.value); setError(''); }} maxLength={120} autoFocus /></Field>{error && <p className="form-error">{error}</p>}</form></Dialog>;
 }
 
-function routeTargetKey(routingProfileId: number, publishedModelId: number, providerModelTargetId: number): string {
-  return `${routingProfileId}:${publishedModelId}:${providerModelTargetId}`;
-}
-
-type RouteTargetRuntimeState = 'ready' | 'unprobed' | 'attention' | 'cooling' | 'paused' | 'unavailable';
+type RouteTargetRuntimeState = 'ready' | 'unprobed' | 'attention' | 'cooling' | 'unavailable';
 
 function isSlowFirstOutput(target: MonitorTarget | undefined, thresholdMs: number): boolean {
   const firstOutputMs = target?.latest?.firstOutputMs;
@@ -110,10 +105,8 @@ function policyDurationLabel(value: number): string {
 function routeTargetRuntimeState(
   target: ModelTarget | undefined,
   monitor: MonitorTarget | undefined,
-  paused: boolean,
   slowFirstOutputThresholdMs: number,
 ): RouteTargetRuntimeState {
-  if (paused) return 'paused';
   if (isSlowFirstOutput(monitor, slowFirstOutputThresholdMs)) return 'cooling';
   if (!target?.routable || !target.usableCredentialCount || !target.enabled || !target.siteEnabled || !target.endpointEnabled) return 'unavailable';
   const monitorStatus = monitor?.status;
@@ -148,11 +141,8 @@ export function ModelsPage() {
   const [deletingProfile, setDeletingProfile] = useState<RoutingProfile | null>(null);
   const [profileSaving, setProfileSaving] = useState(false);
   const [expandedRouteIds, setExpandedRouteIds] = useState<Set<number>>(() => new Set());
-  const [pausedRouteTargets, setPausedRouteTargets] = useState<Set<string>>(() => new Set());
   const [probingRouteId, setProbingRouteId] = useState<number | null>(null);
-  const [slowFirstOutputThresholdMs] = useState(
-    () => loadProbePrototypePreferences().slowFirstOutputThresholdMs,
-  );
+  const slowFirstOutputThresholdMs = base.data?.settings?.firstOutputTimeoutMs || 15_000;
 
   useEffect(() => {
     const profiles = base.data?.profiles || [];
@@ -194,7 +184,6 @@ export function ModelsPage() {
         const runtimeState = routeTargetRuntimeState(
           item,
           health,
-          pausedRouteTargets.has(routeTargetKey(selectedProfileId, route.publishedModelId, target.providerModelTargetId)),
           slowFirstOutputThresholdMs,
         );
         return routeTargetNeedsAttention(runtimeState);
@@ -204,7 +193,7 @@ export function ModelsPage() {
       if (status === 'attention' && !hasIssue) return false;
       return !normalized || `${route.publicName} ${route.officialPriceSku} ${route.targets.map((item) => `${item.siteName} ${item.sourceModel}`).join(' ')}`.toLowerCase().includes(normalized);
     });
-  }, [catalogById, monitorByModelId, pausedRouteTargets, query, routes.data, selectedProfileId, slowFirstOutputThresholdMs, status]);
+  }, [catalogById, monitorByModelId, query, routes.data, slowFirstOutputThresholdMs, status]);
 
   const selectedProfile = base.data?.profiles.find((profile) => profile.id === selectedProfileId);
   const editorTargets = catalog;
@@ -357,17 +346,6 @@ export function ModelsPage() {
     setEditorOpen(true);
   };
 
-  const toggleTargetPaused = (routingProfileId: number, publishedModelId: number, targetId: number, paused: boolean) => {
-    const key = routeTargetKey(routingProfileId, publishedModelId, targetId);
-    setPausedRouteTargets((current) => {
-      const next = new Set(current);
-      if (paused) next.add(key);
-      else next.delete(key);
-      return next;
-    });
-    toast.show(paused ? '上游已暂停' : '上游已恢复', 'success');
-  };
-
   const probeRoute = async (route: ModelRoute) => {
     if (probingRouteId !== null || !monitorByModelId.has(route.publishedModelId)) return;
     setProbingRouteId(route.publishedModelId);
@@ -410,7 +388,7 @@ export function ModelsPage() {
 
         {base.data.settings && <div className="routing-policy-strip" role="status">
           <RouteIcon size={15} />
-          <span><strong>严格顺序路由</strong> · 请求失败立即尝试下一家 · 仅连续 {base.data.settings.failureThreshold} 次失败后冷却 {policyDurationLabel(base.data.settings.cooldownMs)} · 首字超过 {policyDurationLabel(slowFirstOutputThresholdMs)}单次即冷却</span>
+          <span><strong>严格顺序路由</strong> · 请求失败立即尝试下一家 · 仅连续 {base.data.settings.failureThreshold} 次失败后冷却 {policyDurationLabel(base.data.settings.cooldownMs)} · 首 Token 超过 {policyDurationLabel(slowFirstOutputThresholdMs)}单次即冷却</span>
         </div>}
 
         {!catalog.length && <InlineNotice tone="warning">模型目录为空。请先在“上游站点”中添加 API Key，并获取它支持的模型。</InlineNotice>}
@@ -434,21 +412,18 @@ export function ModelsPage() {
               return routeTargetRuntimeState(
                 item,
                 health,
-                pausedRouteTargets.has(routeTargetKey(selectedProfileId, route.publishedModelId, target.providerModelTargetId)),
                 slowFirstOutputThresholdMs,
               );
             });
             const usable = targetStates.filter(routeTargetIsVerifiedUsable).length;
             const attention = targetStates.filter((state) => state === 'attention').length;
             const cooling = targetStates.filter((state) => state === 'cooling').length;
-            const locallyPaused = targetStates.filter((state) => state === 'paused').length;
             const unavailable = targetStates.filter((state) => state === 'unavailable').length;
             const unprobed = targetStates.filter((state) => state === 'unprobed').length;
             const hasIssue = targetStates.some(routeTargetNeedsAttention);
             const issueSummary = [
               attention ? `${attention} 个观察中` : '',
               cooling ? `${cooling} 个冷却中` : '',
-              locallyPaused ? `${locallyPaused} 个已暂停` : '',
               unavailable ? `${unavailable} 个不可用` : '',
               unprobed ? `${unprobed} 个尚未探测` : '',
             ].filter(Boolean).join(' · ');
@@ -457,7 +432,6 @@ export function ModelsPage() {
             const routeStatusPoints = (monitored?.targets || []).flatMap((target) => target.statusBar).sort((left, right) => left.finishedAt - right.finishedAt).slice(-12);
             const visibleMonitorTargets = monitored?.targets || [];
             const primaryTarget = route.targets[0];
-            const routePausedTargetIds = new Set(route.targets.filter((target) => pausedRouteTargets.has(routeTargetKey(selectedProfileId, route.publishedModelId, target.providerModelTargetId))).map((target) => target.providerModelTargetId));
             return <article className="model-route" key={route.publishedModelId}>
               <header className="model-route-header">
                 <button
@@ -489,13 +463,11 @@ export function ModelsPage() {
                   catalog={catalog}
                   monitorTargets={visibleMonitorTargets}
                   slowFirstOutputThresholdMs={slowFirstOutputThresholdMs}
-                  pausedTargetIds={routePausedTargetIds}
                   saving={reorderingRouteId === route.publishedModelId}
                   readOnly={route.inherited}
                   onReorder={(targetIds) => reorder(route, targetIds)}
-                  onTogglePaused={(targetId, paused) => toggleTargetPaused(selectedProfileId, route.publishedModelId, targetId, paused)}
                 />
-                <footer className="model-route-footer"><RouteIcon size={14} /><span>{route.inherited ? '继承路由不可直接拖动；点击“自定义上游”即可生成本方案的独立顺序。' : `普通失败累计到阈值才冷却；首字超过 ${policyDurationLabel(slowFirstOutputThresholdMs)}则单次冷却。`}</span></footer>
+                <footer className="model-route-footer"><RouteIcon size={14} /><span>{route.inherited ? '继承路由不可直接拖动；点击“自定义上游”即可生成本方案的独立顺序。' : `普通失败累计到阈值才冷却；首 Token 超过 ${policyDurationLabel(slowFirstOutputThresholdMs)}则单次冷却。`}</span></footer>
               </div>}
             </article>;
           })}</div>}

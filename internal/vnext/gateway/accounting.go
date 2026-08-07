@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LuTianTian001/JieShan/internal/vnext/capacity"
 	"github.com/LuTianTian001/JieShan/internal/vnext/pricing"
 	"github.com/LuTianTian001/JieShan/internal/vnext/protocol"
 	"github.com/LuTianTian001/JieShan/internal/vnext/resolver"
@@ -356,6 +357,8 @@ func routeCompletionReason(status string, err error) string {
 		return "request_cancelled"
 	case errors.Is(err, ErrRequestTimeout):
 		return "request_timeout"
+	case errors.Is(err, capacity.ErrUpstreamBusy):
+		return "upstream_busy"
 	case errors.Is(err, ErrNoAvailableUpstream):
 		return "candidates_exhausted"
 	case errors.Is(err, ErrRuntimeUnavailable):
@@ -410,6 +413,8 @@ func settlementErrorCode(err error, attempt *Attempt) string {
 		return "invalid_request"
 	case errors.Is(err, ErrCommittedStreamFailed):
 		return "stream_incomplete"
+	case errors.Is(err, capacity.ErrUpstreamBusy):
+		return capacity.UpstreamBusyCode
 	case errors.Is(err, ErrNoAvailableUpstream):
 		return "no_available_upstream"
 	default:

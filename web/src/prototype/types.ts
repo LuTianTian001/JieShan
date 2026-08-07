@@ -13,7 +13,11 @@ import type {
   SiteAccountConnection,
   SiteCredential,
   SiteEndpoint,
+  SitePlatformDetection,
+  SiteRuntimeStatus,
   SiteUsageRecord,
+  SystemHealthOverview,
+  TokenJsonImportPreview,
 } from '../lib/types';
 
 export interface PrototypeRequestAttempt {
@@ -150,6 +154,9 @@ export interface PrototypeState {
   downstreamSecrets: Record<number, string>;
   siteAccounts: Record<number, SiteAccountConnection>;
   siteUsage: Record<number, SiteUsageRecord[]>;
+  sitePlatformDetections: Record<number, SitePlatformDetection>;
+  siteRuntimeStatus: Record<number, SiteRuntimeStatus>;
+  tokenImportPreviews: Record<string, TokenJsonImportPreview>;
   priceCatalogs: PriceCatalog[];
   catalogState: CatalogState;
   monitorSnapshot: MonitorSnapshot;
@@ -157,6 +164,7 @@ export interface PrototypeState {
   routingHealth: Record<number, RoutingHealth>;
   requestLogs: PrototypeRequestLog[];
   settings: GatewaySettings;
+  systemHealth: SystemHealthOverview;
   nextIds: Record<string, number>;
   failNextTargetIds: number[];
 }

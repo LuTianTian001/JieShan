@@ -50,9 +50,12 @@ func (service *Service) consumeResponse(
 		if decodeErr != nil {
 			decoded = protocol.DecodedError{Code: "error_decode_failed", Class: string(routing.FailureUpstreamTransient)}
 		}
-		failure := failureFromDecoded(decoded, response.Header)
 		attempt.ErrorCode = decoded.Code
 		attempt.ErrorClass = decoded.Class
+		if service.reportConcurrencyThrottle(response.StatusCode, response.Header, body, decoded, metadata.SiteID, attempt) {
+			return &capacityRetryError{}
+		}
+		failure := failureFromDecoded(decoded, response.Header)
 		service.finishFailure(ctx, policy, result.RequestID, metadata, candidate, sequence, failure, attempt)
 		return terminalOrRetry(failure)
 	}

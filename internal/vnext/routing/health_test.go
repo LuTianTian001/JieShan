@@ -35,7 +35,7 @@ func TestHealthTransitionsSuspectOpenHalfOpenClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantCooldown := now.Add(time.Minute + 5*time.Minute)
+	wantCooldown := now.Add(time.Minute + 15*time.Minute)
 	if !result.Counted || state.Phase != CircuitOpen || !state.CooldownUntil.Equal(wantCooldown) {
 		t.Fatalf("second independent failure must open circuit until %s: %+v", wantCooldown, state)
 	}
@@ -81,6 +81,23 @@ func TestFailureOutsideWindowStartsNewSuspectSequence(t *testing.T) {
 	})
 	if state.Phase != CircuitSuspect || state.ConsecutiveFailures != 1 {
 		t.Fatalf("failure outside window must start a new suspect sequence: %+v", state)
+	}
+}
+
+func TestFirstOutputTimeoutOpensCircuitOnFirstIncident(t *testing.T) {
+	policy := DefaultHealthPolicy()
+	now := time.Date(2026, 8, 6, 10, 0, 0, 0, time.UTC)
+	state, _ := NewHealthState(1)
+	state, result, err := ApplyHealthEvent(state, policy, HealthEvent{
+		Revision: 1, Sequence: 1, OccurredAt: now, Outcome: HealthFailure,
+		IncidentID: "slow-first-token", Failure: Failure{Kind: FailureFirstOutputTimeout},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Applied || !result.Counted || state.Phase != CircuitOpen || state.ConsecutiveFailures != 1 ||
+		!state.CooldownUntil.Equal(now.Add(policy.Cooldown)) {
+		t.Fatalf("first-output timeout did not immediately open: result=%+v state=%+v", result, state)
 	}
 }
 

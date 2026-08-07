@@ -307,7 +307,7 @@ INSERT INTO price_catalog_rates(
 		t.Fatalf("historical digest after migration = %q, %v", prepared.Digest, err)
 	}
 	var version int
-	if err := upgraded.DB.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 17 {
+	if err := upgraded.DB.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 21 {
 		t.Fatalf("upgraded migration version = %d, %v", version, err)
 	}
 }
@@ -397,7 +397,7 @@ func TestRuntimePriceServiceBootstrapsBuiltinCatalogExactlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if quote.CatalogVersion != pricing.BuiltinOfficialCatalogVersion || quote.ReservationNanoUSD != 750_000_000 {
+	if quote.CatalogVersion != pricing.BuiltinOfficialCatalogVersion || quote.ReservationNanoUSD != 1_500_000_000 {
 		t.Fatalf("built-in quote = %+v", quote)
 	}
 	if _, err := service.Quote("unknown-model", pricing.Usage{pricing.TokenInput: 1}); !errors.Is(err, pricing.ErrPriceUnavailable) {

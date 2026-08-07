@@ -86,6 +86,43 @@ func TestPricingAPIRequiresPreviewedImportAndExplicitCASActivation(t *testing.T)
 	}
 }
 
+func TestPricingAPIEnsuresBundledCatalogWithoutNetworkOrOperatorOverwrite(t *testing.T) {
+	ctx := context.Background()
+	storage, err := vnextstore.Open(ctx, filepath.Join(t.TempDir(), "pricing-builtin-api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	handler, err := NewStoreHandler(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := pricingRequest(t, handler, http.MethodPost, apiPrefix+"/builtin/ensure", nil, "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("ensure status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result pricing.BuiltinBootstrapResult
+	decodeResponse(t, response, &result)
+	if result.Outcome != pricing.BuiltinOutcomeInstalled || !result.Imported || !result.Activated {
+		t.Fatalf("ensure result = %+v", result)
+	}
+	if result.State.ActiveVersion != pricing.BuiltinOfficialCatalogVersion || response.Header().Get("ETag") == "" {
+		t.Fatalf("ensure state=%+v headers=%v", result.State, response.Header())
+	}
+	repeated := pricingRequest(t, handler, http.MethodPost, apiPrefix+"/builtin/ensure", nil, "")
+	var repeatedResult pricing.BuiltinBootstrapResult
+	decodeResponse(t, repeated, &repeatedResult)
+	if repeated.Code != http.StatusOK || repeatedResult.Outcome != pricing.BuiltinOutcomeAlreadyCurrent || repeatedResult.Imported || repeatedResult.Activated {
+		t.Fatalf("repeated ensure status=%d result=%+v", repeated.Code, repeatedResult)
+	}
+
+	wrongMethod := pricingRequest(t, handler, http.MethodGet, apiPrefix+"/builtin/ensure", nil, "")
+	if wrongMethod.Code != http.StatusMethodNotAllowed || wrongMethod.Header().Get("Allow") != http.MethodPost {
+		t.Fatalf("wrong method status=%d body=%s headers=%v", wrongMethod.Code, wrongMethod.Body.String(), wrongMethod.Header())
+	}
+}
+
 func TestPricingAPIRejectsUnverifiedOrStructurallyUnknownCatalogs(t *testing.T) {
 	ctx := context.Background()
 	storage, err := vnextstore.Open(ctx, filepath.Join(t.TempDir(), "invalid-pricing-api.db"))

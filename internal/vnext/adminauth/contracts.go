@@ -17,8 +17,13 @@ const (
 
 var (
 	ErrAdminNotFound                  = errors.New("VNext administrator not found")
+	ErrAdminRevisionConflict          = errors.New("VNext administrator revision conflict")
 	ErrSessionNotFound                = errors.New("VNext administrator session not found")
 	ErrInvalidCredentials             = errors.New("invalid administrator credentials")
+	ErrPasswordConfirmationMismatch   = errors.New("administrator password confirmation does not match")
+	ErrPasswordUnchanged              = errors.New("new administrator password must differ from the current password")
+	ErrPasswordTooShort               = errors.New("administrator password is too short")
+	ErrPasswordTooLong                = errors.New("administrator password is too long")
 	ErrRateLimited                    = errors.New("administrator login is rate limited")
 	ErrUnauthenticated                = errors.New("administrator session is unauthenticated")
 	ErrRecentReauthenticationRequired = errors.New("recent administrator reauthentication is required")
@@ -49,7 +54,8 @@ type Session struct {
 type Repository interface {
 	GetAdminUser(context.Context, string) (AdminUser, error)
 	EnsureAdminUser(context.Context, AdminUser) (AdminUser, bool, error)
-	CreateAdminSession(context.Context, Session) error
+	CreateAdminSession(context.Context, Session, int64) error
+	ChangeAdminPassword(context.Context, int64, int64, string, int64, [32]byte) error
 	GetAdminSession(context.Context, [32]byte) (Session, error)
 	TouchAdminSession(context.Context, [32]byte, int64) error
 	DeleteAdminSession(context.Context, [32]byte) error

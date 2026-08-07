@@ -14,6 +14,7 @@ import { MonitorPage } from '../pages/MonitorPage';
 import { SettingsPage } from '../pages/SettingsPage';
 import { SiteDetailPage } from '../pages/SiteDetailPage';
 import { SitesPage } from '../pages/SitesPage';
+import { SystemLogsPage } from '../pages/SystemLogsPage';
 
 export function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -66,6 +67,7 @@ export function App() {
             <Route path="monitor" element={<MonitorPage />} />
             <Route path="keys" element={<KeysPage />} />
             <Route path="logs" element={<LogsPage />} />
+            <Route path="system-logs" element={<SystemLogsPage />} />
             <Route path="settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/overview" replace />} />
           </Route>

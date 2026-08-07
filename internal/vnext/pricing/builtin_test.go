@@ -19,12 +19,12 @@ func TestBuiltinOfficialCatalogIsDeterministicAndSourceBacked(t *testing.T) {
 	if first.Version != BuiltinOfficialCatalogVersion || first.Digest != second.Digest {
 		t.Fatalf("built-in catalog identity is not deterministic: %q/%q and %q/%q", first.Version, first.Digest, second.Version, second.Digest)
 	}
-	const expectedDigest = "sha256:25d9ca7aac8c9f56eb8c5c453d081a20bdb40b8b00170b11bb548bb052d5d32f"
+	const expectedDigest = "sha256:2d8e659b387d14e0dd51ff1efe8e90b37c55e35186778958c3041371b16ca845"
 	if first.Digest != expectedDigest {
 		t.Fatalf("built-in catalog changed without a version bump: got %q, want %q", first.Digest, expectedDigest)
 	}
-	if len(first.Entries) != 37 {
-		t.Fatalf("built-in entry count = %d, want 37", len(first.Entries))
+	if len(first.Entries) != 39 {
+		t.Fatalf("built-in entry count = %d, want 39", len(first.Entries))
 	}
 	if first.SourceDigest != evidenceDigest(stringsJoinEvidence()) {
 		t.Fatalf("built-in source digest = %q", first.SourceDigest)
@@ -74,10 +74,12 @@ func TestBuiltinOfficialCatalogChargesKnownModelsAndRejectsUnknown(t *testing.T)
 		usage Usage
 		want  int64
 	}{
-		{sku: "gpt-5.4-mini", usage: Usage{TokenInput: 1_000_000, TokenCacheRead: 1_000_000, TokenOutput: 1_000_000, TokenReasoning: 1_000_000}, want: 9_825_000_000},
+		{sku: "gpt-5.4-mini", usage: Usage{TokenInput: 1_000_000, TokenCacheRead: 1_000_000, TokenOutput: 1_000_000, TokenReasoning: 1_000_000}, want: 15_150_000_000},
+		{sku: "claude-sonnet-5", usage: Usage{TokenInput: 1_000_000, TokenCacheWrite1h: 1_000_000, TokenCacheRead: 1_000_000, TokenReasoning: 1_000_000}, want: 16_200_000_000},
 		{sku: "claude-sonnet-4-6", usage: Usage{TokenInput: 1_000_000, TokenCacheWrite5m: 1_000_000, TokenCacheRead: 1_000_000, TokenOutput: 1_000_000}, want: 22_050_000_000},
+		{sku: "claude-sonnet-4-5-20250929", usage: Usage{TokenInput: 1_000_000, TokenOutput: 1_000_000}, want: 18_000_000_000},
 		{sku: "gemini-3.6-flash", usage: Usage{TokenInput: 1_000_000, TokenCacheRead: 1_000_000, TokenReasoning: 1_000_000}, want: 9_150_000_000},
-		{sku: "deepseek-v4-flash", usage: Usage{TokenInput: 1_000_000, TokenCacheRead: 1_000_000, TokenOutput: 1_000_000}, want: 422_800_000},
+		{sku: "deepseek-v4-flash", usage: Usage{TokenInput: 1_000_000, TokenCacheRead: 1_000_000, TokenReasoning: 1_000_000}, want: 422_800_000},
 		{sku: "grok-4.5", usage: Usage{TokenInput: 200_000, TokenCacheRead: 200_000, TokenOutput: 1_000_000, TokenReasoning: 1_000_000}, want: 24_920_000_000},
 	}
 	for _, test := range tests {
@@ -89,16 +91,16 @@ func TestBuiltinOfficialCatalogChargesKnownModelsAndRejectsUnknown(t *testing.T)
 			t.Fatalf("Charge(%q) = %d, want %d", test.sku, charge.NanoUSD, test.want)
 		}
 	}
-	short, err := book.Quote("gpt-5.6-sol", Usage{TokenInput: 272_000})
-	if err != nil || short.ReservationNanoUSD != 1_360_000_000 {
+	short, err := book.Quote("gpt-5.6-sol", Usage{TokenInput: 271_999})
+	if err != nil || short.ReservationNanoUSD != 1_359_995_000 {
 		t.Fatalf("gpt-5.6-sol short quote = %+v, %v", short, err)
 	}
-	long, err := book.Quote("gpt-5.6-sol", Usage{TokenInput: 272_001, TokenOutput: 1, TokenReasoning: 1})
-	if err != nil || long.ReservationNanoUSD != 2_720_100_000 {
+	long, err := book.Quote("gpt-5.6-sol", Usage{TokenInput: 272_000})
+	if err != nil || long.ReservationNanoUSD != 2_720_000_000 {
 		t.Fatalf("gpt-5.6-sol long quote = %+v, %v", long, err)
 	}
-	cacheWrite, err := book.Quote("gpt-5.6-sol", Usage{TokenCacheWrite: 272_001})
-	if err != nil || cacheWrite.ReservationNanoUSD != 3_400_012_500 {
+	cacheWrite, err := book.Quote("gpt-5.6-sol", Usage{TokenCacheWrite: 272_000})
+	if err != nil || cacheWrite.ReservationNanoUSD != 3_400_000_000 {
 		t.Fatalf("gpt-5.6-sol cache-write quote = %+v, %v", cacheWrite, err)
 	}
 	if _, err := book.Quote("gpt-5.5-pro", Usage{TokenCacheRead: 1}); !errors.Is(err, ErrPriceUnavailable) {
@@ -206,6 +208,16 @@ func TestBuiltinOpenAIFlagshipStandardAndLongContextRates(t *testing.T) {
 			short: map[TokenClass]string{TokenInput: "30.00", TokenOutput: "180.00", TokenReasoning: "180.00"},
 			long:  map[TokenClass]string{TokenInput: "60.00", TokenOutput: "270.00", TokenReasoning: "270.00"},
 		},
+		{
+			sku:   "gpt-5.4-mini",
+			short: map[TokenClass]string{TokenInput: "0.75", TokenCacheRead: "0.075", TokenOutput: "4.50", TokenReasoning: "4.50"},
+			long:  map[TokenClass]string{TokenInput: "1.50", TokenCacheRead: "0.15", TokenOutput: "6.75", TokenReasoning: "6.75"},
+		},
+		{
+			sku:   "gpt-5.4-nano",
+			short: map[TokenClass]string{TokenInput: "0.20", TokenCacheRead: "0.02", TokenOutput: "1.25", TokenReasoning: "1.25"},
+			long:  map[TokenClass]string{TokenInput: "0.40", TokenCacheRead: "0.04", TokenOutput: "1.875", TokenReasoning: "1.875"},
+		},
 	}
 	entries := make(map[string]Entry, len(catalog.Entries))
 	for _, entry := range catalog.Entries {
@@ -213,7 +225,8 @@ func TestBuiltinOpenAIFlagshipStandardAndLongContextRates(t *testing.T) {
 	}
 	for _, test := range tests {
 		entry, ok := entries[test.sku]
-		if !ok || entry.LongContext == nil || entry.LongContext.ThresholdTokens != openAILongContextThreshold {
+		if !ok || entry.LongContext == nil || entry.LongContext.ThresholdTokens != openAILongContextThreshold ||
+			!entry.LongContext.ThresholdInclusive {
 			t.Fatalf("tiered entry %q = %+v", test.sku, entry)
 		}
 		assertNativeRates(t, test.sku+" short", entry.Rates, test.short)
@@ -277,6 +290,9 @@ func TestBuiltinBootstrapUpgradesOnlyAnOlderBundledCatalog(t *testing.T) {
 	if !result.Imported || !result.Activated || result.State.ActiveVersion != BuiltinOfficialCatalogVersion || result.State.Revision != 2 {
 		t.Fatalf("upgrade result = %+v", result)
 	}
+	if result.Outcome != BuiltinOutcomeUpgraded {
+		t.Fatalf("upgrade outcome = %q", result.Outcome)
+	}
 
 	operatorInput := BuiltinOfficialUSDCatalog()
 	operatorInput.Version = "operator-catalog"
@@ -298,6 +314,9 @@ func TestBuiltinBootstrapUpgradesOnlyAnOlderBundledCatalog(t *testing.T) {
 	}
 	if operatorResult.Imported || operatorResult.Activated || operatorResult.State.ActiveVersion != operator.Version || len(operatorRepository.catalogs) != 1 {
 		t.Fatalf("operator catalog was replaced: result=%+v catalogs=%d", operatorResult, len(operatorRepository.catalogs))
+	}
+	if operatorResult.Outcome != BuiltinOutcomeOperatorPreserved {
+		t.Fatalf("operator outcome = %q", operatorResult.Outcome)
 	}
 }
 

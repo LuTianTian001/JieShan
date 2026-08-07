@@ -37,6 +37,18 @@ var hourlyReservationRepairMigrationSQL string
 //go:embed schema/0017_price_threshold_inclusive.sql
 var priceThresholdInclusiveMigrationSQL string
 
+//go:embed schema/0018_runtime_policy_defaults.sql
+var runtimePolicyDefaultsMigrationSQL string
+
+//go:embed schema/0019_config_revisions.sql
+var configRevisionsMigrationSQL string
+
+//go:embed schema/0020_site_capacity.sql
+var siteCapacityMigrationSQL string
+
+//go:embed schema/0021_site_usage_sync_windows.sql
+var siteUsageSyncWindowsMigrationSQL string
+
 var migrations = []migration{
 	{
 		version: 1,
@@ -251,6 +263,8 @@ CREATE TABLE downstream_keys (
   quota_nano_usd INTEGER CHECK (quota_nano_usd IS NULL OR quota_nano_usd >= 0),
   used_nano_usd INTEGER NOT NULL DEFAULT 0 CHECK (used_nano_usd >= 0),
   reserved_nano_usd INTEGER NOT NULL DEFAULT 0 CHECK (reserved_nano_usd >= 0),
+  -- Deprecated migration-history column. Runtime and control contracts do not
+  -- read or write downstream RPM policy.
   rpm_limit INTEGER NOT NULL DEFAULT 0 CHECK (rpm_limit >= 0),
   expires_at INTEGER,
   last_used_at INTEGER,
@@ -471,7 +485,7 @@ CREATE INDEX credential_runtime_state_state_idx ON credential_runtime_state(stat
 CREATE TABLE model_monitor_settings (
   published_model_id INTEGER PRIMARY KEY REFERENCES published_models(id) ON DELETE CASCADE,
   enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
-  interval_ms INTEGER NOT NULL DEFAULT 300000 CHECK (interval_ms > 0),
+  interval_ms INTEGER NOT NULL DEFAULT 900000 CHECK (interval_ms > 0),
   history_limit INTEGER NOT NULL DEFAULT 288 CHECK (history_limit BETWEEN 1 AND 10000),
   next_probe_at INTEGER NOT NULL,
   last_probe_started_at INTEGER,
@@ -867,6 +881,26 @@ CREATE INDEX admin_sessions_user_seen_idx ON admin_sessions(admin_user_id, last_
 		version: 17,
 		name:    "vnext_price_threshold_inclusive_v1",
 		sql:     priceThresholdInclusiveMigrationSQL,
+	},
+	{
+		version: 18,
+		name:    "vnext_runtime_policy_defaults_v1",
+		sql:     runtimePolicyDefaultsMigrationSQL,
+	},
+	{
+		version: 19,
+		name:    "vnext_config_revisions_v1",
+		sql:     configRevisionsMigrationSQL,
+	},
+	{
+		version: 20,
+		name:    "vnext_site_capacity_v1",
+		sql:     siteCapacityMigrationSQL,
+	},
+	{
+		version: 21,
+		name:    "vnext_site_usage_sync_windows_v1",
+		sql:     siteUsageSyncWindowsMigrationSQL,
 	},
 }
 

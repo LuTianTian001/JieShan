@@ -147,7 +147,15 @@ func (handler *Handler) listConnections(w http.ResponseWriter, r *http.Request) 
 	}
 	result := make([]connectionResponse, 0, len(items))
 	for _, item := range items {
-		result = append(result, handler.connectionResponse(item, nil))
+		balance, balanceErr := handler.repository.LatestBalance(r.Context(), item.SiteID)
+		var latest *vnextstore.SiteBalanceSnapshot
+		if balanceErr == nil {
+			latest = &balance
+		} else if !errors.Is(balanceErr, sql.ErrNoRows) {
+			writeRepositoryError(w, balanceErr)
+			return
+		}
+		result = append(result, handler.connectionResponse(item, latest))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": result})
 }

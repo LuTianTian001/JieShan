@@ -77,13 +77,15 @@ func TestOpenComposesAuthenticatedVNextStackAndSPA(t *testing.T) {
 
 	adminHeaders := login(t, runtime, testAdminPassword)
 	for name, path := range map[string]string{
-		"inventory":     InventoryAdminPrefix + "/sites",
-		"routing":       RoutingProfilesAdminPrefix,
-		"site accounts": SiteAccountsAdminPrefix,
-		"pricing":       PricingAdminPrefix + "/state",
-		"request logs":  RequestLogsAdminPrefix,
-		"monitor":       MonitorAdminPrefix,
-		"settings":      SettingsAdminPrefix,
+		"inventory":      InventoryAdminPrefix + "/sites",
+		"routing":        RoutingProfilesAdminPrefix,
+		"site accounts":  SiteAccountsAdminPrefix,
+		"pricing":        PricingAdminPrefix + "/state",
+		"request logs":   RequestLogsAdminPrefix,
+		"system logs":    SystemLogsAdminPrefix,
+		"monitor":        MonitorAdminPrefix,
+		"settings":       SettingsAdminPrefix,
+		"runtime status": SettingsAdminPrefix + "/runtime-overview",
 	} {
 		response := serve(runtime, http.MethodGet, path, nil, adminHeaders)
 		if response.Code != http.StatusOK {
@@ -286,10 +288,10 @@ func TestOpenInjectsMonitorAndOwnsItsLifecycle(t *testing.T) {
 				return nil, errors.New("runtime protocol registry contains an incomplete adapter")
 			}
 		}
-		if dependencies.HealthPolicy.FailureThreshold != 2 || dependencies.HealthPolicy.Cooldown != 5*time.Minute {
+		if dependencies.HealthPolicy.FailureThreshold != 2 || dependencies.HealthPolicy.Cooldown != 15*time.Minute {
 			return nil, errors.New("monitor did not receive normalized gateway health policy")
 		}
-		if snapshot := dependencies.Settings.MonitoringSnapshot(); snapshot.ProbeInterval != 5*time.Minute ||
+		if snapshot := dependencies.Settings.MonitoringSnapshot(); snapshot.ProbeInterval != 15*time.Minute ||
 			snapshot.HealthPolicy.FailureThreshold != 2 {
 			return nil, errors.New("monitor did not receive dynamic runtime settings")
 		}

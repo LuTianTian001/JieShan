@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"reflect"
 	"testing"
@@ -19,13 +20,14 @@ func TestInventoryAdminCRUDUsesCASAndPreservesSecrets(t *testing.T) {
 		t.Fatalf("ListSites() = %#v, %v", sites, err)
 	}
 	updatedSite, err := storage.UpdateSite(ctx, siteID, SiteUpdate{
-		ExpectedRevision: sites[0].Revision, Name: "Relay Main", DashboardURL: "https://relay.example/panel/", Enabled: true,
+		ExpectedRevision: sites[0].Revision, Name: "Relay Main", DashboardURL: "https://relay.example/panel/",
+		Enabled: true, MaxInFlight: 7,
 	})
-	if err != nil || updatedSite.Revision != 2 || updatedSite.DashboardURL != "https://relay.example/panel" {
+	if err != nil || updatedSite.Revision != 2 || updatedSite.DashboardURL != "https://relay.example/panel" || updatedSite.MaxInFlight != 7 {
 		t.Fatalf("UpdateSite() = %#v, %v", updatedSite, err)
 	}
 	if _, err := storage.UpdateSite(ctx, siteID, SiteUpdate{
-		ExpectedRevision: 1, Name: "stale", Enabled: true,
+		ExpectedRevision: 1, Name: "stale", Enabled: true, MaxInFlight: updatedSite.MaxInFlight,
 	}); !errors.Is(err, ErrRevisionConflict) {
 		t.Fatalf("stale UpdateSite() error = %v", err)
 	}
@@ -184,6 +186,155 @@ func TestInventoryAdminImportsCatalogAndPersistsStrictRouteOrder(t *testing.T) {
 	}); !errors.Is(err, ErrRevisionConflict) {
 		t.Fatalf("stale published model update error = %v", err)
 	}
+}
+
+func TestDeleteSiteUsesCASAndRemovesOnlyItsRoutedTargets(t *testing.T) {
+	ctx := context.Background()
+	storage := newTestStore(t)
+	siteA := mustCreateSite(t, storage, "Delete source A")
+	endpointA := mustCreateEndpoint(t, storage, siteA, "A", "https://a.example/v1")
+	credentialA := mustCreateCredential(t, storage, siteA, "key-a")
+	endpointRecordA, err := storage.GetSiteEndpoint(ctx, endpointA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.ReplaceEndpointCredentialBindings(ctx, siteA, endpointA, endpointRecordA.Revision, []int64{credentialA}); err != nil {
+		t.Fatal(err)
+	}
+	targetA := mustCreateProviderTarget(t, storage, siteA, endpointA, "shared-model")
+
+	siteB := mustCreateSite(t, storage, "Delete source B")
+	endpointB := mustCreateEndpoint(t, storage, siteB, "B", "https://b.example/v1")
+	targetB := mustCreateProviderTarget(t, storage, siteB, endpointB, "shared-model")
+
+	model, err := storage.CreatePublishedModel(ctx, PublishedModelWrite{
+		PublicName: "shared-model", OfficialPriceSKU: "shared-model", Enabled: true,
+	}, []int64{targetA, targetB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := storage.CreatePublishedModel(ctx, PublishedModelWrite{
+		PublicName: "orphan-model", OfficialPriceSKU: "orphan-model", Enabled: true,
+	}, []int64{targetA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := storage.CreateRoutingProfile(ctx, "Delete source override")
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, err := storage.CreateRoutingProfileRoute(ctx, profile.ID, profile.Revision, RoutingProfileRouteWrite{
+		PublishedModelID: model.ID,
+		Enabled:          true,
+		TargetIDs:        []int64{model.Targets[0].ID, model.Targets[1].ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileAfterSharedRoute, err := storage.GetRoutingProfile(ctx, profile.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphanRoute, err := storage.CreateRoutingProfileRoute(ctx, profile.ID, profileAfterSharedRoute.Revision, RoutingProfileRouteWrite{
+		PublishedModelID: orphan.ID,
+		Enabled:          true,
+		TargetIDs:        []int64{orphan.Targets[0].ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileBefore, err := storage.GetRoutingProfile(ctx, profile.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultBefore, err := storage.GetDefaultRoutingProfile(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := storage.GetSite(ctx, siteA)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := storage.DeleteSite(ctx, siteA, site.Revision+1); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("stale DeleteSite() error = %v", err)
+	}
+	if _, err := storage.GetSite(ctx, siteA); err != nil {
+		t.Fatalf("stale delete removed site: %v", err)
+	}
+	if err := storage.DeleteSite(ctx, siteA, site.Revision); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := storage.GetSite(ctx, siteA); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted site lookup = %v", err)
+	}
+	for query, args := range map[string][]any{
+		`SELECT 1 FROM site_endpoints WHERE site_id=?`:                 {siteA},
+		`SELECT 1 FROM site_credentials WHERE site_id=?`:               {siteA},
+		`SELECT 1 FROM provider_model_targets WHERE site_id=?`:         {siteA},
+		`SELECT 1 FROM credential_runtime_state WHERE credential_id=?`: {credentialA},
+	} {
+		var exists int
+		if err := storage.DB.QueryRowContext(ctx, query, args...).Scan(&exists); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("cascade query %q error = %v", query, err)
+		}
+	}
+
+	modelAfter, err := storage.GetPublishedModel(ctx, model.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !modelAfter.Enabled || modelAfter.Revision != model.Revision+1 ||
+		!reflect.DeepEqual(publishedTargetProviderIDs(modelAfter.Targets), []int64{targetB}) ||
+		len(modelAfter.Targets) != 1 || modelAfter.Targets[0].Position != 0 {
+		t.Fatalf("shared model after site delete = %+v", modelAfter)
+	}
+	orphanAfter, err := storage.GetPublishedModel(ctx, orphan.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if orphanAfter.Enabled || orphanAfter.Revision != orphan.Revision+1 || len(orphanAfter.Targets) != 0 {
+		t.Fatalf("orphan model after site delete = %+v", orphanAfter)
+	}
+	routeAfter, err := storage.GetRoutingProfileRoute(ctx, profile.ID, model.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routeAfter.Revision != route.Revision+1 ||
+		!reflect.DeepEqual(publishedTargetProviderIDs(routeAfter.Targets), []int64{targetB}) ||
+		len(routeAfter.Targets) != 1 || routeAfter.Targets[0].Position != 0 {
+		t.Fatalf("custom route after site delete = %+v", routeAfter)
+	}
+	orphanRouteAfter, err := storage.GetRoutingProfileRoute(ctx, profile.ID, orphan.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if orphanRouteAfter.Enabled || orphanRouteAfter.Revision != orphanRoute.Revision+1 || len(orphanRouteAfter.Targets) != 0 {
+		t.Fatalf("empty custom route after site delete = %+v", orphanRouteAfter)
+	}
+	profileAfter, err := storage.GetRoutingProfile(ctx, profile.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profileAfter.Revision != profileBefore.Revision+1 {
+		t.Fatalf("custom profile revision = %d, want %d", profileAfter.Revision, profileBefore.Revision+1)
+	}
+	defaultAfter, err := storage.GetDefaultRoutingProfile(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultAfter.Revision != defaultBefore.Revision+1 {
+		t.Fatalf("default profile revision = %d, want %d", defaultAfter.Revision, defaultBefore.Revision+1)
+	}
+	latest, err := storage.LatestConfigRevision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Reason != "site_deleted" {
+		t.Fatalf("latest config revision = %+v", latest)
+	}
+	assertNoForeignKeyViolations(t, storage)
 }
 
 func intPointer(value int) *int {

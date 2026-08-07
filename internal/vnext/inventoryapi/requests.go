@@ -30,6 +30,7 @@ type createSiteRequest struct {
 	Name         optional[string] `json:"name"`
 	DashboardURL optional[string] `json:"dashboardUrl"`
 	Enabled      optional[bool]   `json:"enabled"`
+	MaxInFlight  optional[int]    `json:"maxConcurrency"`
 }
 
 func (body createSiteRequest) validate() (vnextstore.SiteWrite, error) {
@@ -48,17 +49,25 @@ func (body createSiteRequest) validate() (vnextstore.SiteWrite, error) {
 	if err != nil {
 		return vnextstore.SiteWrite{}, err
 	}
-	return vnextstore.SiteWrite{Name: name, DashboardURL: dashboardURL, Enabled: enabled}, nil
+	maxInFlight := vnextstore.DefaultSiteMaxInFlight
+	if body.MaxInFlight.Set {
+		if body.MaxInFlight.Null || body.MaxInFlight.Value <= 0 {
+			return vnextstore.SiteWrite{}, errors.New("maxConcurrency must be a positive integer")
+		}
+		maxInFlight = body.MaxInFlight.Value
+	}
+	return vnextstore.SiteWrite{Name: name, DashboardURL: dashboardURL, Enabled: enabled, MaxInFlight: maxInFlight}, nil
 }
 
 type updateSiteRequest struct {
 	Name         optional[string] `json:"name"`
 	DashboardURL optional[string] `json:"dashboardUrl"`
 	Enabled      optional[bool]   `json:"enabled"`
+	MaxInFlight  optional[int]    `json:"maxConcurrency"`
 }
 
 func (body updateSiteRequest) apply(current vnextstore.Site, revision int64) (vnextstore.SiteUpdate, error) {
-	if !body.Name.Set && !body.DashboardURL.Set && !body.Enabled.Set {
+	if !body.Name.Set && !body.DashboardURL.Set && !body.Enabled.Set && !body.MaxInFlight.Set {
 		return vnextstore.SiteUpdate{}, errors.New("at least one mutable field is required")
 	}
 	result := vnextstore.SiteUpdate{
@@ -66,6 +75,7 @@ func (body updateSiteRequest) apply(current vnextstore.Site, revision int64) (vn
 		Name:             current.Name,
 		DashboardURL:     current.DashboardURL,
 		Enabled:          current.Enabled,
+		MaxInFlight:      current.MaxInFlight,
 	}
 	if body.Name.Set {
 		name, err := requiredName(body.Name, "name")
@@ -90,6 +100,12 @@ func (body updateSiteRequest) apply(current vnextstore.Site, revision int64) (vn
 			return vnextstore.SiteUpdate{}, err
 		}
 		result.Enabled = value
+	}
+	if body.MaxInFlight.Set {
+		if body.MaxInFlight.Null || body.MaxInFlight.Value <= 0 {
+			return vnextstore.SiteUpdate{}, errors.New("maxConcurrency must be a positive integer")
+		}
+		result.MaxInFlight = body.MaxInFlight.Value
 	}
 	return result, nil
 }

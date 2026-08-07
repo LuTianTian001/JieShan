@@ -40,6 +40,8 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case len(segments) == 2 && segments[0] == "builtin" && segments[1] == "ensure":
+		handler.ensureBuiltin(w, r)
 	case len(segments) == 1 && segments[0] == "catalogs":
 		handler.handleCatalogs(w, r)
 	case len(segments) == 2 && segments[0] == "catalogs" && segments[1] == "preview":
@@ -53,6 +55,20 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "Pricing resource was not found.")
 	}
+}
+
+func (handler *Handler) ensureBuiltin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	result, err := handler.service.EnsureBuiltinOfficialCatalog(r.Context())
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeStateETag(w, result.State)
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (handler *Handler) handleCatalogs(w http.ResponseWriter, r *http.Request) {

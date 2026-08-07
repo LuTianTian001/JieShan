@@ -112,6 +112,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 			RequestTimeout:     cfg.RequestTimeout,
 			MaxAttempts:        cfg.MaxAttempts,
 		},
+		ProbeInterval:      cfg.ProbeInterval,
 		CredentialCooldown: cfg.CredentialCooldown,
 		MonitorFactory:     monitorFactory,
 	})

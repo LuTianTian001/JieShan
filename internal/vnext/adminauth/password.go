@@ -8,13 +8,15 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/argon2"
 )
 
 const (
-	minimumPasswordBytes = 12
-	maximumPasswordBytes = 1_024
+	minimumPasswordBytes         = 12
+	maximumPasswordBytes         = 1_024
+	minimumNewPasswordCharacters = 12
 )
 
 type Argon2Params struct {
@@ -53,10 +55,20 @@ func normalizeArgon2Params(input Argon2Params) (Argon2Params, error) {
 
 func validateInitialPassword(password string) error {
 	if len(password) < minimumPasswordBytes {
-		return fmt.Errorf("initial administrator password must contain at least %d bytes", minimumPasswordBytes)
+		return fmt.Errorf("initial administrator password must contain at least %d bytes: %w", minimumPasswordBytes, ErrPasswordTooShort)
 	}
 	if len(password) > maximumPasswordBytes {
-		return fmt.Errorf("initial administrator password exceeds %d bytes", maximumPasswordBytes)
+		return fmt.Errorf("initial administrator password exceeds %d bytes: %w", maximumPasswordBytes, ErrPasswordTooLong)
+	}
+	return nil
+}
+
+func validateNewPassword(password string) error {
+	if utf8.RuneCountInString(password) < minimumNewPasswordCharacters {
+		return ErrPasswordTooShort
+	}
+	if len(password) > maximumPasswordBytes {
+		return ErrPasswordTooLong
 	}
 	return nil
 }

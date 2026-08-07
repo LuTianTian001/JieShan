@@ -238,7 +238,10 @@ func (service *Service) Login(ctx context.Context, username, password, clientKey
 		TokenHash: tokenHash, AdminUserID: admin.ID, AdminUsername: admin.Username, CSRFHash: csrfHash,
 		ExpiresAt: expiresAt.UnixMilli(), LastSeenAt: now.UnixMilli(), CreatedAt: now.UnixMilli(),
 	}
-	if err := service.repository.CreateAdminSession(ctx, session); err != nil {
+	if err := service.repository.CreateAdminSession(ctx, session, admin.Revision); err != nil {
+		if errors.Is(err, ErrAdminRevisionConflict) {
+			return LoginResult{}, ErrInvalidCredentials
+		}
 		return LoginResult{}, fmt.Errorf("create administrator session: %w", err)
 	}
 	service.limiter.success(clientKey)
@@ -246,6 +249,60 @@ func (service *Service) Login(ctx context.Context, username, password, clientKey
 		Principal:    Principal{AdminUserID: admin.ID, Username: admin.Username, ExpiresAt: session.ExpiresAt},
 		SessionToken: sessionToken, CSRFToken: csrfToken, ExpiresAt: expiresAt,
 	}, nil
+}
+
+func (service *Service) ChangePassword(
+	ctx context.Context,
+	authenticated AuthenticatedSession,
+	currentPassword string,
+	newPassword string,
+	confirmation string,
+) error {
+	if service == nil || authenticated.Principal.AdminUserID != 1 || authenticated.Principal.Username != AdminUsername ||
+		authenticated.Session.AdminUserID != 1 || authenticated.Session.AdminUsername != AdminUsername {
+		return ErrUnauthenticated
+	}
+	if subtle.ConstantTimeCompare([]byte(newPassword), []byte(confirmation)) != 1 {
+		return ErrPasswordConfirmationMismatch
+	}
+	if err := validateNewPassword(newPassword); err != nil {
+		return err
+	}
+	admin, err := service.repository.GetAdminUser(ctx, AdminUsername)
+	if err != nil {
+		return fmt.Errorf("read VNext administrator: %w", err)
+	}
+	passwordValid, err := verifyPassword(admin.PasswordHash, currentPassword)
+	if err != nil {
+		return fmt.Errorf("verify VNext administrator password: %w", err)
+	}
+	if !passwordValid {
+		return ErrInvalidCredentials
+	}
+	if subtle.ConstantTimeCompare([]byte(currentPassword), []byte(newPassword)) == 1 {
+		return ErrPasswordUnchanged
+	}
+	service.randomMu.Lock()
+	passwordHash, err := hashPassword(newPassword, service.argon2, service.random)
+	service.randomMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("hash VNext administrator password: %w", err)
+	}
+	changedAt := service.now().UTC().UnixMilli()
+	if changedAt <= admin.PasswordChangedAt {
+		changedAt = admin.PasswordChangedAt + 1
+	}
+	if err := service.repository.ChangeAdminPassword(
+		ctx,
+		admin.ID,
+		admin.Revision,
+		passwordHash,
+		changedAt,
+		authenticated.Session.TokenHash,
+	); err != nil {
+		return fmt.Errorf("change VNext administrator password: %w", err)
+	}
+	return nil
 }
 
 func (service *Service) AuthenticateToken(ctx context.Context, rawToken string) (AuthenticatedSession, error) {

@@ -21,8 +21,11 @@ func TestFreshSchemaIsCanonicalAndHasNoLegacyRoutingSurface(t *testing.T) {
 	if err := s.DB.QueryRowContext(ctx, `SELECT version,name FROM schema_migrations ORDER BY version DESC LIMIT 1`).Scan(&version, &name); err != nil {
 		t.Fatal(err)
 	}
-	if version != 17 || name != "vnext_price_threshold_inclusive_v1" {
+	if version != 21 || name != "vnext_site_usage_sync_windows_v1" {
 		t.Fatalf("migration = %d/%q", version, name)
+	}
+	if _, ok := tableColumns(t, s, "sites")["max_in_flight"]; !ok {
+		t.Fatal("sites missing max_in_flight")
 	}
 	var prefixIndex string
 	if err := s.DB.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='index' AND name='downstream_keys_prefix_idx'`).Scan(&prefixIndex); err != nil {
@@ -37,9 +40,9 @@ func TestFreshSchemaIsCanonicalAndHasNoLegacyRoutingSurface(t *testing.T) {
 		"request_logs", "request_attempts", "request_route_candidates", "quota_ledger", "credential_runtime_state",
 		"downstream_key_hourly_usage",
 		"model_monitor_settings", "model_probe_runs", "model_probe_results",
-		"site_account_connections", "site_balance_snapshots", "site_usage_records",
+		"site_account_connections", "site_balance_snapshots", "site_usage_records", "site_usage_sync_windows",
 		"price_catalogs", "price_catalog_entries", "price_catalog_rates", "price_catalog_long_context_rates", "price_catalog_state",
-		"admin_users", "admin_sessions", "runtime_settings",
+		"admin_users", "admin_sessions", "runtime_settings", "config_revisions", "config_outbox",
 	} {
 		var found string
 		if err := s.DB.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&found); err != nil {
@@ -120,6 +123,8 @@ func TestFreshSchemaIsCanonicalAndHasNoLegacyRoutingSurface(t *testing.T) {
 	}
 
 	columns := tableColumns(t, s, "downstream_keys")
+	// rpm_limit remains only because historical migrations and offline legacy
+	// readers still need a stable compatibility column.
 	for _, required := range []string{"key_digest", "encrypted_secret", "reveal_version", "routing_profile_id", "quota_nano_usd", "hourly_quota_nano_usd", "billing_multiplier_bps", "rpm_limit"} {
 		if _, ok := columns[required]; !ok {
 			t.Fatalf("downstream_keys missing %s", required)
@@ -265,10 +270,18 @@ func TestFreshSchemaIsCanonicalAndHasNoLegacyRoutingSurface(t *testing.T) {
 	for _, required := range []string{
 		"site_id", "adapter_kind", "origin", "secrets_cipher", "cipher_version", "enabled",
 		"last_session_refresh_at", "last_balance_refresh_at", "last_usage_refresh_at",
-		"last_error_operation", "last_error_code", "last_error_at", "revision",
+		"usage_sync_through_at", "last_error_operation", "last_error_code", "last_error_at", "revision",
 	} {
 		if _, ok := accountColumns[required]; !ok {
 			t.Fatalf("site_account_connections missing %s", required)
+		}
+	}
+	syncWindowColumns := tableColumns(t, s, "site_usage_sync_windows")
+	for _, required := range []string{
+		"site_account_connection_id", "site_id", "window_from_at", "window_to_at", "cursor", "created_at", "updated_at",
+	} {
+		if _, ok := syncWindowColumns[required]; !ok {
+			t.Fatalf("site_usage_sync_windows missing %s", required)
 		}
 	}
 	usageColumns := tableColumns(t, s, "site_usage_records")
@@ -558,7 +571,14 @@ SET first_output_timeout_ms=30000,revision=1,updated_at=1234 WHERE singleton_id=
 	if err != nil {
 		t.Fatal(err)
 	}
-	if key.UsedNanoUSD != 120 || key.ReservedNanoUSD != 30 || key.RPMLimit != 0 ||
+	var deprecatedRPMLimit int
+	if err := upgraded.DB.QueryRowContext(ctx, `SELECT rpm_limit FROM downstream_keys WHERE id=?`, keyID).Scan(&deprecatedRPMLimit); err != nil {
+		t.Fatal(err)
+	}
+	if deprecatedRPMLimit != 0 {
+		t.Fatalf("deprecated RPM compatibility value = %d, want 0", deprecatedRPMLimit)
+	}
+	if key.UsedNanoUSD != 120 || key.ReservedNanoUSD != 30 ||
 		key.HourlyQuotaNanoUSD != nil || key.BillingMultiplierBPS != DefaultBillingMultiplierBPS ||
 		key.UsedThisHourNanoUSD != 0 || key.ReservedThisHourNanoUSD != 0 {
 		t.Fatalf("upgraded downstream key = %+v", key)
@@ -740,6 +760,78 @@ FROM runtime_settings WHERE singleton_id=1`).Scan(&timeout, &revision, &updatedA
 			}
 			if timeout != test.wantTimeout || revision != test.revision || updatedAt != test.updatedAt {
 				t.Fatalf("upgraded policy = timeout %d revision %d updatedAt %d", timeout, revision, updatedAt)
+			}
+		})
+	}
+}
+
+func TestRuntimePolicyDefaultMigrationOnlyUpgradesBootstrapPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		revision     int64
+		wantCooldown int64
+		wantProbe    int64
+	}{
+		{name: "bootstrap", revision: 1, wantCooldown: 900_000, wantProbe: 900_000},
+		{name: "administrator saved", revision: 2, wantCooldown: 300_000, wantProbe: 300_000},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "runtime-settings-v17.db")
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=foreign_keys(1)")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx, `CREATE TABLE schema_migrations (
+version INTEGER PRIMARY KEY,
+name TEXT NOT NULL,
+applied_at INTEGER NOT NULL
+)`); err != nil {
+				t.Fatal(err)
+			}
+			for _, item := range migrations[:17] {
+				if _, err := db.ExecContext(ctx, item.sql); err != nil {
+					t.Fatalf("apply historical migration %d: %v", item.version, err)
+				}
+				if _, err := db.ExecContext(ctx,
+					`INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,0)`, item.version, item.name); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := db.ExecContext(ctx, `UPDATE runtime_settings
+SET cooldown_ms=300000,probe_interval_ms=300000,revision=? WHERE singleton_id=1`, test.revision); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx, `INSERT INTO published_models(
+id,public_name,official_price_sku,enabled,revision,created_at,updated_at
+) VALUES (7,'migration-model','migration-model',1,1,0,0)`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx, `INSERT INTO model_monitor_settings(
+published_model_id,enabled,interval_ms,history_limit,next_probe_at,revision,created_at,updated_at
+) VALUES (7,1,300000,24,300000,1,0,0)`); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			upgraded, err := Open(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer upgraded.Close()
+			var cooldown, probe, monitor int64
+			if err := upgraded.DB.QueryRowContext(ctx, `SELECT cooldown_ms,probe_interval_ms
+FROM runtime_settings WHERE singleton_id=1`).Scan(&cooldown, &probe); err != nil {
+				t.Fatal(err)
+			}
+			if err := upgraded.DB.QueryRowContext(ctx, `SELECT interval_ms FROM model_monitor_settings
+WHERE published_model_id=7`).Scan(&monitor); err != nil {
+				t.Fatal(err)
+			}
+			if cooldown != test.wantCooldown || probe != test.wantProbe || monitor != test.wantProbe {
+				t.Fatalf("upgraded policy = cooldown %d probe %d monitor %d", cooldown, probe, monitor)
 			}
 		})
 	}

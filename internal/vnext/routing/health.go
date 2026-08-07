@@ -37,7 +37,7 @@ func DefaultHealthPolicy() HealthPolicy {
 	return HealthPolicy{
 		FailureThreshold: 2,
 		FailureWindow:    5 * time.Minute,
-		Cooldown:         5 * time.Minute,
+		Cooldown:         15 * time.Minute,
 		HalfOpenLease:    30 * time.Second,
 	}
 }
@@ -136,6 +136,7 @@ const (
 	PermitUnsupported   PermitReason = "unsupported"
 	PermitStaleRevision PermitReason = "stale_revision"
 	PermitStaleSequence PermitReason = "stale_sequence"
+	PermitRecentSuccess PermitReason = "recent_live_success"
 )
 
 type Permit struct {
@@ -325,7 +326,11 @@ func ApplyHealthEvent(state HealthState, policy HealthPolicy, event HealthEvent)
 	next.Capability = CapabilityUnknown
 	stampHealthEvent(&next, event.Sequence, eventAt)
 
-	if !wasHalfOpen && next.Phase != CircuitOpen && failures < policy.FailureThreshold {
+	failureThreshold := policy.FailureThreshold
+	if event.Failure.Kind == FailureFirstOutputTimeout {
+		failureThreshold = 1
+	}
+	if !wasHalfOpen && next.Phase != CircuitOpen && failures < failureThreshold {
 		next.Phase = CircuitSuspect
 		next.CooldownUntil = time.Time{}
 		next.HalfOpenLeaseUntil = time.Time{}
@@ -342,8 +347,8 @@ func ApplyHealthEvent(state HealthState, policy HealthPolicy, event HealthEvent)
 		cooldownUntil = next.CooldownUntil
 	}
 	next.Phase = CircuitOpen
-	if next.ConsecutiveFailures < policy.FailureThreshold {
-		next.ConsecutiveFailures = policy.FailureThreshold
+	if next.ConsecutiveFailures < failureThreshold {
+		next.ConsecutiveFailures = failureThreshold
 	}
 	next.CooldownUntil = cooldownUntil
 	next.HalfOpenLeaseUntil = time.Time{}

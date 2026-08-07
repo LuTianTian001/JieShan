@@ -1,6 +1,7 @@
 package monitorapi
 
 import (
+	"fmt"
 	"net/http"
 	"sort"
 	"time"
@@ -10,7 +11,12 @@ import (
 	vnextstore "github.com/LuTianTian001/JieShan/internal/vnext/store"
 )
 
-const matrixStatusBarLimit = 24
+const (
+	matrixStatusBarLimit            = 24
+	monitorProbeEvidenceLimit       = 1000
+	monitorTrafficObservationLimit  = 10_000
+	monitorTransitionEvidenceWindow = 24 * time.Hour
+)
 
 type monitorSettingResponse struct {
 	Enabled             bool   `json:"enabled"`
@@ -41,28 +47,48 @@ type monitorRouteResponse struct {
 }
 
 type monitorTargetResponse struct {
-	PublishedModelTargetID       int64                  `json:"publishedModelTargetId"`
-	PublishedModelTargetRevision int64                  `json:"publishedModelTargetRevision"`
-	ProviderModelTargetID        int64                  `json:"providerModelTargetId"`
-	ProviderModelTargetRevision  int64                  `json:"providerModelTargetRevision"`
-	Position                     int                    `json:"position"`
-	SiteID                       int64                  `json:"siteId"`
-	SiteName                     string                 `json:"siteName"`
-	EndpointID                   int64                  `json:"endpointId"`
-	EndpointName                 string                 `json:"endpointName"`
-	SourceModel                  string                 `json:"sourceModel"`
-	WireProtocol                 string                 `json:"wireProtocol"`
-	APISurface                   string                 `json:"apiSurface"`
-	Enabled                      bool                   `json:"enabled"`
-	UsableCredentialCount        int                    `json:"usableCredentialCount"`
-	Status                       string                 `json:"status"`
-	Successes                    int                    `json:"successes"`
-	Failures                     int                    `json:"failures"`
-	Skipped                      int                    `json:"skipped"`
-	SuccessBasisPoints           int                    `json:"successBasisPoints"`
-	Latest                       *probePointResponse    `json:"latest"`
-	StatusBar                    []probePointResponse   `json:"statusBar"`
-	Health                       *routingHealthResponse `json:"health"`
+	PublishedModelTargetID       int64                   `json:"publishedModelTargetId"`
+	PublishedModelTargetRevision int64                   `json:"publishedModelTargetRevision"`
+	ProviderModelTargetID        int64                   `json:"providerModelTargetId"`
+	ProviderModelTargetRevision  int64                   `json:"providerModelTargetRevision"`
+	Position                     int                     `json:"position"`
+	SiteID                       int64                   `json:"siteId"`
+	SiteName                     string                  `json:"siteName"`
+	EndpointID                   int64                   `json:"endpointId"`
+	EndpointName                 string                  `json:"endpointName"`
+	SourceModel                  string                  `json:"sourceModel"`
+	WireProtocol                 string                  `json:"wireProtocol"`
+	APISurface                   string                  `json:"apiSurface"`
+	Enabled                      bool                    `json:"enabled"`
+	UsableCredentialCount        int                     `json:"usableCredentialCount"`
+	Status                       string                  `json:"status"`
+	Successes                    int                     `json:"successes"`
+	Failures                     int                     `json:"failures"`
+	Skipped                      int                     `json:"skipped"`
+	SuccessBasisPoints           int                     `json:"successBasisPoints"`
+	Latest                       *probePointResponse     `json:"latest"`
+	StatusBar                    []probePointResponse    `json:"statusBar"`
+	Health                       *routingHealthResponse  `json:"health"`
+	Evidence                     monitorEvidenceResponse `json:"evidence"`
+}
+
+type monitorEvidenceResponse struct {
+	LiveTraffic monitorEvidenceSummaryResponse `json:"liveTraffic"`
+	Probe       monitorEvidenceSummaryResponse `json:"probe"`
+}
+
+type monitorEvidenceSummaryResponse struct {
+	Source             string `json:"source"`
+	WindowMS           int64  `json:"windowMs"`
+	Samples            int    `json:"samples"`
+	Successes          int    `json:"successes"`
+	Failures           int    `json:"failures"`
+	Skipped            int    `json:"skipped"`
+	SuccessBasisPoints int    `json:"successBasisPoints"`
+	P50FirstOutputMS   *int64 `json:"p50FirstOutputMs"`
+	P95FirstOutputMS   *int64 `json:"p95FirstOutputMs"`
+	LastObservedAt     *int64 `json:"lastObservedAt"`
+	LastFailureKind    string `json:"lastFailureKind"`
 }
 
 type routingHealthResponse struct {
@@ -101,19 +127,31 @@ type probePointResponse struct {
 }
 
 type targetHistoryResponse struct {
-	PublishedModelID   int64                  `json:"publishedModelId"`
-	PublicModel        string                 `json:"publicModel"`
-	Target             monitorTargetIdentity  `json:"target"`
-	Status             string                 `json:"status"`
-	Successes          int                    `json:"successes"`
-	Failures           int                    `json:"failures"`
-	Skipped            int                    `json:"skipped"`
-	Total              int                    `json:"total"`
-	Attempted          int                    `json:"attempted"`
-	SuccessBasisPoints int                    `json:"successBasisPoints"`
-	Health             *routingHealthResponse `json:"health"`
-	Order              string                 `json:"order"`
-	Items              []probePointResponse   `json:"items"`
+	PublishedModelID   int64                       `json:"publishedModelId"`
+	PublicModel        string                      `json:"publicModel"`
+	Target             monitorTargetIdentity       `json:"target"`
+	Status             string                      `json:"status"`
+	Successes          int                         `json:"successes"`
+	Failures           int                         `json:"failures"`
+	Skipped            int                         `json:"skipped"`
+	Total              int                         `json:"total"`
+	Attempted          int                         `json:"attempted"`
+	SuccessBasisPoints int                         `json:"successBasisPoints"`
+	Health             *routingHealthResponse      `json:"health"`
+	Order              string                      `json:"order"`
+	Items              []probePointResponse        `json:"items"`
+	CircuitTransitions []circuitTransitionResponse `json:"circuitTransitions"`
+}
+
+type circuitTransitionResponse struct {
+	ID          string `json:"id"`
+	FromPhase   string `json:"fromPhase"`
+	ToPhase     string `json:"toPhase"`
+	Trigger     string `json:"trigger"`
+	Reason      string `json:"reason"`
+	FailureKind string `json:"failureKind"`
+	RequestID   string `json:"requestId"`
+	OccurredAt  int64  `json:"occurredAt"`
 }
 
 type monitorTargetIdentity struct {
@@ -190,7 +228,7 @@ func (handler *Handler) newMonitorRouteResponse(
 		PublishedModelRevision: view.PublishedModelRevision, Monitor: newMonitorSettingResponse(view.Setting, now),
 		Targets: make([]monitorTargetResponse, 0, len(view.Targets)),
 	}
-	activeSummaries := make([]monitoring.TargetSummary, 0, len(view.Targets))
+	activeStatuses := make([]string, 0, len(view.Targets))
 	for _, target := range view.Targets {
 		limit := view.Setting.HistoryLimit
 		if limit <= 0 {
@@ -200,23 +238,37 @@ func (handler *Handler) newMonitorRouteResponse(
 			limit = 1000
 		}
 		results, err := handler.repository.ListModelProbeTargetResults(
-			request.Context(), view.Setting.PublishedModelID, target.ProviderModelTargetID, limit,
+			request.Context(), view.Setting.PublishedModelID, target.ProviderModelTargetID,
+			maxInt(limit, monitorProbeEvidenceLimit),
 		)
 		if err != nil {
 			return monitorRouteResponse{}, err
 		}
-		currentResults := resultsAtRevision(results, target.ProviderModelTargetRevision)
+		currentEvidenceResults := resultsAtRevision(results, target.ProviderModelTargetRevision)
+		currentResults := firstResults(currentEvidenceResults, limit)
 		summary, err := summarizeStoreResults(target.ProviderModelTargetID, currentResults)
 		if err != nil {
 			return monitorRouteResponse{}, err
 		}
+		traffic, err := handler.repository.ListMonitorTrafficObservations(
+			request.Context(), target.ProviderModelTargetID, target.ProviderModelTargetRevision,
+			now.Add(-monitoring.LiveTrafficEvidenceWindow), now, monitorTrafficObservationLimit,
+		)
+		if err != nil {
+			return monitorRouteResponse{}, err
+		}
+		evidence, err := newMonitorEvidenceResponse(currentEvidenceResults, traffic, now)
+		if err != nil {
+			return monitorRouteResponse{}, err
+		}
+		targetResponse := newMonitorTargetResponse(target, currentResults, summary, evidence, now)
 		if targetConfiguredEnabled(target) {
-			activeSummaries = append(activeSummaries, summary)
+			activeStatuses = append(activeStatuses, targetResponse.Status)
 			response.Successes += summary.Successes
 			response.Failures += summary.Failures
 			response.Skipped += summary.Skipped
 		}
-		response.Targets = append(response.Targets, newMonitorTargetResponse(target, currentResults, summary, now))
+		response.Targets = append(response.Targets, targetResponse)
 	}
 	attempted := response.Successes + response.Failures
 	if attempted > 0 {
@@ -230,7 +282,7 @@ func (handler *Handler) newMonitorRouteResponse(
 	case !hasEnabledTarget(view.Targets):
 		response.Status = "unavailable"
 	default:
-		response.Status = string(monitoring.SummarizeModel(activeSummaries))
+		response.Status = summarizeMonitorStatuses(activeStatuses)
 	}
 	return response, nil
 }
@@ -249,6 +301,7 @@ func newMonitorTargetResponse(
 	target vnextstore.MonitorTargetView,
 	results []vnextstore.ModelProbeTargetResult,
 	summary monitoring.TargetSummary,
+	evidence monitorEvidenceResponse,
 	now time.Time,
 ) monitorTargetResponse {
 	enabled := targetConfiguredEnabled(target)
@@ -262,7 +315,7 @@ func newMonitorTargetResponse(
 		UsableCredentialCount: target.UsableCredentialCount, Successes: summary.Successes,
 		Failures: summary.Failures, Skipped: summary.Skipped,
 		SuccessBasisPoints: summary.SuccessBasisPoints(), Health: newRoutingHealthResponse(target.Health),
-		StatusBar: make([]probePointResponse, 0),
+		StatusBar: make([]probePointResponse, 0), Evidence: evidence,
 	}
 	chronological := chronologicalResults(results)
 	if len(chronological) > matrixStatusBarLimit {
@@ -275,7 +328,7 @@ func newMonitorTargetResponse(
 		latest := newProbePointResponse(results[0])
 		response.Latest = &latest
 	}
-	response.Status = targetStatus(target, response.Latest, now)
+	response.Status = targetStatus(target, response.Latest, evidence.LiveTraffic, now)
 	return response
 }
 
@@ -283,6 +336,9 @@ func newTargetHistoryResponse(
 	view vnextstore.MonitorRouteView,
 	target vnextstore.MonitorTargetView,
 	results []vnextstore.ModelProbeTargetResult,
+	evidenceResults []vnextstore.ModelProbeTargetResult,
+	traffic []vnextstore.MonitorTrafficObservation,
+	policy routing.HealthPolicy,
 	now time.Time,
 ) (targetHistoryResponse, error) {
 	summary, err := summarizeStoreResults(target.ProviderModelTargetID, results)
@@ -298,6 +354,14 @@ func newTargetHistoryResponse(
 		value := newProbePointResponse(results[0])
 		latest = &value
 	}
+	evidence, err := newMonitorEvidenceResponse(evidenceResults, traffic, now)
+	if err != nil {
+		return targetHistoryResponse{}, err
+	}
+	transitions, err := newCircuitTransitionResponses(target, evidenceResults, traffic, policy, now)
+	if err != nil {
+		return targetHistoryResponse{}, err
+	}
 	return targetHistoryResponse{
 		PublishedModelID: view.Setting.PublishedModelID, PublicModel: view.PublicModel,
 		Target: monitorTargetIdentity{
@@ -306,11 +370,158 @@ func newTargetHistoryResponse(
 			EndpointID: target.EndpointID, EndpointName: target.EndpointName, SourceModel: target.SourceModel,
 			WireProtocol: target.WireProtocol, APISurface: target.Surface,
 		},
-		Status: targetStatus(target, latest, now), Successes: summary.Successes, Failures: summary.Failures,
+		Status: targetStatus(target, latest, evidence.LiveTraffic, now), Successes: summary.Successes, Failures: summary.Failures,
 		Skipped: summary.Skipped, Total: summary.Total, Attempted: summary.Successes + summary.Failures,
 		SuccessBasisPoints: summary.SuccessBasisPoints(), Health: newRoutingHealthResponse(target.Health),
-		Order: "oldest_first", Items: items,
+		Order: "oldest_first", Items: items, CircuitTransitions: transitions,
 	}, nil
+}
+
+func newMonitorEvidenceResponse(
+	probeResults []vnextstore.ModelProbeTargetResult,
+	traffic []vnextstore.MonitorTrafficObservation,
+	now time.Time,
+) (monitorEvidenceResponse, error) {
+	probeObservations := make([]monitoring.EvidenceObservation, 0, len(probeResults))
+	probeBoundary := now.Add(-monitoring.ProbeEvidenceWindow)
+	for _, result := range probeResults {
+		if result.FinishedAt.Before(probeBoundary) || result.FinishedAt.After(now) {
+			continue
+		}
+		probeObservations = append(probeObservations, monitoring.EvidenceObservation{
+			Outcome: monitoring.Outcome(result.Outcome), FailureKind: routing.FailureKind(result.FailureKind),
+			FirstOutputMS: cloneInt64(result.FirstOutputMS), ObservedAt: result.FinishedAt,
+		})
+	}
+	probe, err := monitoring.SummarizeEvidence(
+		monitoring.EvidenceProbe, monitoring.ProbeEvidenceWindow, probeObservations,
+	)
+	if err != nil {
+		return monitorEvidenceResponse{}, err
+	}
+
+	liveObservations := make([]monitoring.EvidenceObservation, 0, len(traffic))
+	liveBoundary := now.Add(-monitoring.LiveTrafficEvidenceWindow)
+	for _, observation := range traffic {
+		if observation.FinishedAt.Before(liveBoundary) || observation.FinishedAt.After(now) {
+			continue
+		}
+		outcome, failureKind, relevant := monitorTrafficOutcome(observation)
+		if !relevant {
+			continue
+		}
+		liveObservations = append(liveObservations, monitoring.EvidenceObservation{
+			Outcome: outcome, FailureKind: failureKind, FirstOutputMS: cloneInt64(observation.FirstOutputMS),
+			ObservedAt: observation.FinishedAt,
+		})
+	}
+	live, err := monitoring.SummarizeEvidence(
+		monitoring.EvidenceLiveTraffic, monitoring.LiveTrafficEvidenceWindow, liveObservations,
+	)
+	if err != nil {
+		return monitorEvidenceResponse{}, err
+	}
+	return monitorEvidenceResponse{
+		LiveTraffic: newMonitorEvidenceSummaryResponse(live),
+		Probe:       newMonitorEvidenceSummaryResponse(probe),
+	}, nil
+}
+
+func newMonitorEvidenceSummaryResponse(summary monitoring.EvidenceSummary) monitorEvidenceSummaryResponse {
+	return monitorEvidenceSummaryResponse{
+		Source: string(summary.Source), WindowMS: summary.Window.Milliseconds(), Samples: summary.Samples,
+		Successes: summary.Successes, Failures: summary.Failures, Skipped: summary.Skipped,
+		SuccessBasisPoints: summary.SuccessBasisPoints,
+		P50FirstOutputMS:   cloneInt64(summary.P50FirstOutputMS), P95FirstOutputMS: cloneInt64(summary.P95FirstOutputMS),
+		LastObservedAt: unixMilliPointer(summary.LastObservedAt), LastFailureKind: string(summary.LastFailureKind),
+	}
+}
+
+func monitorTrafficOutcome(
+	observation vnextstore.MonitorTrafficObservation,
+) (monitoring.Outcome, routing.FailureKind, bool) {
+	if observation.Status == "success" {
+		return monitoring.OutcomeSuccess, "", true
+	}
+	if observation.Status != "failed" {
+		return "", "", false
+	}
+	failureKind := routing.FailureKind(observation.FailureKind)
+	if observation.HTTPStatus != nil && *observation.HTTPStatus == http.StatusTooManyRequests &&
+		(failureKind == "" || failureKind == routing.FailureUnknown) {
+		return monitoring.OutcomeSkipped, "", true
+	}
+	disposition := (routing.Failure{Kind: failureKind}).Disposition()
+	if disposition.Scope != routing.FailureScopeTarget || !disposition.PenalizeTarget {
+		return "", "", false
+	}
+	return monitoring.OutcomeFailure, failureKind, true
+}
+
+func newCircuitTransitionResponses(
+	target vnextstore.MonitorTargetView,
+	probeResults []vnextstore.ModelProbeTargetResult,
+	traffic []vnextstore.MonitorTrafficObservation,
+	policy routing.HealthPolicy,
+	now time.Time,
+) ([]circuitTransitionResponse, error) {
+	boundary := now.Add(-monitorTransitionEvidenceWindow)
+	evidence := make([]routing.HealthEvidence, 0, len(probeResults)+len(traffic))
+	for _, result := range probeResults {
+		if !result.HealthApplied || result.FinishedAt.Before(boundary) || result.FinishedAt.After(now) {
+			continue
+		}
+		outcome := routing.HealthOutcome(result.Outcome)
+		if outcome != routing.HealthSuccess && outcome != routing.HealthFailure {
+			continue
+		}
+		item := routing.HealthEvidence{
+			ID: fmt.Sprintf("probe-%d", result.ID), Source: routing.HealthEvidenceProbe,
+			Revision: routing.Revision(result.ProviderModelTargetRevision), StartedAt: result.StartedAt,
+			OccurredAt: result.FinishedAt, Outcome: outcome,
+		}
+		if outcome == routing.HealthFailure {
+			item.Failure = routing.Failure{Kind: routing.FailureKind(result.FailureKind)}
+			item.IncidentID = fmt.Sprintf("probe:%s:%d", result.RunID, result.ProviderModelTargetID)
+		}
+		evidence = append(evidence, item)
+	}
+	for _, observation := range traffic {
+		if observation.FinishedAt.Before(boundary) || observation.FinishedAt.After(now) {
+			continue
+		}
+		outcome, failureKind, relevant := monitorTrafficOutcome(observation)
+		if !relevant || outcome == monitoring.OutcomeSkipped {
+			continue
+		}
+		item := routing.HealthEvidence{
+			ID: fmt.Sprintf("live-%d", observation.ID), RequestID: observation.RequestID,
+			Source: routing.HealthEvidenceLiveTraffic, Revision: routing.Revision(observation.ProviderModelTargetRevision),
+			StartedAt: observation.StartedAt, OccurredAt: observation.FinishedAt,
+			Outcome: routing.HealthOutcome(outcome),
+		}
+		if outcome == monitoring.OutcomeFailure {
+			item.Failure = routing.Failure{Kind: failureKind}
+			item.IncidentID = fmt.Sprintf("%s:%d", observation.RequestID, observation.AttemptIndex)
+		}
+		evidence = append(evidence, item)
+	}
+	transitions, err := routing.DeriveCircuitTransitions(
+		routing.Revision(target.ProviderModelTargetRevision), policy, evidence,
+	)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]circuitTransitionResponse, 0, len(transitions))
+	for _, transition := range transitions {
+		items = append(items, circuitTransitionResponse{
+			ID: transition.ID, FromPhase: string(transition.FromPhase), ToPhase: string(transition.ToPhase),
+			Trigger: string(transition.Trigger), Reason: transition.Reason,
+			FailureKind: string(transition.FailureKind), RequestID: transition.RequestID,
+			OccurredAt: transition.OccurredAt.UnixMilli(),
+		})
+	}
+	return items, nil
 }
 
 func summarizeStoreResults(targetID int64, results []vnextstore.ModelProbeTargetResult) (monitoring.TargetSummary, error) {
@@ -357,7 +568,12 @@ func newRoutingHealthResponse(snapshot *vnextstore.TargetHealthSnapshot) *routin
 	}
 }
 
-func targetStatus(target vnextstore.MonitorTargetView, latest *probePointResponse, now time.Time) string {
+func targetStatus(
+	target vnextstore.MonitorTargetView,
+	latest *probePointResponse,
+	live monitorEvidenceSummaryResponse,
+	now time.Time,
+) string {
 	if !target.SiteEnabled || !target.EndpointEnabled || !target.ProviderTargetEnabled {
 		return "disabled"
 	}
@@ -379,7 +595,17 @@ func targetStatus(target vnextstore.MonitorTargetView, latest *probePointRespons
 			return "recovering"
 		case routing.CircuitSuspect:
 			return "suspect"
+		case routing.CircuitClosed:
+			if state.Capability == routing.CapabilitySupported {
+				return "healthy"
+			}
 		}
+	}
+	if live.Successes > 0 && live.Failures == 0 {
+		return "healthy"
+	}
+	if live.Failures > 0 && live.Successes == 0 {
+		return "suspect"
 	}
 	if latest == nil {
 		return "unprobed"
@@ -392,6 +618,34 @@ func targetStatus(target vnextstore.MonitorTargetView, latest *probePointRespons
 	default:
 		return "skipped"
 	}
+}
+
+func summarizeMonitorStatuses(statuses []string) string {
+	if len(statuses) == 0 {
+		return string(monitoring.ModelUnprobed)
+	}
+	healthy := 0
+	observed := 0
+	for _, status := range statuses {
+		switch status {
+		case "healthy":
+			healthy++
+			observed++
+		case "unprobed", "skipped":
+		default:
+			observed++
+		}
+	}
+	if healthy == len(statuses) {
+		return string(monitoring.ModelHealthy)
+	}
+	if healthy > 0 {
+		return string(monitoring.ModelDegraded)
+	}
+	if observed == 0 {
+		return string(monitoring.ModelUnprobed)
+	}
+	return string(monitoring.ModelUnavailable)
 }
 
 func newProbeRunResponse(run monitoring.ModelRun, view vnextstore.MonitorRouteView) probeRunResponse {
@@ -497,6 +751,23 @@ func resultsAtRevision(
 		}
 	}
 	return filtered
+}
+
+func firstResults(results []vnextstore.ModelProbeTargetResult, limit int) []vnextstore.ModelProbeTargetResult {
+	if limit < 0 {
+		limit = 0
+	}
+	if len(results) <= limit {
+		return results
+	}
+	return results[:limit]
+}
+
+func maxInt(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func unixMilliPointer(value *time.Time) *int64 {
