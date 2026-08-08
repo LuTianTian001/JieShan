@@ -99,6 +99,15 @@ const attentionStates = new Set<MonitorHealth>([
   'unsupported',
 ]);
 
+const routeReadyStates = new Set<MonitorHealth>(['healthy', 'degraded', 'suspect', 'recovering']);
+
+function targetIsRouteReady(target: MonitorModel['targets'][number], routableProviderTargetIds: Set<number>): boolean {
+  return target.enabled
+    && target.usableCredentialCount > 0
+    && routableProviderTargetIds.has(target.providerModelTargetId)
+    && routeReadyStates.has(target.status);
+}
+
 function effectiveModelHealth(model: MonitorModel): MonitorHealth {
   const states = model.targets.filter((target) => target.enabled).map((target) => target.status);
   if (states.includes('cooling')) return 'cooling';
@@ -137,8 +146,10 @@ export function DashboardPage() {
     const rightHealthy = effectiveModelHealth(right) === 'healthy' ? 1 : 0;
     return leftHealthy - rightHealthy || left.publicModel.localeCompare(right.publicModel);
   });
-  const healthyModels = monitoredModels.filter((model) => effectiveModelHealth(model) === 'healthy').length;
   const monitoredTargets = monitoredModels.flatMap((model) => model.targets).filter((target) => target.enabled);
+  const routableProviderTargetIds = new Set(targets.filter((target) => target.routable).map((target) => target.id));
+  const routableModels = monitoredModels.filter((model) => model.publishedModelEnabled
+    && model.targets.some((target) => targetIsRouteReady(target, routableProviderTargetIds))).length;
   const now = Date.now();
   const coolingTargets = [...new Map(
     monitoredTargets
@@ -176,9 +187,9 @@ export function DashboardPage() {
         <MetricCard
           icon={HeartPulse}
           label="受监控模型"
-          value={monitoredModels.length ? `${healthyModels} / ${monitoredModels.length}` : '-'}
-          detail={monitoredModels.length ? `${monitoredTargets.length} 个上游 Key 正在自动探测` : '尚未选择需要监控的模型'}
-          tone={!monitoredModels.length ? 'neutral' : healthyModels === monitoredModels.length ? 'success' : 'warning'}
+          value={monitor ? monitoredModels.length || '-' : '-'}
+          detail={!monitor ? '监控数据暂不可用' : monitoredModels.length ? `${routableModels} / ${monitoredModels.length} 个模型可路由 · ${monitoredTargets.length} 个上游目标` : '尚未选择需要监控的模型'}
+          tone={!monitor ? 'warning' : !monitoredModels.length ? 'neutral' : routableModels === monitoredModels.length ? 'success' : routableModels ? 'warning' : 'danger'}
         />
         <MetricCard
           icon={TimerReset}
@@ -200,23 +211,27 @@ export function DashboardPage() {
         <Panel className="dashboard-runtime-panel">
           <SectionHeader
             title="模型运行状态"
-            description="只展示已选择监控的模型，每一格代表一个实际上游 Key。"
+            description="只展示已选择监控的模型，每一格代表一个上游模型目标。"
             actions={<Link className="text-link" to="/monitor">管理监控</Link>}
           />
-          {!monitor || orderedModels.length === 0 ? (
+          {!monitor ? (
+            <div className="dashboard-empty"><HeartPulse size={18} /><span>监控数据暂不可用</span><Link to="/monitor">查看详情</Link></div>
+          ) : orderedModels.length === 0 ? (
             <div className="dashboard-empty"><HeartPulse size={18} /><span>还没有选择需要监控的模型</span><Link to="/monitor">去选择</Link></div>
           ) : (
             <div className="dashboard-model-list">
               {orderedModels.slice(0, 6).map((model) => {
                 const activeTargets = model.targets.filter((target) => target.enabled);
-                const normalTargets = activeTargets.filter((target) => target.status === 'healthy').length;
+                const routableTargets = model.publishedModelEnabled
+                  ? activeTargets.filter((target) => targetIsRouteReady(target, routableProviderTargetIds)).length
+                  : 0;
                 const health = effectiveModelHealth(model);
                 return (
                   <Link to="/monitor" className="dashboard-model-row" key={model.publishedModelId}>
                     <span className={`dashboard-model-state ${healthClass(health)}`}><HeartPulse size={16} /></span>
                     <div className="dashboard-model-main">
                       <span><code>{model.publicModel}</code><HealthBadge state={health} /></span>
-                      <small>{normalTargets} / {activeTargets.length} 个上游可用 · {formatRelativeTime(model.monitor.lastProbeFinishedAt)}探测</small>
+                      <small>{routableTargets} / {activeTargets.length} 个上游参与路由 · {formatRelativeTime(model.monitor.lastProbeFinishedAt)}探测</small>
                     </div>
                     <div className="dashboard-target-track" aria-label={`${model.publicModel} 上游状态`}>
                       {activeTargets.map((target) => (
