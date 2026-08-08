@@ -100,6 +100,92 @@ func TestManualTargetProbeRunsOnlySelectedUpstreamAndReleasesMissingTargetClaim(
 	}
 }
 
+func TestManualTargetsProbeDeduplicatesAndPreservesRouteOrder(t *testing.T) {
+	fixture := newSchedulerFixture(t, "selected-targets", 4)
+	executor := &trackingExecutor{run: func(_ context.Context, _ ProbeRequest) (ProbeObservation, error) {
+		return ProbeObservation{Outcome: OutcomeSuccess, HTTPStatus: 200, Latency: 40 * time.Millisecond}, nil
+	}}
+	scheduler := newTestScheduler(t, fixture.storage, executor, Options{MaxConcurrentTargets: 2})
+
+	for _, targetIDs := range [][]int64{nil, {}, {fixture.targetIDs[0], 0}, {-1}} {
+		if _, err := scheduler.ProbeTargets(context.Background(), fixture.routeID, targetIDs); err == nil {
+			t.Fatalf("invalid target IDs %+v unexpectedly succeeded", targetIDs)
+		}
+	}
+	if executor.callCount() != 0 {
+		t.Fatalf("invalid target selection invoked executor %d times", executor.callCount())
+	}
+
+	missing := []int64{fixture.targetIDs[0], 999999}
+	if _, err := scheduler.ProbeTargets(context.Background(), fixture.routeID, missing); !errors.Is(err, ErrProbeTargetMissing) {
+		t.Fatalf("partially missing target error = %v", err)
+	}
+	disabled, err := fixture.storage.GetProviderModelTarget(context.Background(), fixture.targetIDs[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.storage.UpdateProviderModelTarget(
+		context.Background(), disabled.SiteID, disabled.EndpointID, disabled.ID,
+		vnextstore.ProviderModelTargetUpdate{
+			ExpectedRevision: disabled.Revision, SourceModel: disabled.SourceModel,
+			DisplayName: disabled.DisplayName, Enabled: false,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scheduler.ProbeTargets(context.Background(), fixture.routeID, []int64{disabled.ID}); !errors.Is(err, ErrProbeTargetMissing) {
+		t.Fatalf("disabled target error = %v", err)
+	}
+
+	requested := []int64{fixture.targetIDs[3], fixture.targetIDs[1], fixture.targetIDs[3]}
+	run, err := scheduler.ProbeTargets(context.Background(), fixture.routeID, requested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int64{fixture.targetIDs[1], fixture.targetIDs[3]}
+	if run.Run.TargetCount != len(want) || len(run.Results) != len(want) {
+		t.Fatalf("selected-target run = %+v", run)
+	}
+	for index, targetID := range want {
+		if run.Results[index].TargetID != targetID {
+			t.Fatalf("result target order = %+v, want %+v", run.Results, want)
+		}
+	}
+	if executor.callCount() != len(want) {
+		t.Fatalf("executor calls = %d, want %d", executor.callCount(), len(want))
+	}
+}
+
+func TestManualTargetsProbeUsesModelSerializationBoundary(t *testing.T) {
+	fixture := newSchedulerFixture(t, "selected-target-serialization", 3)
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	executor := &trackingExecutor{run: func(ctx context.Context, _ ProbeRequest) (ProbeObservation, error) {
+		started <- struct{}{}
+		select {
+		case <-release:
+			return ProbeObservation{Outcome: OutcomeSuccess, HTTPStatus: 200, Latency: time.Millisecond}, nil
+		case <-ctx.Done():
+			return ProbeObservation{}, ctx.Err()
+		}
+	}}
+	scheduler := newTestScheduler(t, fixture.storage, executor, Options{MaxConcurrentTargets: 1})
+
+	completed := make(chan error, 1)
+	go func() {
+		_, err := scheduler.ProbeTargets(context.Background(), fixture.routeID, fixture.targetIDs[:2])
+		completed <- err
+	}()
+	<-started
+	if _, err := scheduler.ProbeTarget(context.Background(), fixture.routeID, fixture.targetIDs[2]); !errors.Is(err, ErrProbeInProgress) {
+		t.Fatalf("overlapping target probe error = %v", err)
+	}
+	close(release)
+	if err := <-completed; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOrdinaryProbeFailureBecomesSuspectBeforeCooling(t *testing.T) {
 	fixture := newSchedulerFixture(t, "threshold", 1)
 	executor := &trackingExecutor{run: func(context.Context, ProbeRequest) (ProbeObservation, error) {

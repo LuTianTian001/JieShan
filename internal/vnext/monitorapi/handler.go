@@ -44,6 +44,12 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 			return
 		}
 		handler.probeModel(writer, request, publishedModelID)
+	case len(segments) == 4 && segments[2] == "targets" && segments[3] == "probe":
+		if request.Method != http.MethodPost {
+			methodNotAllowed(writer, http.MethodPost)
+			return
+		}
+		handler.probeTargets(writer, request, publishedModelID)
 	case len(segments) == 5 && segments[2] == "targets" && segments[4] == "probe":
 		targetID, valid := positiveID(writer, segments[3], "provider model target")
 		if !valid {
@@ -253,6 +259,71 @@ func (handler *Handler) probeTarget(
 		return
 	}
 	run, err := handler.target.ProbeTarget(request.Context(), publishedModelID, targetID)
+	if err != nil {
+		handler.writeProbeError(writer, err)
+		return
+	}
+	handler.writeProbeRun(writer, run, view)
+}
+
+type targetsProbeRequest struct {
+	ProviderModelTargetIDs []int64 `json:"providerModelTargetIds"`
+}
+
+func (body targetsProbeRequest) targetIDs() ([]int64, error) {
+	if len(body.ProviderModelTargetIDs) == 0 {
+		return nil, errors.New("providerModelTargetIds must contain at least one target ID")
+	}
+	targetIDs := make([]int64, 0, len(body.ProviderModelTargetIDs))
+	seen := make(map[int64]struct{}, len(body.ProviderModelTargetIDs))
+	for _, targetID := range body.ProviderModelTargetIDs {
+		if targetID <= 0 {
+			return nil, errors.New("providerModelTargetIds must contain only positive integers")
+		}
+		if _, exists := seen[targetID]; exists {
+			continue
+		}
+		seen[targetID] = struct{}{}
+		targetIDs = append(targetIDs, targetID)
+	}
+	return targetIDs, nil
+}
+
+func (handler *Handler) probeTargets(writer http.ResponseWriter, request *http.Request, publishedModelID int64) {
+	view, err := handler.selectedModel(request, publishedModelID)
+	if err != nil {
+		writeRepositoryError(writer, err, "selected")
+		return
+	}
+	if !view.Setting.Enabled || !view.PublishedModelEnabled {
+		writeError(writer, http.StatusConflict, "monitor_disabled", "the selected model monitor is disabled")
+		return
+	}
+	var body targetsProbeRequest
+	if !decodeJSON(writer, request, &body) {
+		return
+	}
+	targetIDs, err := body.targetIDs()
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	for _, targetID := range targetIDs {
+		target, exists := findTarget(view.Targets, targetID)
+		if !exists {
+			writeError(writer, http.StatusNotFound, "monitor_target_not_found", "target is not part of this published model")
+			return
+		}
+		if !targetConfiguredEnabled(target) {
+			writeError(writer, http.StatusConflict, "monitor_disabled", "one or more selected upstream targets are not enabled for probing")
+			return
+		}
+	}
+	if handler.targets == nil {
+		writeError(writer, http.StatusServiceUnavailable, "probe_unavailable", "multi-target probe execution is not installed")
+		return
+	}
+	run, err := handler.targets.ProbeTargets(request.Context(), publishedModelID, targetIDs)
 	if err != nil {
 		handler.writeProbeError(writer, err)
 		return

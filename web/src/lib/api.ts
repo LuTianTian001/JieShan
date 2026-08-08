@@ -956,6 +956,13 @@ export const api = {
     );
   },
 
+  async probeTargets(publishedModelId: number, providerModelTargetIds: number[]): Promise<void> {
+    await requestJSON<unknown>(
+      `${MONITOR_PREFIX}/models/${publishedModelId}/targets/probe`,
+      jsonInit('POST', { providerModelTargetIds }),
+    );
+  },
+
   monitorTargetHistory(publishedModelId: number, providerModelTargetId: number, limit = 200): Promise<MonitorTargetHistory> {
     const query = new URLSearchParams({ limit: String(limit) });
     return requestJSON<MonitorTargetHistory>(

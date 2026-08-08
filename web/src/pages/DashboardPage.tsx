@@ -24,6 +24,7 @@ import {
 import { api, ApiUnavailableError } from '../lib/api';
 import { formatDateTime, formatRelativeTime, formatUSDFromNano } from '../lib/format';
 import { useResource } from '../lib/hooks';
+import { groupUpstreamTargets, type UpstreamGroup } from '../lib/upstreamGroups';
 import type {
   CatalogState,
   DownstreamKey,
@@ -108,8 +109,24 @@ function targetIsRouteReady(target: MonitorModel['targets'][number], routablePro
     && routeReadyStates.has(target.status);
 }
 
-function effectiveModelHealth(model: MonitorModel): MonitorHealth {
-  const states = model.targets.filter((target) => target.enabled).map((target) => target.status);
+function targetGroupHealth(
+  group: UpstreamGroup<MonitorModel['targets'][number]>,
+  routableProviderTargetIds: Set<number>,
+): MonitorHealth {
+  const targets = group.targets.filter((target) => target.enabled);
+  if (!targets.length) return 'disabled';
+  const routeReady = targets.filter((target) => targetIsRouteReady(target, routableProviderTargetIds));
+  if (routeReady.length === targets.length && targets.every((target) => target.status === 'healthy')) return 'healthy';
+  if (routeReady.length) return 'degraded';
+  if (targets.some((target) => target.status === 'cooling')) return 'cooling';
+  if (targets.some((target) => target.status === 'unavailable' || target.status === 'no_credentials' || target.status === 'unsupported')) return 'unavailable';
+  if (targets.some((target) => attentionStates.has(target.status))) return 'degraded';
+  return targets[0]?.status || 'unprobed';
+}
+
+function effectiveModelHealth(model: MonitorModel, routableProviderTargetIds: Set<number>): MonitorHealth {
+  const states = groupUpstreamTargets(model.targets.filter((target) => target.enabled))
+    .map((group) => targetGroupHealth(group, routableProviderTargetIds));
   if (states.includes('cooling')) return 'cooling';
   if (states.some((state) => state === 'unavailable' || state === 'no_credentials' || state === 'unsupported')) return 'unavailable';
   if (states.some((state) => attentionStates.has(state))) return 'degraded';
@@ -141,21 +158,21 @@ export function DashboardPage() {
 
   const { sites, targets, keys, accounts, pricing, monitor, summary24h, summaryToday, recentLogs } = resource.data;
   const monitoredModels = (monitor?.items || []).filter((model) => model.monitor.enabled);
+  const routableProviderTargetIds = new Set(targets.filter((target) => target.routable).map((target) => target.id));
   const orderedModels = [...monitoredModels].sort((left, right) => {
-    const leftHealthy = effectiveModelHealth(left) === 'healthy' ? 1 : 0;
-    const rightHealthy = effectiveModelHealth(right) === 'healthy' ? 1 : 0;
+    const leftHealthy = effectiveModelHealth(left, routableProviderTargetIds) === 'healthy' ? 1 : 0;
+    const rightHealthy = effectiveModelHealth(right, routableProviderTargetIds) === 'healthy' ? 1 : 0;
     return leftHealthy - rightHealthy || left.publicModel.localeCompare(right.publicModel);
   });
-  const monitoredTargets = monitoredModels.flatMap((model) => model.targets).filter((target) => target.enabled);
-  const routableProviderTargetIds = new Set(targets.filter((target) => target.routable).map((target) => target.id));
   const routableModels = monitoredModels.filter((model) => model.publishedModelEnabled
-    && model.targets.some((target) => targetIsRouteReady(target, routableProviderTargetIds))).length;
+    && groupUpstreamTargets(model.targets.filter((target) => target.enabled))
+      .some((group) => group.targets.some((target) => targetIsRouteReady(target, routableProviderTargetIds)))).length;
   const now = Date.now();
-  const coolingTargets = [...new Map(
-    monitoredTargets
-      .filter((target) => target.status === 'cooling' || (target.health?.cooldownUntil || 0) > now)
-      .map((target) => [target.providerModelTargetId, target]),
-  ).values()];
+  const monitoredSites = new Set(monitoredModels.flatMap((model) => model.targets.filter((target) => target.enabled).map((target) => target.siteId)));
+  const coolingRouteGroups = monitoredModels.flatMap((model) => groupUpstreamTargets(model.targets.filter((target) => target.enabled))
+    .filter((group) => group.targets.some((target) => target.status === 'cooling' || (target.health?.cooldownUntil || 0) > now))
+    .map((group) => ({ modelId: model.publishedModelId, group })));
+  const coolingSiteCount = new Set(coolingRouteGroups.map(({ group }) => group.siteId)).size;
   const routeEvents = (recentLogs?.items || [])
     .filter((log) => log.switchCount > 0 || !logIsSuccessful(log))
     .sort((left, right) => right.startedAt - left.startedAt)
@@ -188,15 +205,15 @@ export function DashboardPage() {
           icon={HeartPulse}
           label="受监控模型"
           value={monitor ? monitoredModels.length || '-' : '-'}
-          detail={!monitor ? '监控数据暂不可用' : monitoredModels.length ? `${routableModels} / ${monitoredModels.length} 个模型可路由 · ${monitoredTargets.length} 个上游目标` : '尚未选择需要监控的模型'}
+          detail={!monitor ? '监控数据暂不可用' : monitoredModels.length ? `${routableModels} / ${monitoredModels.length} 个模型可路由 · ${monitoredSites.size} 个独立站点` : '尚未选择需要监控的模型'}
           tone={!monitor ? 'warning' : !monitoredModels.length ? 'neutral' : routableModels === monitoredModels.length ? 'success' : routableModels ? 'warning' : 'danger'}
         />
         <MetricCard
           icon={TimerReset}
-          label="冷却中的上游"
-          value={coolingTargets.length}
-          detail={coolingTargets.length ? '冷却期间请求会自动尝试下一家' : '当前没有上游处于冷却'}
-          tone={coolingTargets.length ? 'warning' : 'success'}
+          label="冷却中的站点"
+          value={coolingSiteCount}
+          detail={coolingSiteCount ? `影响 ${coolingRouteGroups.length} 个模型路由项，请求会自动尝试下一站` : '当前没有上游站点处于冷却'}
+          tone={coolingSiteCount ? 'warning' : 'success'}
         />
         <MetricCard
           icon={CircleDollarSign}
@@ -211,7 +228,7 @@ export function DashboardPage() {
         <Panel className="dashboard-runtime-panel">
           <SectionHeader
             title="模型运行状态"
-            description="只展示已选择监控的模型，每一格代表一个上游模型目标。"
+            description="只展示已选择监控的模型，每一格代表一个逻辑上游站点。"
             actions={<Link className="text-link" to="/monitor">管理监控</Link>}
           />
           {!monitor ? (
@@ -221,24 +238,24 @@ export function DashboardPage() {
           ) : (
             <div className="dashboard-model-list">
               {orderedModels.slice(0, 6).map((model) => {
-                const activeTargets = model.targets.filter((target) => target.enabled);
-                const routableTargets = model.publishedModelEnabled
-                  ? activeTargets.filter((target) => targetIsRouteReady(target, routableProviderTargetIds)).length
+                const activeGroups = groupUpstreamTargets(model.targets.filter((target) => target.enabled));
+                const routableGroups = model.publishedModelEnabled
+                  ? activeGroups.filter((group) => group.targets.some((target) => targetIsRouteReady(target, routableProviderTargetIds))).length
                   : 0;
-                const health = effectiveModelHealth(model);
+                const health = effectiveModelHealth(model, routableProviderTargetIds);
                 return (
                   <Link to="/monitor" className="dashboard-model-row" key={model.publishedModelId}>
                     <span className={`dashboard-model-state ${healthClass(health)}`}><HeartPulse size={16} /></span>
                     <div className="dashboard-model-main">
                       <span><code>{model.publicModel}</code><HealthBadge state={health} /></span>
-                      <small>{routableTargets} / {activeTargets.length} 个上游参与路由 · {formatRelativeTime(model.monitor.lastProbeFinishedAt)}探测</small>
+                      <small>{routableGroups} / {activeGroups.length} 个站点参与路由 · {formatRelativeTime(model.monitor.lastProbeFinishedAt)}探测</small>
                     </div>
                     <div className="dashboard-target-track" aria-label={`${model.publicModel} 上游状态`}>
-                      {activeTargets.map((target) => (
+                      {activeGroups.map((group) => (
                         <span
-                          className={healthClass(target.status)}
-                          title={`${target.siteName} · ${target.credentialName || target.sourceModel}`}
-                          key={target.publishedModelTargetId}
+                          className={healthClass(targetGroupHealth(group, routableProviderTargetIds))}
+                          title={`${group.siteName} · ${group.sourceModel}${group.targets.length > 1 ? ` · ${group.targets.length} 个内部 API 通道` : ''}`}
+                          key={group.key}
                         />
                       ))}
                     </div>

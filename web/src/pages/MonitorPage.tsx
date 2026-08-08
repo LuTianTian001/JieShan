@@ -22,6 +22,7 @@ import {
 import { api, ApiUnavailableError } from '../lib/api';
 import { formatDateTime, formatRelativeTime, protocolLabel } from '../lib/format';
 import { useResource } from '../lib/hooks';
+import { groupUpstreamTargets, upstreamChannelSummary, type UpstreamGroup } from '../lib/upstreamGroups';
 import type { GatewaySettings, ModelRoute, MonitorHealth, MonitorModel, MonitorSetting, MonitorSnapshot, MonitorTarget, MonitorTargetHistory } from '../lib/types';
 
 interface MonitorData {
@@ -171,6 +172,26 @@ function targetConnection(target: MonitorTarget): { label: string; tone: 'succes
   return { label: '已连接', tone: 'success' };
 }
 
+function channelLabel(target: MonitorTarget): string {
+  if (target.apiSurface === 'openai.chat_completions') return 'Chat';
+  if (target.apiSurface === 'openai.responses') return 'Responses';
+  if (target.apiSurface === 'anthropic.messages') return 'Messages';
+  if (target.apiSurface === 'gemini.generate_content') return 'GenerateContent';
+  return protocolLabel(target.wireProtocol);
+}
+
+function groupConnection(group: UpstreamGroup<MonitorTarget>): { label: string; tone: BadgeTone; connected: boolean; partial: boolean } {
+  const states = group.targets.map(targetConnection);
+  const connected = states.filter((state) => state.tone === 'success').length;
+  if (connected === states.length) return { label: states.length > 1 ? '全部已连接' : '已连接', tone: 'success', connected: true, partial: false };
+  if (connected) return { label: `${connected}/${states.length} 已连接`, tone: 'warning', connected: false, partial: true };
+  if (states.some((state) => state.tone === 'danger')) {
+    const label = states.every((state) => state.label === states[0].label) ? states[0].label : '连接异常';
+    return { label, tone: 'danger', connected: false, partial: false };
+  }
+  return { label: '待检测', tone: 'neutral', connected: false, partial: false };
+}
+
 function effectiveTargetStatus(target: MonitorTarget, slowFirstOutputThresholdMs: number): MonitorHealth {
   if (isSlowFirstOutput(target.latest, slowFirstOutputThresholdMs)) return 'cooling';
   return target.status;
@@ -180,6 +201,16 @@ function targetProbeState(target: MonitorTarget, slowFirstOutputThresholdMs: num
   if (isSlowFirstOutput(target.latest, slowFirstOutputThresholdMs)) return 'cooling';
   if (!target.latest || target.latest.outcome === 'skipped') return 'unprobed';
   return target.latest.outcome === 'success' ? 'healthy' : 'unavailable';
+}
+
+function groupProbePresentation(group: UpstreamGroup<MonitorTarget>, slowFirstOutputThresholdMs: number): { label: string; tone: BadgeTone; healthy: boolean; partial: boolean } {
+  const healthy = group.targets.filter((target) => targetProbeState(target, slowFirstOutputThresholdMs) === 'healthy').length;
+  if (healthy === group.targets.length) return { label: group.targets.length > 1 ? '全部通过' : '探针通过', tone: 'success', healthy: true, partial: false };
+  if (healthy) return { label: `${healthy}/${group.targets.length} 通过`, tone: 'warning', healthy: false, partial: true };
+  if (group.targets.some((target) => isSlowFirstOutput(target.latest, slowFirstOutputThresholdMs))) return { label: '通过但过慢', tone: 'warning', healthy: false, partial: false };
+  if (group.targets.some((target) => target.latest?.outcome === 'failure')) return { label: '探针失败', tone: 'danger', healthy: false, partial: false };
+  if (group.targets.some((target) => target.latest?.outcome === 'skipped')) return { label: '本次跳过', tone: 'neutral', healthy: false, partial: false };
+  return { label: '未探测', tone: 'neutral', healthy: false, partial: false };
 }
 
 function routingLabel(target: MonitorTarget, slowFirstOutputThresholdMs: number): string {
@@ -200,28 +231,51 @@ function routingLabel(target: MonitorTarget, slowFirstOutputThresholdMs: number)
   return labels[target.status] || target.status;
 }
 
-function probePresentation(target: MonitorTarget, slowFirstOutputThresholdMs: number): { label: string; tone: BadgeTone } {
-  if (!target.latest) return { label: '未探测', tone: 'neutral' };
-  if (target.latest.outcome === 'skipped') return { label: '本次跳过', tone: 'neutral' };
-  if (target.latest.outcome === 'failure') return { label: '探针失败', tone: 'danger' };
-  if (isSlowFirstOutput(target.latest, slowFirstOutputThresholdMs)) return { label: '通过但过慢', tone: 'warning' };
-  return { label: '探针通过', tone: 'success' };
-}
-
-function routingPresentation(target: MonitorTarget, slowFirstOutputThresholdMs: number): { label: string; tone: BadgeTone } {
-  const label = routingLabel(target, slowFirstOutputThresholdMs);
-  if (isRouteReady(target, slowFirstOutputThresholdMs)) {
-    return { label, tone: target.status === 'healthy' ? 'success' : 'warning' };
-  }
-  if (isSlowFirstOutput(target.latest, slowFirstOutputThresholdMs) || target.status === 'cooling') return { label, tone: 'warning' };
-  if (['unprobed', 'skipped'].includes(target.status)) return { label, tone: 'neutral' };
-  return { label, tone: 'danger' };
-}
-
 function isRouteReady(target: MonitorTarget, slowFirstOutputThresholdMs: number): boolean {
   return ['healthy', 'degraded', 'suspect', 'recovering'].includes(
     effectiveTargetStatus(target, slowFirstOutputThresholdMs),
   );
+}
+
+function groupRoutingPresentation(group: UpstreamGroup<MonitorTarget>, slowFirstOutputThresholdMs: number): { label: string; tone: BadgeTone; ready: boolean; complete: boolean } {
+  const ready = group.targets.filter((target) => isRouteReady(target, slowFirstOutputThresholdMs)).length;
+  if (ready === group.targets.length) {
+    const allHealthy = group.targets.every((target) => effectiveTargetStatus(target, slowFirstOutputThresholdMs) === 'healthy');
+    return { label: group.targets.length > 1 ? '全部可路由' : routingLabel(group.targets[0], slowFirstOutputThresholdMs), tone: allHealthy ? 'success' : 'warning', ready: true, complete: true };
+  }
+  if (ready) return { label: `${ready}/${group.targets.length} 可路由`, tone: 'warning', ready: true, complete: false };
+  if (group.targets.some((target) => effectiveTargetStatus(target, slowFirstOutputThresholdMs) === 'cooling')) return { label: '冷却中', tone: 'warning', ready: false, complete: false };
+  if (group.targets.every((target) => ['unprobed', 'skipped'].includes(effectiveTargetStatus(target, slowFirstOutputThresholdMs)))) return { label: '待探测', tone: 'neutral', ready: false, complete: false };
+  return { label: '不可路由', tone: 'danger', ready: false, complete: false };
+}
+
+function groupEffectiveStatus(group: UpstreamGroup<MonitorTarget>, slowFirstOutputThresholdMs: number): MonitorHealth {
+  const statuses = group.targets.map((target) => effectiveTargetStatus(target, slowFirstOutputThresholdMs));
+  const ready = statuses.filter((state) => ['healthy', 'degraded', 'suspect', 'recovering'].includes(state)).length;
+  if (ready === statuses.length && statuses.every((state) => state === 'healthy')) return 'healthy';
+  if (ready) return 'degraded';
+  if (statuses.includes('cooling')) return 'cooling';
+  if (statuses.some((state) => ['unavailable', 'no_credentials', 'unsupported'].includes(state))) return 'unavailable';
+  return statuses[0] || 'unprobed';
+}
+
+function groupHasCooling(group: UpstreamGroup<MonitorTarget>, slowFirstOutputThresholdMs: number): boolean {
+  return group.targets.some((target) => effectiveTargetStatus(target, slowFirstOutputThresholdMs) === 'cooling');
+}
+
+function aggregateEvidence(group: UpstreamGroup<MonitorTarget>, source: 'liveTraffic' | 'probe') {
+  const items = group.targets.map((target) => target.evidence[source]);
+  const samples = items.reduce((sum, item) => sum + item.samples, 0);
+  const successes = items.reduce((sum, item) => sum + item.successes, 0);
+  const failures = items.reduce((sum, item) => sum + item.failures, 0);
+  const attempted = successes + failures;
+  const p95Values = items.flatMap((item) => item.p95FirstOutputMs === null ? [] : [item.p95FirstOutputMs]);
+  return {
+    samples,
+    successBasisPoints: attempted ? Math.round(successes * 10_000 / attempted) : 0,
+    p95FirstOutputMs: p95Values.length ? Math.max(...p95Values) : null,
+    windowMs: Math.max(0, ...items.map((item) => item.windowMs)),
+  };
 }
 
 function modelMatchesFilter(model: MonitorModel, filter: MonitorStatusFilter, slowFirstOutputThresholdMs: number): boolean {
@@ -246,7 +300,7 @@ export function MonitorPage() {
   const [selectionQuery, setSelectionQuery] = useState('');
   const [savingSelection, setSavingSelection] = useState(false);
   const [probingModel, setProbingModel] = useState<number | null>(null);
-  const [probingTarget, setProbingTarget] = useState<{ modelId: number; targetId: number } | null>(null);
+  const [probingGroup, setProbingGroup] = useState<{ modelId: number; groupKey: string } | null>(null);
   const [expandedModelIds, setExpandedModelIds] = useState<Set<number>>(() => new Set());
   const [bulkProbe, setBulkProbe] = useState<BulkProbeState>({ running: false, completed: 0, total: 0, currentModelId: null });
   const [clockNow, setClockNow] = useState(() => Date.now());
@@ -305,12 +359,14 @@ export function MonitorPage() {
   }, [monitored, probePreferences.slowFirstOutputThresholdMs, query, status]);
 
   const monitorOverview = useMemo(() => {
-    const targets = monitored.flatMap((model) => model.targets);
-    const routeReady = targets.filter((target) => isRouteReady(target, probePreferences.slowFirstOutputThresholdMs)).length;
-    const cooling = targets.filter((target) => effectiveTargetStatus(target, probePreferences.slowFirstOutputThresholdMs) === 'cooling').length;
-    const failed = targets.filter((target) => ['unavailable', 'no_credentials', 'unsupported'].includes(effectiveTargetStatus(target, probePreferences.slowFirstOutputThresholdMs))).length;
+    const groups = monitored.flatMap((model) => groupUpstreamTargets(model.targets));
+    const routing = groups.map((group) => groupRoutingPresentation(group, probePreferences.slowFirstOutputThresholdMs));
+    const routeReady = routing.filter((state) => state.ready).length;
+    const partial = routing.filter((state) => state.ready && !state.complete).length;
+    const cooling = groups.filter((group) => groupHasCooling(group, probePreferences.slowFirstOutputThresholdMs)).length;
+    const failed = groups.filter((group) => groupEffectiveStatus(group, probePreferences.slowFirstOutputThresholdMs) === 'unavailable').length;
     const lastProbeAt = monitored.reduce((latest, model) => Math.max(latest, model.monitor.lastProbeFinishedAt || 0), 0);
-    return { targetCount: targets.length, routeReady, cooling, failed, lastProbeAt };
+    return { targetCount: groups.length, routeReady, partial, cooling, failed, lastProbeAt };
   }, [monitored, probePreferences.slowFirstOutputThresholdMs]);
 
   const coolingModelCount = useMemo(
@@ -346,20 +402,20 @@ export function MonitorPage() {
     }
   };
 
-  const probeTarget = async (publishedModelId: number, providerModelTargetId: number, siteName: string) => {
-    setProbingTarget({ modelId: publishedModelId, targetId: providerModelTargetId });
+  const probeTargetGroup = async (publishedModelId: number, group: UpstreamGroup<MonitorTarget>) => {
+    setProbingGroup({ modelId: publishedModelId, groupKey: group.key });
     try {
       await Promise.all([
-        api.probeTarget(publishedModelId, providerModelTargetId),
+        api.probeTargets(publishedModelId, group.targets.map((target) => target.providerModelTargetId)),
         keepPrototypeProgressVisible(),
       ]);
-      toast.show(`${siteName} 已完成探测`, 'success');
+      toast.show(`${group.siteName} 的全部 API 通道已完成探测`, 'success');
       await resource.refresh();
     } catch (reason) {
       toast.show(reason instanceof Error ? reason.message : '上游探测失败', 'error');
       await resource.refresh();
     } finally {
-      setProbingTarget(null);
+      setProbingGroup(null);
     }
   };
 
@@ -475,7 +531,7 @@ export function MonitorPage() {
     <div className="page monitor-page">
       <PageHeader
         title="模型监控"
-        description="真实请求与主动探针分开呈现；每个上游同时展示连接、路由资格和熔断变化。"
+        description="真实请求与主动探针分开呈现；同站点的 Chat、Responses 等内部 API 通道合并展示。"
         actions={<>
           <Button icon={ListChecks} onClick={() => setSelectionOpen(true)} disabled={!snapshot}>选择监控模型</Button>
           <Button icon={Settings2} onClick={openProbeSettings}>探针设置</Button>
@@ -490,8 +546,8 @@ export function MonitorPage() {
 
       {snapshot && <div className="monitor-overview-strip">
         <div><span>监控模型</span><strong>{monitored.length}</strong><small>仅计算已选择模型</small></div>
-        <div><span>上游探测目标</span><strong>{monitorOverview.targetCount}</strong><small>按站点与模型分别检测</small></div>
-        <div><span>当前可路由</span><strong>{monitorOverview.routeReady} / {monitorOverview.targetCount}</strong><small>{monitorOverview.cooling} 冷却 · {monitorOverview.failed} 失败</small></div>
+        <div><span>模型上游</span><strong>{monitorOverview.targetCount}</strong><small>同站点的多个 API 通道已合并</small></div>
+        <div><span>当前参与路由</span><strong>{monitorOverview.routeReady} / {monitorOverview.targetCount}</strong><small>{monitorOverview.partial} 部分可用 · {monitorOverview.cooling} 冷却 · {monitorOverview.failed} 失败</small></div>
         <div><span>最近自动探测</span><strong>{monitorOverview.lastProbeAt ? formatRelativeTime(monitorOverview.lastProbeAt) : '尚未探测'}</strong><small>页面每 20 秒刷新状态</small></div>
       </div>}
 
@@ -508,13 +564,17 @@ export function MonitorPage() {
 
         {!monitored.length ? <EmptyState title="还没有选择监控模型" description={`选择需要保障的模型后，每 ${probeIntervalLabel(probePreferences.okProbeIntervalMs)}发送一次低 Token 的 OK 探针。`} action={<Button variant="primary" icon={ListChecks} onClick={() => setSelectionOpen(true)}>选择模型</Button>} /> : visible.length === 0 ? <EmptyState title="没有匹配的监控模型" description="调整搜索词或状态筛选。" /> : <div className="monitor-model-list">{visible.map((model) => {
           const expanded = expandedModelIds.has(model.publishedModelId);
-          const connected = model.targets.filter((target) => targetConnection(target).tone === 'success').length;
-          const probeHealthy = model.targets.filter((target) => targetProbeState(target, probePreferences.slowFirstOutputThresholdMs) === 'healthy').length;
-          const routeReady = model.targets.filter((target) => isRouteReady(target, probePreferences.slowFirstOutputThresholdMs)).length;
-          const modelProbing = probingModel === model.publishedModelId || bulkProbe.currentModelId === model.publishedModelId || probingTarget?.modelId === model.publishedModelId || model.monitor.busy;
-          const renderedTargets = status === 'cooling'
-            ? model.targets.filter((target) => effectiveTargetStatus(target, probePreferences.slowFirstOutputThresholdMs) === 'cooling')
-            : model.targets;
+          const targetGroups = groupUpstreamTargets(model.targets);
+          const connected = targetGroups.filter((group) => groupConnection(group).connected).length;
+          const probeHealthy = targetGroups.filter((group) => groupProbePresentation(group, probePreferences.slowFirstOutputThresholdMs).healthy).length;
+          const routeStates = targetGroups.map((group) => groupRoutingPresentation(group, probePreferences.slowFirstOutputThresholdMs));
+          const routeReady = routeStates.filter((state) => state.ready).length;
+          const routeComplete = routeStates.filter((state) => state.complete).length;
+          const wholeModelProbing = probingModel === model.publishedModelId || bulkProbe.currentModelId === model.publishedModelId || model.monitor.busy;
+          const modelProbing = wholeModelProbing || probingGroup?.modelId === model.publishedModelId;
+          const renderedGroups = status === 'cooling'
+            ? targetGroups.filter((group) => groupHasCooling(group, probePreferences.slowFirstOutputThresholdMs))
+            : targetGroups;
           return <article className="monitor-model" key={model.publishedModelId}>
             <header className="monitor-model-header">
               <button
@@ -525,36 +585,42 @@ export function MonitorPage() {
                 onClick={() => toggleModelDetails(model.publishedModelId)}
               >
                 <span className="monitor-model-icon"><HeartPulse size={17} /></span>
-                <span className="monitor-model-name"><span><code>{model.publicModel}</code><Badge tone={routeReady === model.targets.length && model.targets.length ? 'success' : routeReady ? 'warning' : 'danger'}>{routeReady === model.targets.length && model.targets.length ? '全部可路由' : routeReady ? `${routeReady} / ${model.targets.length} 可路由` : '无可用路由'}</Badge></span><small>最近探测 {formatRelativeTime(model.monitor.lastProbeFinishedAt)} · 下次自动探针 {probeCountdown(model.monitor.nextProbeAt, clockNow, modelProbing)}</small></span>
-                <span className="monitor-model-stats"><span><strong>{connected} / {model.targets.length}</strong>连接正常</span><span><strong>{probeHealthy} / {model.targets.length}</strong>探针通过</span><span><strong>{routeReady} / {model.targets.length}</strong>参与路由</span></span>
+                <span className="monitor-model-name"><span><code>{model.publicModel}</code><Badge tone={routeComplete === targetGroups.length && targetGroups.length ? 'success' : routeReady ? 'warning' : 'danger'}>{routeComplete === targetGroups.length && targetGroups.length ? '全部站点可路由' : routeReady ? `${routeReady} / ${targetGroups.length} 站点参与路由` : '无可用路由'}</Badge></span><small>最近探测 {formatRelativeTime(model.monitor.lastProbeFinishedAt)} · 下次自动探针 {probeCountdown(model.monitor.nextProbeAt, clockNow, modelProbing)}</small></span>
+                <span className="monitor-model-stats"><span><strong>{connected} / {targetGroups.length}</strong>站点连接</span><span><strong>{probeHealthy} / {targetGroups.length}</strong>站点通过</span><span><strong>{routeReady} / {targetGroups.length}</strong>参与路由</span></span>
               </button>
-              <div className="model-route-actions"><Button size="sm" icon={RefreshCw} className={modelProbing ? 'probe-refresh is-probing' : 'probe-refresh'} aria-busy={modelProbing || undefined} disabled={bulkProbe.running || modelProbing || probingTarget !== null} onClick={() => void probe(model.publishedModelId)}>探测全部上游</Button><IconButton className={`model-route-disclosure ${expanded ? 'is-open' : ''}`} label={`${expanded ? '收起' : '展开'} ${model.publicModel} 的监控明细`} aria-expanded={expanded} onClick={() => toggleModelDetails(model.publishedModelId)}><ChevronDown size={17} /></IconButton></div>
+              <div className="model-route-actions"><Button size="sm" icon={RefreshCw} className={modelProbing ? 'probe-refresh is-probing' : 'probe-refresh'} aria-busy={modelProbing || undefined} disabled={bulkProbe.running || modelProbing || probingGroup !== null} onClick={() => void probe(model.publishedModelId)}>探测全部上游</Button><IconButton className={`model-route-disclosure ${expanded ? 'is-open' : ''}`} label={`${expanded ? '收起' : '展开'} ${model.publicModel} 的监控明细`} aria-expanded={expanded} onClick={() => toggleModelDetails(model.publishedModelId)}><ChevronDown size={17} /></IconButton></div>
             </header>
-            {expanded && <div className="monitor-targets">{renderedTargets.map((target) => {
-              const connection = targetConnection(target);
-              const slowFirstOutput = isSlowFirstOutput(target.latest, probePreferences.slowFirstOutputThresholdMs);
-              const effectiveStatus = effectiveTargetStatus(target, probePreferences.slowFirstOutputThresholdMs);
-              const probeState = probePresentation(target, probePreferences.slowFirstOutputThresholdMs);
-              const routeState = routingPresentation(target, probePreferences.slowFirstOutputThresholdMs);
-              const targetProbing = modelProbing && (probingTarget === null || probingTarget.targetId === target.providerModelTargetId);
-              return <div className="monitor-target" key={target.publishedModelTargetId}>
-                <span className="monitor-target-rank" title={`路由优先级 ${target.position + 1}`}>{target.position + 1}</span>
-                <div className="monitor-target-identity"><strong>{target.siteName}</strong><span>{monitorCredentialName(target) || `${protocolLabel(target.wireProtocol)} · ${target.usableCredentialCount} 个 API Key`}</span><code>{target.sourceModel}</code></div>
+            {expanded && <div className="monitor-targets">{renderedGroups.map((group) => {
+              const connection = groupConnection(group);
+              const probeState = groupProbePresentation(group, probePreferences.slowFirstOutputThresholdMs);
+              const routeState = groupRoutingPresentation(group, probePreferences.slowFirstOutputThresholdMs);
+              const groupProbing = wholeModelProbing || (probingGroup?.modelId === model.publishedModelId && probingGroup.groupKey === group.key);
+              const liveEvidence = aggregateEvidence(group, 'liveTraffic');
+              const probeEvidence = aggregateEvidence(group, 'probe');
+              const usableCredentialCount = Math.max(0, ...group.targets.map((target) => target.usableCredentialCount));
+              const slowTargets = group.targets.filter((target) => isSlowFirstOutput(target.latest, probePreferences.slowFirstOutputThresholdMs));
+              const coolingTargets = group.targets.filter((target) => effectiveTargetStatus(target, probePreferences.slowFirstOutputThresholdMs) === 'cooling');
+              const cooldownUntil = Math.max(0, ...coolingTargets.map((target) => target.health?.cooldownUntil || 0));
+              const latestTarget = [...group.targets].sort((left, right) => (right.latest?.finishedAt || 0) - (left.latest?.finishedAt || 0))[0];
+              const groupRank = targetGroups.findIndex((candidate) => candidate.key === group.key) + 1;
+              return <div className="monitor-target" key={group.key}>
+                <span className="monitor-target-rank" title={`路由优先级 ${groupRank}`}>{groupRank}</span>
+                <div className="monitor-target-identity"><strong>{group.siteName}</strong><span className="monitor-target-channels">{[...new Set(group.targets.map(channelLabel))].map((label) => <Badge tone="neutral" key={label}>{label}</Badge>)}</span><span>{usableCredentialCount} 个 API Key · {upstreamChannelSummary(group.targets)}</span><code>{group.sourceModel}</code></div>
                 <div className="monitor-target-states">
                   <span><small>连接</small><Badge tone={connection.tone}>{connection.label}</Badge></span>
                   <span><small>探针</small><Badge tone={probeState.tone}>{probeState.label}</Badge></span>
                   <span><small>路由资格</small><Badge tone={routeState.tone}>{routeState.label}</Badge></span>
                 </div>
                 <div className="monitor-target-metrics monitor-target-evidence">
-                  <span><small>真实流量 · {evidenceWindowLabel(target.evidence.liveTraffic.windowMs)}</small><strong>{basisPoints(target.evidence.liveTraffic.successBasisPoints)}</strong><em>{target.evidence.liveTraffic.samples} 请求 · P95 首 Token {formatProbeSeconds(target.evidence.liveTraffic.p95FirstOutputMs)}</em></span>
-                  <span><small>主动探针 · {evidenceWindowLabel(target.evidence.probe.windowMs)}</small><strong>{basisPoints(target.evidence.probe.successBasisPoints)}</strong><em>{target.evidence.probe.samples} 次 · 首 Token {formatProbeSeconds(target.latest?.firstOutputMs)}</em></span>
+                  <span><small>真实流量 · 聚合 {evidenceWindowLabel(liveEvidence.windowMs)}</small><strong>{basisPoints(liveEvidence.successBasisPoints)}</strong><em>{liveEvidence.samples} 请求 · 最慢 P95 {formatProbeSeconds(liveEvidence.p95FirstOutputMs)}</em></span>
+                  <span><small>主动探针 · 聚合 {evidenceWindowLabel(probeEvidence.windowMs)}</small><strong>{basisPoints(probeEvidence.successBasisPoints)}</strong><em>{probeEvidence.samples} 次 · 最慢 P95 {formatProbeSeconds(probeEvidence.p95FirstOutputMs)}</em></span>
                 </div>
                 <div className="monitor-target-observation">
-                  <div className="monitor-target-action-row"><button type="button" className="status-history" aria-label={`查看 ${target.siteName} 的完整探针历史`} title="查看完整探针历史" onClick={() => void openHistory(model, target)}>{target.statusBar.slice(-16).map((point) => <span className={`history-${isSlowFirstOutput(point, probePreferences.slowFirstOutputThresholdMs) ? 'slow' : point.outcome}`} title={pointTitle(point, probePreferences.slowFirstOutputThresholdMs)} key={`${point.runId}-${point.finishedAt}`} />)}<History size={14} /></button><IconButton size="sm" className="target-probe-button" label={`立即探测 ${target.siteName}`} aria-busy={targetProbing || undefined} disabled={bulkProbe.running || probingModel !== null || probingTarget !== null || model.monitor.busy || !target.enabled} onClick={() => void probeTarget(model.publishedModelId, target.providerModelTargetId, target.siteName)}><RefreshCw className={targetProbing ? 'spin' : undefined} size={15} /></IconButton></div>
-                  <div className="target-next-state">{slowFirstOutput ? <><TimerReset size={14} /><span title={`首 Token 超过 ${probeIntervalLabel(probePreferences.slowFirstOutputThresholdMs)}，冷却 ${probeIntervalLabel(probePreferences.cooldownMs)}`}>慢首 Token · 冷却 {probeIntervalLabel(probePreferences.cooldownMs)}</span></> : effectiveStatus === 'cooling' ? <><TimerReset size={14} /><span>{formatRelativeTime(target.health?.cooldownUntil)}恢复测试</span></> : target.latest?.errorCode ? <span title={target.latest.errorCode}>{target.latest.errorCode}</span> : <><History size={14} /><span>{formatRelativeTime(target.latest?.finishedAt)}检测</span></>}</div>
+                  <div className="monitor-target-action-row"><div className="monitor-channel-history-list">{group.targets.map((target) => <button type="button" className="monitor-channel-history" aria-label={`查看 ${group.siteName} ${channelLabel(target)} 通道的完整探针历史`} title={`查看 ${channelLabel(target)} 通道历史`} onClick={() => void openHistory(model, target)} key={target.providerModelTargetId}><span className="monitor-channel-label">{channelLabel(target)}</span><span className="status-history">{target.statusBar.slice(-8).map((point) => <span className={`history-${isSlowFirstOutput(point, probePreferences.slowFirstOutputThresholdMs) ? 'slow' : point.outcome}`} title={pointTitle(point, probePreferences.slowFirstOutputThresholdMs)} key={`${point.runId}-${point.finishedAt}`} />)}<History size={13} /></span></button>)}</div><IconButton size="sm" className="target-probe-button" label={`立即探测 ${group.siteName} 的全部 API 通道`} aria-busy={groupProbing || undefined} disabled={bulkProbe.running || probingModel !== null || probingGroup !== null || model.monitor.busy || !group.targets.some((target) => target.enabled)} onClick={() => void probeTargetGroup(model.publishedModelId, group)}><RefreshCw className={groupProbing ? 'spin' : undefined} size={15} /></IconButton></div>
+                  <div className="target-next-state">{slowTargets.length ? <><TimerReset size={14} /><span title={`首 Token 超过 ${probeIntervalLabel(probePreferences.slowFirstOutputThresholdMs)}，冷却 ${probeIntervalLabel(probePreferences.cooldownMs)}`}>{slowTargets.length === group.targets.length ? '全部通道' : `${slowTargets.length}/${group.targets.length} 通道`}慢首 Token</span></> : coolingTargets.length ? <><TimerReset size={14} /><span>{coolingTargets.length === group.targets.length ? '全部通道' : `${coolingTargets.length}/${group.targets.length} 通道`}冷却 · {formatRelativeTime(cooldownUntil)}恢复测试</span></> : latestTarget?.latest?.errorCode ? <span title={latestTarget.latest.errorCode}>{channelLabel(latestTarget)} · {latestTarget.latest.errorCode}</span> : <><History size={14} /><span>{formatRelativeTime(latestTarget?.latest?.finishedAt)}检测</span></>}</div>
                 </div>
               </div>;
-            })}{status === 'cooling' && !renderedTargets.length ? <EmptyState title="没有冷却中的上游" description="该模型当前没有处于冷却状态的上游。" /> : null}</div>}
+            })}{status === 'cooling' && !renderedGroups.length ? <EmptyState title="没有冷却中的站点" description="该模型当前没有处于冷却状态的上游站点。" /> : null}</div>}
           </article>;
         })}</div>}
       </Panel>}
@@ -580,7 +646,7 @@ export function MonitorPage() {
         </div>
       </Dialog>
 
-      <Dialog open={Boolean(historySelection)} title={historySelection ? `${historySelection.model.publicModel} · ${historySelection.target.siteName}` : ''} description={historySelection ? `${monitorCredentialName(historySelection.target) || protocolLabel(historySelection.target.wireProtocol)} · ${historySelection.target.sourceModel}` : ''} onClose={() => { setHistorySelection(null); setTargetHistory(null); setHistoryError(''); }} width="lg">
+      <Dialog open={Boolean(historySelection)} title={historySelection ? `${historySelection.model.publicModel} · ${historySelection.target.siteName}` : ''} description={historySelection ? `${channelLabel(historySelection.target)} 通道 · ${monitorCredentialName(historySelection.target) || protocolLabel(historySelection.target.wireProtocol)} · ${historySelection.target.sourceModel}` : ''} onClose={() => { setHistorySelection(null); setTargetHistory(null); setHistoryError(''); }} width="lg">
         {historyLoading ? <LoadingState label="正在读取完整探针历史" /> : historyError ? <ErrorState message={historyError} onRetry={() => historySelection && void openHistory(historySelection.model, historySelection.target)} /> : targetHistory && <div className="probe-history-detail">
           <div className="probe-history-summary"><div><span>当前状态</span><HealthBadge state={isSlowFirstOutput(latestHistoryPoint, probePreferences.slowFirstOutputThresholdMs) ? 'cooling' : targetHistory.status} /></div><div><span>成功率</span><strong>{basisPoints(targetHistory.successBasisPoints)}</strong></div><div><span>最近首 Token</span><strong>{formatProbeSeconds(latestHistoryPoint?.firstOutputMs)}</strong></div><div><span>成功 / 失败</span><strong>{targetHistory.successes} / {targetHistory.failures}</strong></div></div>
           <Disclosure summary={<span className="settings-disclosure-title"><Activity size={17} /><span><strong>熔断状态时间线</strong><small>{targetHistory.circuitTransitions.length ? `${targetHistory.circuitTransitions.length} 次状态变化` : '当前历史窗口内没有状态变化'}</small></span></span>} open={targetHistory.circuitTransitions.length > 0}>

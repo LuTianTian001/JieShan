@@ -285,7 +285,7 @@ func (scheduler *Scheduler) RunDueOnce(ctx context.Context) ([]ModelRun, error) 
 // ProbeModel performs one manual model-wide run. Every currently enabled
 // published model target is included once, preserving the operator's order.
 func (scheduler *Scheduler) ProbeModel(ctx context.Context, publishedModelID int64) (ModelRun, error) {
-	return scheduler.probeManual(ctx, publishedModelID, 0)
+	return scheduler.probeManual(ctx, publishedModelID, nil)
 }
 
 // ProbeTarget performs one manual run for exactly one currently enabled
@@ -298,12 +298,28 @@ func (scheduler *Scheduler) ProbeTarget(
 	if providerModelTargetID <= 0 {
 		return ModelRun{}, errors.New("provider model target ID must be positive")
 	}
-	return scheduler.probeManual(ctx, publishedModelID, providerModelTargetID)
+	return scheduler.probeManual(ctx, publishedModelID, []int64{providerModelTargetID})
+}
+
+// ProbeTargets performs one manual run for a selected set of currently enabled
+// upstream targets. Selection is de-duplicated, while execution and returned
+// results retain the published model's route order.
+func (scheduler *Scheduler) ProbeTargets(
+	ctx context.Context,
+	publishedModelID int64,
+	providerModelTargetIDs []int64,
+) (ModelRun, error) {
+	targetIDs, err := normalizeProbeTargetIDs(providerModelTargetIDs)
+	if err != nil {
+		return ModelRun{}, err
+	}
+	return scheduler.probeManual(ctx, publishedModelID, targetIDs)
 }
 
 func (scheduler *Scheduler) probeManual(
 	ctx context.Context,
-	publishedModelID, providerModelTargetID int64,
+	publishedModelID int64,
+	providerModelTargetIDs []int64,
 ) (ModelRun, error) {
 	if ctx == nil {
 		return ModelRun{}, errors.New("monitor probe context is required")
@@ -328,15 +344,19 @@ func (scheduler *Scheduler) probeManual(
 	if err != nil {
 		return ModelRun{}, err
 	}
-	if providerModelTargetID > 0 {
-		selected := job.Targets[:0]
+	if providerModelTargetIDs != nil {
+		requested := make(map[int64]struct{}, len(providerModelTargetIDs))
+		for _, targetID := range providerModelTargetIDs {
+			requested[targetID] = struct{}{}
+		}
+		selected := make([]vnextstore.ModelMonitorTarget, 0, len(requested))
 		for _, target := range job.Targets {
-			if target.ProviderModelTargetID == providerModelTargetID {
+			if _, exists := requested[target.ProviderModelTargetID]; exists {
 				selected = append(selected, target)
-				break
+				delete(requested, target.ProviderModelTargetID)
 			}
 		}
-		if len(selected) == 0 {
+		if len(requested) > 0 {
 			cleanupCtx, cancel := cleanupContext()
 			scheduler.stateMu.Lock()
 			releaseErr := scheduler.repository.ReleaseModelMonitorClaim(
@@ -349,6 +369,25 @@ func (scheduler *Scheduler) probeManual(
 		job.Targets = selected
 	}
 	return scheduler.runClaimed(ctx, job, "manual")
+}
+
+func normalizeProbeTargetIDs(targetIDs []int64) ([]int64, error) {
+	if len(targetIDs) == 0 {
+		return nil, errors.New("at least one provider model target ID is required")
+	}
+	normalized := make([]int64, 0, len(targetIDs))
+	seen := make(map[int64]struct{}, len(targetIDs))
+	for _, targetID := range targetIDs {
+		if targetID <= 0 {
+			return nil, errors.New("provider model target IDs must be positive")
+		}
+		if _, exists := seen[targetID]; exists {
+			continue
+		}
+		seen[targetID] = struct{}{}
+		normalized = append(normalized, targetID)
+	}
+	return normalized, nil
 }
 
 func (scheduler *Scheduler) runClaimed(ctx context.Context, job vnextstore.ModelMonitorJob, trigger string) (ModelRun, error) {

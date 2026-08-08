@@ -20,6 +20,7 @@ import {
 } from '../components/ui';
 import { api } from '../lib/api';
 import { useResource } from '../lib/hooks';
+import { groupUpstreamTargets, type UpstreamGroup } from '../lib/upstreamGroups';
 import type {
   CreateDefaultRouteInput,
   GatewaySettings,
@@ -125,6 +126,25 @@ function routeTargetIsVerifiedUsable(state: RouteTargetRuntimeState): boolean {
   return state === 'ready' || state === 'attention';
 }
 
+function routeTargetGroupRuntimeState(
+  group: UpstreamGroup<ModelRoute['targets'][number]>,
+  catalogById: Map<number, ModelTarget>,
+  monitoredTargets: MonitorTarget[],
+  slowFirstOutputThresholdMs: number,
+): RouteTargetRuntimeState {
+  const states = group.targets.map((target) => routeTargetRuntimeState(
+    catalogById.get(target.providerModelTargetId),
+    monitoredTargets.find((candidate) => candidate.providerModelTargetId === target.providerModelTargetId),
+    slowFirstOutputThresholdMs,
+  ));
+  const usable = states.filter(routeTargetIsVerifiedUsable).length;
+  if (usable === states.length && states.every((state) => state === 'ready')) return 'ready';
+  if (usable > 0) return 'attention';
+  if (states.some((state) => state === 'cooling')) return 'cooling';
+  if (states.some((state) => state === 'unprobed')) return 'unprobed';
+  return 'unavailable';
+}
+
 export function ModelsPage() {
   const toast = useToast();
   const base = useResource(loadModelsBase, []);
@@ -178,16 +198,9 @@ export function ModelsPage() {
     const normalized = query.trim().toLowerCase();
     return (routes.data || []).filter((route) => {
       const monitored = monitorByModelId.get(route.publishedModelId);
-      const hasIssue = route.targets.some((target) => {
-        const item = catalogById.get(target.providerModelTargetId);
-        const health = monitored?.targets.find((candidate) => candidate.providerModelTargetId === target.providerModelTargetId);
-        const runtimeState = routeTargetRuntimeState(
-          item,
-          health,
-          slowFirstOutputThresholdMs,
-        );
-        return routeTargetNeedsAttention(runtimeState);
-      });
+      const hasIssue = groupUpstreamTargets(route.targets).some((group) => routeTargetNeedsAttention(
+        routeTargetGroupRuntimeState(group, catalogById, monitored?.targets || [], slowFirstOutputThresholdMs),
+      ));
       if (status === 'enabled' && !route.enabled) return false;
       if (status === 'disabled' && route.enabled) return false;
       if (status === 'attention' && !hasIssue) return false;
@@ -406,15 +419,13 @@ export function ModelsPage() {
 
           {routes.loading && !routes.data ? <LoadingState label="正在读取模型路由" /> : routes.error && !routes.data ? <ErrorState message={routes.error} onRetry={() => void routes.refresh()} /> : visibleRoutes.length === 0 ? <EmptyState title={routes.data?.length ? '没有匹配的模型' : '这套路由还没有模型'} description={routes.data?.length ? '调整搜索或状态筛选。' : selectedProfile?.isDefault ? '点击“发布模型”，先选模型，再按顺序选择上游站点。' : '默认路由还没有可继承的模型。'} action={!routes.data?.length && catalog.length && selectedProfile?.isDefault ? <Button variant="primary" icon={Plus} onClick={openCreate}>发布第一个模型</Button> : undefined} /> : <div className="model-route-list">{visibleRoutes.map((route) => {
             const monitored = monitorByModelId.get(route.publishedModelId);
-            const targetStates = route.targets.map((target) => {
-              const item = catalogById.get(target.providerModelTargetId);
-              const health = monitored?.targets.find((candidate) => candidate.providerModelTargetId === target.providerModelTargetId);
-              return routeTargetRuntimeState(
-                item,
-                health,
-                slowFirstOutputThresholdMs,
-              );
-            });
+            const targetGroups = groupUpstreamTargets(route.targets);
+            const targetStates = targetGroups.map((group) => routeTargetGroupRuntimeState(
+              group,
+              catalogById,
+              monitored?.targets || [],
+              slowFirstOutputThresholdMs,
+            ));
             const usable = targetStates.filter(routeTargetIsVerifiedUsable).length;
             const attention = targetStates.filter((state) => state === 'attention').length;
             const cooling = targetStates.filter((state) => state === 'cooling').length;
@@ -431,7 +442,7 @@ export function ModelsPage() {
             const expanded = expandedRouteIds.has(route.publishedModelId);
             const routeStatusPoints = (monitored?.targets || []).flatMap((target) => target.statusBar).sort((left, right) => left.finishedAt - right.finishedAt).slice(-12);
             const visibleMonitorTargets = monitored?.targets || [];
-            const primaryTarget = route.targets[0];
+            const primaryTarget = targetGroups[0];
             return <article className="model-route" key={route.publishedModelId}>
               <header className="model-route-header">
                 <button
@@ -442,15 +453,15 @@ export function ModelsPage() {
                   onClick={() => toggleRouteDetails(route.publishedModelId)}
                 >
                   <span className="model-icon"><Layers3 size={17} /></span>
-                  <span className="model-route-name"><span><code>{route.publicName}</code><Badge tone={route.enabled ? 'success' : 'neutral'}>{route.enabled ? '已发布' : '已暂停'}</Badge>{route.inherited && <Badge tone="info">继承 {route.sourceProfileName || '默认路由'}</Badge>}</span><span><span>{route.targets.length} 个上游</span><span>计价 <code>{route.officialPriceSku}</code></span></span></span>
+                  <span className="model-route-name"><span><code>{route.publicName}</code><Badge tone={route.enabled ? 'success' : 'neutral'}>{route.enabled ? '已发布' : '已暂停'}</Badge>{route.inherited && <Badge tone="info">继承 {route.sourceProfileName || '默认路由'}</Badge>}</span><span><span>{targetGroups.length} 个上游站点</span><span>计价 <code>{route.officialPriceSku}</code></span></span></span>
                   <span className="model-route-primary"><small>首选上游</small><strong>{primaryTarget?.siteName || '尚未配置'}</strong><code>{primaryTarget?.sourceModel || '—'}</code></span>
                   <span className="model-route-health">
-                    {!hasIssue && usable === route.targets.length && route.targets.length > 0
+                    {!hasIssue && usable === targetGroups.length && targetGroups.length > 0
                       ? <CheckCircle2 size={16} />
                       : usable > 0 || unprobed > 0
                         ? <AlertTriangle size={16} />
                         : <CircleX className="model-route-health-failed" size={16} />}
-                    <strong>{usable} / {route.targets.length} 上游可用</strong>
+                    <strong>{usable} / {targetGroups.length} 站点参与路由</strong>
                     {routeStatusPoints.length ? <span className="status-history" aria-label={`${route.publicName} 的近期上游状态`} title={statusSummary}>{routeStatusPoints.map((point) => <span className={`history-${point.outcome === 'success' && point.firstOutputMs !== null && point.firstOutputMs > slowFirstOutputThresholdMs ? 'slow' : point.outcome}`} key={`${point.runId}-${point.finishedAt}`} />)}</span> : <span>{statusSummary}</span>}
                   </span>
                 </button>

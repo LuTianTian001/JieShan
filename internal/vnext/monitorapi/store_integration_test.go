@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -356,6 +357,112 @@ func TestStoreHandlerManualTargetProbe(t *testing.T) {
 		http.StatusNotFound, "monitor_target_not_found")
 }
 
+func TestStoreHandlerManualTargetsProbe(t *testing.T) {
+	fixture := newAPIFixture(t)
+	path := fmt.Sprintf("%s/models/%d/targets/probe", APIPrefix, fixture.selectedRouteID)
+	startedAt := fixture.now.Add(time.Minute)
+	finishedAt := startedAt.Add(500 * time.Millisecond)
+	fixture.prober.set(monitoring.ModelRun{
+		Run: vnextstore.ModelProbeRun{
+			ID: "manual-targets", PublishedModelID: fixture.selectedRouteID, PublicModelSnapshot: "public-selected",
+			TriggerKind: "manual", Status: "completed", TargetCount: 2, StartedAt: startedAt, FinishedAt: &finishedAt,
+		},
+		Results: []monitoring.TargetResult{
+			{
+				RunID: "manual-targets", TargetID: fixture.selectedTargetIDs[0], Outcome: monitoring.OutcomeSuccess,
+				HTTPStatus: http.StatusOK, LatencyMS: 400, StartedAt: startedAt, FinishedAt: finishedAt,
+			},
+			{
+				RunID: "manual-targets", TargetID: fixture.selectedTargetIDs[1], Outcome: monitoring.OutcomeSuccess,
+				HTTPStatus: http.StatusOK, LatencyMS: 500, StartedAt: startedAt, FinishedAt: finishedAt,
+			},
+		},
+	}, nil)
+
+	for _, body := range [][]byte{
+		[]byte(`{}`),
+		[]byte(`{"providerModelTargetIds":[]}`),
+		[]byte(`{"providerModelTargetIds":[0]}`),
+		[]byte(`{"providerModelTargetIds":[1.5]}`),
+		[]byte(`{"providerModelTargetIds":["1"]}`),
+	} {
+		assertAPIError(t, serveMonitor(fixture.handler, http.MethodPost, path, body, nil),
+			http.StatusBadRequest, "invalid_request")
+	}
+	if _, _, calls := fixture.prober.targetsCall(); calls != 0 {
+		t.Fatalf("invalid requests invoked multi-target prober %d times", calls)
+	}
+
+	foreignBody, err := json.Marshal(targetsProbeRequest{ProviderModelTargetIDs: []int64{
+		fixture.selectedTargetIDs[0], fixture.unselectedTargetIDs[0],
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAPIError(t, serveMonitor(fixture.handler, http.MethodPost, path, foreignBody, nil),
+		http.StatusNotFound, "monitor_target_not_found")
+
+	requested := []int64{fixture.selectedTargetIDs[1], fixture.selectedTargetIDs[0], fixture.selectedTargetIDs[1]}
+	requestBody, err := json.Marshal(targetsProbeRequest{ProviderModelTargetIDs: requested})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveMonitor(fixture.handler, http.MethodPost, path, requestBody, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("targets probe status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Run probeRunResponse `json:"run"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Run.TargetCount != 2 || len(body.Run.Results) != 2 {
+		t.Fatalf("targets probe response = %+v", body.Run)
+	}
+	modelID, targetIDs, calls := fixture.prober.targetsCall()
+	wantTargetIDs := []int64{fixture.selectedTargetIDs[1], fixture.selectedTargetIDs[0]}
+	if calls != 1 || modelID != fixture.selectedRouteID || !reflect.DeepEqual(targetIDs, wantTargetIDs) {
+		t.Fatalf("targets prober call = model %d targets %+v calls %d", modelID, targetIDs, calls)
+	}
+
+	target, err := fixture.storage.GetProviderModelTarget(context.Background(), fixture.selectedTargetIDs[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.storage.UpdateProviderModelTarget(context.Background(), target.SiteID, target.EndpointID, target.ID,
+		vnextstore.ProviderModelTargetUpdate{
+			ExpectedRevision: target.Revision, SourceModel: target.SourceModel,
+			DisplayName: target.DisplayName, Enabled: false,
+		}); err != nil {
+		t.Fatal(err)
+	}
+	disabledBody, err := json.Marshal(targetsProbeRequest{ProviderModelTargetIDs: []int64{target.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAPIError(t, serveMonitor(fixture.handler, http.MethodPost, path, disabledBody, nil),
+		http.StatusConflict, "monitor_disabled")
+	if _, _, calls := fixture.prober.targetsCall(); calls != 1 {
+		t.Fatalf("disabled target invoked multi-target prober; calls = %d", calls)
+	}
+
+	modelOnly, err := NewStoreHandler(fixture.storage, ProbeModelFunc(func(context.Context, int64) (monitoring.ModelRun, error) {
+		return monitoring.ModelRun{}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	availableBody, err := json.Marshal(targetsProbeRequest{ProviderModelTargetIDs: []int64{fixture.selectedTargetIDs[0]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAPIError(t, serveMonitor(modelOnly, http.MethodPost, path, availableBody, nil),
+		http.StatusServiceUnavailable, "probe_unavailable")
+	assertAPIError(t, serveMonitor(fixture.handler, http.MethodGet, path, nil, nil),
+		http.StatusMethodNotAllowed, "method_not_allowed")
+}
+
 type apiFixture struct {
 	storage             *vnextstore.Store
 	handler             *Handler
@@ -648,13 +755,15 @@ func seedLiveTrafficEvidence(t *testing.T, fixture apiFixture) {
 }
 
 type fakeModelProber struct {
-	mu           sync.Mutex
-	run          monitoring.ModelRun
-	err          error
-	calls        int
-	targetCalls  int
-	lastModelID  int64
-	lastTargetID int64
+	mu            sync.Mutex
+	run           monitoring.ModelRun
+	err           error
+	calls         int
+	targetCalls   int
+	targetsCalls  int
+	lastModelID   int64
+	lastTargetID  int64
+	lastTargetIDs []int64
 }
 
 func (prober *fakeModelProber) set(run monitoring.ModelRun, err error) {
@@ -680,10 +789,25 @@ func (prober *fakeModelProber) ProbeTarget(_ context.Context, modelID, targetID 
 	return prober.run, prober.err
 }
 
+func (prober *fakeModelProber) ProbeTargets(_ context.Context, modelID int64, targetIDs []int64) (monitoring.ModelRun, error) {
+	prober.mu.Lock()
+	defer prober.mu.Unlock()
+	prober.targetsCalls++
+	prober.lastModelID = modelID
+	prober.lastTargetIDs = append([]int64(nil), targetIDs...)
+	return prober.run, prober.err
+}
+
 func (prober *fakeModelProber) targetCall() (int64, int64, int) {
 	prober.mu.Lock()
 	defer prober.mu.Unlock()
 	return prober.lastModelID, prober.lastTargetID, prober.targetCalls
+}
+
+func (prober *fakeModelProber) targetsCall() (int64, []int64, int) {
+	prober.mu.Lock()
+	defer prober.mu.Unlock()
+	return prober.lastModelID, append([]int64(nil), prober.lastTargetIDs...), prober.targetsCalls
 }
 
 func (prober *fakeModelProber) callCount() int {

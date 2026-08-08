@@ -34,6 +34,10 @@ type TargetProber interface {
 	ProbeTarget(context.Context, int64, int64) (monitoring.ModelRun, error)
 }
 
+type TargetsProber interface {
+	ProbeTargets(context.Context, int64, []int64) (monitoring.ModelRun, error)
+}
+
 type ProbeModelFunc func(context.Context, int64) (monitoring.ModelRun, error)
 
 func (function ProbeModelFunc) ProbeModel(ctx context.Context, publishedModelID int64) (monitoring.ModelRun, error) {
@@ -47,6 +51,7 @@ type Handler struct {
 	repository Repository
 	prober     ModelProber
 	target     TargetProber
+	targets    TargetsProber
 	now        func() time.Time
 }
 
@@ -62,6 +67,9 @@ func New(repository Repository, prober ModelProber) (*Handler, error) {
 	handler := &Handler{repository: repository, prober: prober, now: time.Now}
 	if target, ok := prober.(TargetProber); ok && !nilLike(target) {
 		handler.target = target
+	}
+	if targets, ok := prober.(TargetsProber); ok && !nilLike(targets) {
+		handler.targets = targets
 	}
 	return handler, nil
 }
@@ -87,8 +95,9 @@ func nilLike(value any) bool {
 }
 
 var (
-	_ http.Handler = (*Handler)(nil)
-	_ Repository   = (*vnextstore.Store)(nil)
-	_ ModelProber  = (*monitoring.Scheduler)(nil)
-	_ TargetProber = (*monitoring.Scheduler)(nil)
+	_ http.Handler  = (*Handler)(nil)
+	_ Repository    = (*vnextstore.Store)(nil)
+	_ ModelProber   = (*monitoring.Scheduler)(nil)
+	_ TargetProber  = (*monitoring.Scheduler)(nil)
+	_ TargetsProber = (*monitoring.Scheduler)(nil)
 )
